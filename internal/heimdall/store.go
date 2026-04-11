@@ -1,12 +1,13 @@
 package heimdall
 
 import (
+	"bytes"
 	"database/sql"
-	"encoding/binary"
-	"math"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -14,16 +15,19 @@ import (
 
 // VectorRecord is a single indexed chunk with its embedding.
 type VectorRecord struct {
-	ID          string    `json:"id"`
-	FilePath    string    `json:"filePath"`
-	StartLine   int       `json:"startLine"`
-	EndLine     int       `json:"endLine"`
-	Content     string    `json:"content"`
-	Kind        string    `json:"kind"`
-	Identifier  string    `json:"identifier"`
-	Embedding   []float32 `json:"embedding"`
-	ModTime     int64     `json:"modTime"`
-	ContentHash string    `json:"contentHash"`
+	ID            string    `json:"id"`
+	FilePath      string    `json:"filePath"`
+	StartLine     int       `json:"startLine"`
+	EndLine       int       `json:"endLine"`
+	Content       string    `json:"content"`
+	Kind          string    `json:"kind"`
+	Identifier    string    `json:"identifier"`
+	Embedding     []float32 `json:"embedding"`
+	ModTime       int64     `json:"modTime"`
+	ContentHash   string    `json:"contentHash"`
+	SourceType    string    `json:"sourceType"`    // "code", "ticket", "doc", "pr", etc.
+	Metadata      string    `json:"metadata"`      // JSON object string
+	Relationships string    `json:"relationships"` // JSON array string
 }
 
 // SearchResult is a record with its similarity score.
@@ -81,6 +85,12 @@ func OpenStore(dbDir string) (*VectorStore, error) {
 	// Migrate: add content_hash column if missing (existing DBs).
 	db.Exec(`ALTER TABLE entries ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''`)
 
+	// Migrate: add typed context columns if missing (existing DBs).
+	db.Exec(`ALTER TABLE entries ADD COLUMN source_type TEXT DEFAULT 'code'`)
+	db.Exec(`ALTER TABLE entries ADD COLUMN metadata TEXT DEFAULT '{}'`)
+	db.Exec(`ALTER TABLE entries ADD COLUMN relationships TEXT DEFAULT '[]'`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_source_type ON entries(source_type)`)
+
 	return &VectorStore{db: db}, nil
 }
 
@@ -92,12 +102,25 @@ func (s *VectorStore) Close() error {
 	return nil
 }
 
-// Search returns the top-k most similar records to the query vector.
+// Search is a convenience wrapper — delegates to SearchFiltered with no filters.
 func (s *VectorStore) Search(query []float32, topK int) []SearchResult {
+	return s.SearchFiltered(query, topK, "", nil)
+}
+
+// SearchFiltered is the single search implementation. Supports optional source_type
+// pre-filter (SQL WHERE) and metadata post-filter (JSON comparison).
+func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType string, metadataFilter map[string]any) []SearchResult {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query(`SELECT id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time FROM entries`)
+	sqlQuery := `SELECT id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, source_type, metadata, relationships FROM entries`
+	var args []any
+	if sourceType != "" {
+		sqlQuery += ` WHERE source_type = ?`
+		args = append(args, sourceType)
+	}
+
+	rows, err := s.db.Query(sqlQuery, args...)
 	if err != nil {
 		return nil
 	}
@@ -107,14 +130,24 @@ func (s *VectorStore) Search(query []float32, topK int) []SearchResult {
 	for rows.Next() {
 		var rec VectorRecord
 		var vecBlob []byte
-		var kind, identifier sql.NullString
-		if err := rows.Scan(&rec.ID, &rec.FilePath, &rec.StartLine, &rec.EndLine, &rec.Content, &kind, &identifier, &vecBlob, &rec.ModTime); err != nil {
+		var kind, identifier, srcType, meta, rels sql.NullString
+		if err := rows.Scan(&rec.ID, &rec.FilePath, &rec.StartLine, &rec.EndLine, &rec.Content,
+			&kind, &identifier, &vecBlob, &rec.ModTime, &srcType, &meta, &rels); err != nil {
 			continue
 		}
 		rec.Kind = kind.String
 		rec.Identifier = identifier.String
-		rec.Embedding = decodeFloat32Vec(vecBlob)
-		sim := cosineSimilarity(query, rec.Embedding)
+		rec.SourceType = srcType.String
+		rec.Metadata = meta.String
+		rec.Relationships = rels.String
+		rec.Embedding = DecodeFloat32Vec(vecBlob)
+
+		// Post-filter: metadata match
+		if len(metadataFilter) > 0 && !matchesMetadata(rec.Metadata, metadataFilter) {
+			continue
+		}
+
+		sim := CosineSimilarity(query, rec.Embedding)
 		results = append(results, SearchResult{Record: rec, Similarity: sim})
 	}
 
@@ -125,6 +158,30 @@ func (s *VectorStore) Search(query []float32, topK int) []SearchResult {
 		results = results[:topK]
 	}
 	return results
+}
+
+// matchesMetadata checks if the record's JSON metadata contains all key-value pairs in the filter.
+// Uses JSON serialization for type-safe comparison (no fmt.Sprintf coercion).
+func matchesMetadata(metadataJSON string, filter map[string]any) bool {
+	if metadataJSON == "" || metadataJSON == "{}" {
+		return false
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(metadataJSON), &meta); err != nil {
+		return false
+	}
+	for k, v := range filter {
+		val, ok := meta[k]
+		if !ok {
+			return false
+		}
+		expected, _ := json.Marshal(v)
+		actual, _ := json.Marshal(val)
+		if !bytes.Equal(expected, actual) {
+			return false
+		}
+	}
+	return true
 }
 
 // Upsert adds or updates records. Records with matching IDs are replaced.
@@ -139,8 +196,8 @@ func (s *VectorStore) Upsert(records []VectorRecord) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO entries (id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, content_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT OR REPLACE INTO entries (id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, content_hash, source_type, metadata, relationships)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -148,8 +205,22 @@ func (s *VectorStore) Upsert(records []VectorRecord) error {
 	defer stmt.Close()
 
 	for _, r := range records {
-		vecBlob := encodeFloat32Vec(r.Embedding)
-		if _, err := stmt.Exec(r.ID, r.FilePath, r.StartLine, r.EndLine, r.Content, r.Kind, r.Identifier, vecBlob, r.ModTime, r.ContentHash); err != nil {
+		// Sanitize content: strip null bytes (SEC-10)
+		content := strings.ReplaceAll(r.Content, "\x00", "")
+		vecBlob := EncodeFloat32Vec(r.Embedding)
+		sourceType := r.SourceType
+		if sourceType == "" {
+			sourceType = "code"
+		}
+		metadata := r.Metadata
+		if metadata == "" {
+			metadata = "{}"
+		}
+		relationships := r.Relationships
+		if relationships == "" {
+			relationships = "[]"
+		}
+		if _, err := stmt.Exec(r.ID, r.FilePath, r.StartLine, r.EndLine, content, r.Kind, r.Identifier, vecBlob, r.ModTime, r.ContentHash, sourceType, metadata, relationships); err != nil {
 			return err
 		}
 	}
@@ -217,38 +288,16 @@ func (s *VectorStore) MaxModTimeForFile(filePath string) int64 {
 	return modTime
 }
 
-// encodeFloat32Vec serializes a []float32 to a compact binary blob.
-func encodeFloat32Vec(v []float32) []byte {
-	buf := make([]byte, len(v)*4)
-	for i, f := range v {
-		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
-	}
-	return buf
-}
+// SnippetBySource returns the first 200 characters of content for entries
+// matching the given file_path (source identifier).
+func (s *VectorStore) SnippetBySource(source string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-// decodeFloat32Vec deserializes a binary blob back to []float32.
-func decodeFloat32Vec(b []byte) []float32 {
-	n := len(b) / 4
-	v := make([]float32, n)
-	for i := range v {
-		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	var content string
+	s.db.QueryRow(`SELECT content FROM entries WHERE file_path = ? LIMIT 1`, source).Scan(&content)
+	if len(content) > 200 {
+		content = content[:200] + "..."
 	}
-	return v
-}
-
-// cosineSimilarity computes the cosine similarity between two vectors.
-func cosineSimilarity(a, b []float32) float64 {
-	if len(a) != len(b) || len(a) == 0 {
-		return 0
-	}
-	var dot, normA, normB float64
-	for i := range a {
-		dot += float64(a[i]) * float64(b[i])
-		normA += float64(a[i]) * float64(a[i])
-		normB += float64(b[i]) * float64(b[i])
-	}
-	if normA == 0 || normB == 0 {
-		return 0
-	}
-	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
+	return content
 }

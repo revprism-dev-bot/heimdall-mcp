@@ -83,6 +83,29 @@ func resolveConfigPath() string {
 	return ""
 }
 
+// ResolveMemoryDBPath returns the path to the global memory database.
+// It independently resolves the config dir without depending on config file existence.
+// Falls back to /tmp/heimdall-mcp if home dir cannot be determined.
+func ResolveMemoryDBPath() string {
+	dir := resolveConfigDir()
+	return filepath.Join(dir, "memories.db")
+}
+
+// resolveConfigDir returns the heimdall-mcp config directory, creating it if needed.
+func resolveConfigDir() string {
+	xdgConfig := os.Getenv("XDG_CONFIG_HOME")
+	if xdgConfig == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return filepath.Join(os.TempDir(), "heimdall-mcp")
+		}
+		xdgConfig = filepath.Join(home, ".config")
+	}
+	dir := filepath.Join(xdgConfig, "heimdall-mcp")
+	os.MkdirAll(dir, 0700)
+	return dir
+}
+
 // migrateConfigDir renames the config directory from openviking-mcp to heimdall-mcp.
 // Uses a lock file to prevent TOCTOU races.
 func migrateConfigDir() {

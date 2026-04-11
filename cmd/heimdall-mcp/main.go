@@ -42,8 +42,16 @@ func main() {
 		return
 	}
 
+	// Open global memory store
+	memDBPath := config.ResolveMemoryDBPath()
+	memStore, err := heimdall.OpenMemoryStore(memDBPath)
+	if err != nil {
+		log.Fatalf("failed to open memory store at %s: %v", memDBPath, err)
+	}
+	defer memStore.Close()
+
 	// MCP mode: no args, run as stdio MCP server
-	s := &mcp.Server{Cfg: cfg, Registry: registry.LoadRegistry()}
+	s := &mcp.Server{Cfg: cfg, Registry: registry.LoadRegistry(), MemoryStore: memStore}
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)

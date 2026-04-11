@@ -55,9 +55,11 @@ type MCPContent struct {
 // --- Tool input types ---
 
 type searchInput struct {
-	Query   string `json:"query"`
-	Limit   int    `json:"limit"`
-	Project string `json:"project"` // optional: project name or path
+	Query          string          `json:"query"`
+	Limit          int             `json:"limit"`
+	Project        string          `json:"project"`         // optional: project name or path
+	SourceType     string          `json:"source_type"`     // optional: filter by source type
+	MetadataFilter json.RawMessage `json:"metadata_filter"` // optional: filter by metadata key-value pairs
 }
 
 type indexInput struct {
@@ -65,10 +67,110 @@ type indexInput struct {
 }
 
 type indexTextInput struct {
-	Content string `json:"content"` // the text to index
-	Source  string `json:"source"`  // identifier (e.g. "JIRA-123", "confluence:page-title", "slack:#channel")
-	URL     string `json:"url"`     // optional link to the original source
-	Project string `json:"project"` // which project to store it under (optional, uses CWD)
+	Content       string          `json:"content"`       // the text to index
+	Source        string          `json:"source"`        // identifier (e.g. "JIRA-123", "confluence:page-title")
+	URL           string          `json:"url"`           // optional link to the original source
+	Project       string          `json:"project"`       // which project to store it under (optional)
+	Type          string          `json:"type"`          // content type: ticket, doc, pr, message, changelog, note, custom
+	Metadata      json.RawMessage `json:"metadata"`      // arbitrary JSON object
+	Relationships json.RawMessage `json:"relationships"` // array of {type, target}
+}
+
+type explainInput struct {
+	Query   string `json:"query"`
+	Limit   int    `json:"limit"`   // default 10
+	Project string `json:"project"` // optional
+}
+
+// --- Enriched search result ---
+
+// SearchResultEnriched is the enriched result returned by heimdall_search.
+type SearchResultEnriched struct {
+	File           string  `json:"file"`
+	StartLine      int     `json:"startLine"`
+	EndLine        int     `json:"endLine"`
+	Content        string  `json:"content"`
+	Score          float64 `json:"score"`
+	Source         string  `json:"source"`         // "code", "external", "memory"
+	ChunkID        string  `json:"chunkId"`
+	EmbeddingModel string  `json:"embeddingModel"`
+}
+
+// --- Explain result types ---
+
+// ExplainResult is the full diagnostic output for heimdall_explain.
+type ExplainResult struct {
+	Query               string              `json:"query"`
+	QueryEmbeddingDim   int                 `json:"queryEmbeddingDim"`
+	TotalChunksSearched int                 `json:"totalChunksSearched"`
+	SearchTimeMs        int64               `json:"searchTimeMs"`
+	Results             []ExplainResultItem `json:"results"`
+	ScoreDistribution   ScoreDistribution   `json:"scoreDistribution"`
+	SourceCounts        SourceCounts        `json:"sourceCounts"`
+	IndexStats          IndexStatsInfo      `json:"indexStats"`
+}
+
+// ExplainResultItem is a single result in the explain output.
+type ExplainResultItem struct {
+	Rank           int           `json:"rank"`
+	ChunkID        string        `json:"chunkId"`
+	File           string        `json:"file"`
+	Score          float64       `json:"score"`
+	Source         string        `json:"source"`
+	ChunkSizeBytes int           `json:"chunkSizeBytes"`
+	ChunkLines     int           `json:"chunkLines"`
+	Related        []RelatedItem `json:"related,omitempty"`
+}
+
+// ScoreDistribution categorizes search results by score range.
+type ScoreDistribution struct {
+	Above90 int `json:"above90"`
+	Above70 int `json:"above70"`
+	Above50 int `json:"above50"`
+	Below50 int `json:"below50"`
+}
+
+// SourceCounts tallies results by source type.
+type SourceCounts struct {
+	Code     int `json:"code"`
+	External int `json:"external"`
+	Memory   int `json:"memory"`
+}
+
+// IndexStatsInfo holds high-level index statistics for explain output.
+type IndexStatsInfo struct {
+	TotalChunks int    `json:"totalChunks"`
+	TotalFiles  int    `json:"totalFiles"`
+	LastIndexed string `json:"lastIndexed"`
+}
+
+// RelatedItem is a relationship-traversal result.
+type RelatedItem struct {
+	Source       string `json:"source"`
+	Relationship string `json:"relationship"`
+	Snippet      string `json:"snippet"`
+}
+
+// --- Memory tool input types ---
+
+type rememberInput struct {
+	Content string   `json:"content"`
+	Tags    []string `json:"tags"`
+	Type    string   `json:"type"`    // "preference", "decision", "fact", "context"
+	Project string   `json:"project"`
+}
+
+type recallInput struct {
+	Query   string   `json:"query"`
+	Tags    []string `json:"tags"`
+	Type    string   `json:"type"`
+	Limit   int      `json:"limit"`
+	Project string   `json:"project"`
+}
+
+type ingestSessionInput struct {
+	Summary string `json:"summary"`
+	Project string `json:"project"`
 }
 
 // --- Index state ---
