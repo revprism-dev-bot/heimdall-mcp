@@ -61,13 +61,20 @@ func promptModelSelection(models []discoveredModel, currentModel string) ([]stri
 	}
 
 	if len(embeddable) == 0 {
-		return nil, fmt.Errorf("no embedding-capable models found in Ollama")
+		return nil, fmt.Errorf("no embedding-capable models found in Ollama.\n\nPull an embedding model first:\n  ollama pull nomic-embed-text\n\nSee all options: heimdall-mcp models")
 	}
 
-	// Single model — auto-select, no prompt needed
+	// Single model — show what it is, auto-select
 	if len(embeddable) == 1 {
-		fmt.Printf("  Using: %s (%dd)\n\n", embeddable[0].Name, embeddable[0].Dimensions)
-		return []string{embeddable[0].Name}, nil
+		m := embeddable[0]
+		fmt.Printf("1 embedding model found:\n")
+		if m.Known != nil {
+			fmt.Printf("  %s — %s, %s, %dd\n", stripTag(m.Name), m.Known.Origin, m.Known.Params, m.Dimensions)
+		} else {
+			fmt.Printf("  %s — %dd\n", stripTag(m.Name), m.Dimensions)
+		}
+		fmt.Println()
+		return []string{m.Name}, nil
 	}
 
 	// Build options for multi-select
