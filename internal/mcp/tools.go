@@ -28,7 +28,7 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	ctx := context.Background()
 	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
-		return ErrResult("Ollama not reachable at " + s.Cfg.OllamaEndpoint + ": " + err.Error())
+		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
 
 	// Resolve DB directory (read-only)

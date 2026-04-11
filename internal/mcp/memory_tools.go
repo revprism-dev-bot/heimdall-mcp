@@ -68,7 +68,7 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 	ctx := context.Background()
 	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
-		return ErrResult("Ollama not reachable: " + err.Error())
+		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
 	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
 
@@ -161,7 +161,7 @@ func (s *Server) toolRecall(args json.RawMessage) MCPToolResult {
 	ctx := context.Background()
 	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
-		return ErrResult("Ollama not reachable: " + err.Error())
+		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
 	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
 
@@ -230,7 +230,7 @@ func (s *Server) toolIngestSession(args json.RawMessage) MCPToolResult {
 	ctx := context.Background()
 	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
-		return ErrResult("Ollama not reachable: " + err.Error())
+		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
 	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
 
