@@ -2,11 +2,12 @@ package config
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 )
 
-// Config holds the OpenViking MCP server configuration.
+// Config holds the Heimdall MCP server configuration.
 type Config struct {
 	OllamaEndpoint   string   `json:"ollamaEndpoint"`
 	Model            string   `json:"model"`
@@ -22,12 +23,13 @@ func DefaultConfig() Config {
 		Model:            "bge-m3",
 		ContextDepth:     1,
 		MaxContextTokens: 4096,
-		ExcludePatterns:  []string{".git", "node_modules", "vendor", ".viking_db", "__pycache__", ".idea"},
+		ExcludePatterns:  []string{".git", "node_modules", "vendor", ".heimdall_db", "__pycache__", ".idea"},
 	}
 }
 
 // LoadConfig loads config from the resolved path, merging with defaults.
 func LoadConfig() Config {
+	migrateConfigDir()
 	cfg := DefaultConfig()
 	path := resolveConfigPath()
 	if path == "" {
@@ -62,11 +64,11 @@ func LoadConfig() Config {
 }
 
 // resolveConfigPath finds the config file using this precedence:
-// 1. $OPENVIKING_MCP_CONFIG env var
-// 2. $XDG_CONFIG_HOME/openviking-mcp/config.json
-// 3. ~/.config/openviking-mcp/config.json
+// 1. $HEIMDALL_MCP_CONFIG env var
+// 2. $XDG_CONFIG_HOME/heimdall-mcp/config.json
+// 3. ~/.config/heimdall-mcp/config.json
 func resolveConfigPath() string {
-	if envPath := os.Getenv("OPENVIKING_MCP_CONFIG"); envPath != "" {
+	if envPath := os.Getenv("HEIMDALL_MCP_CONFIG"); envPath != "" {
 		return envPath
 	}
 	xdgConfig := os.Getenv("XDG_CONFIG_HOME")
@@ -74,9 +76,53 @@ func resolveConfigPath() string {
 		home, _ := os.UserHomeDir()
 		xdgConfig = filepath.Join(home, ".config")
 	}
-	path := filepath.Join(xdgConfig, "openviking-mcp", "config.json")
+	path := filepath.Join(xdgConfig, "heimdall-mcp", "config.json")
 	if _, err := os.Stat(path); err == nil {
 		return path
 	}
 	return ""
+}
+
+// migrateConfigDir renames the config directory from openviking-mcp to heimdall-mcp.
+// Uses a lock file to prevent TOCTOU races.
+func migrateConfigDir() {
+	xdgConfig := os.Getenv("XDG_CONFIG_HOME")
+	if xdgConfig == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		xdgConfig = filepath.Join(home, ".config")
+	}
+
+	oldDir := filepath.Join(xdgConfig, "openviking-mcp")
+	newDir := filepath.Join(xdgConfig, "heimdall-mcp")
+
+	// Quick pre-check
+	if _, err := os.Stat(oldDir); err != nil {
+		return
+	}
+
+	// Acquire exclusive lock file
+	lockPath := filepath.Join(xdgConfig, ".heimdall-config-migrate.lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return // another process is migrating
+	}
+	defer os.Remove(lockPath)
+	defer lock.Close()
+
+	// Re-check after lock
+	if _, err := os.Stat(oldDir); err != nil {
+		return
+	}
+	if _, err := os.Stat(newDir); err == nil {
+		return // new dir already exists
+	}
+
+	if err := os.Rename(oldDir, newDir); err != nil {
+		log.Printf("heimdall: failed to migrate config %s → %s: %v", oldDir, newDir, err)
+		return
+	}
+	log.Printf("heimdall: migrated config directory %s → %s", oldDir, newDir)
 }

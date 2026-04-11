@@ -1,4 +1,4 @@
-/openviking-mcp
-.viking_db/
+/heimdall-mcp
+.heimdall_db/
 *.log
 dist/

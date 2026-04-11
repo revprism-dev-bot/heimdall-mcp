@@ -1,4 +1,4 @@
-// openviking-mcp is a stdio MCP server that provides local semantic code
+// heimdall-mcp is a stdio MCP server that provides local semantic code
 // search powered by Ollama embeddings (BGE-M3) and a SQLite vector store.
 //
 // It enables any MCP client (Claude Code, Claude Desktop, etc.) to search,
@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	claude mcp add openviking /path/to/openviking-mcp
+//	claude mcp add heimdall /path/to/heimdall-mcp
 package main
 
 import (
@@ -17,15 +17,22 @@ import (
 	"log"
 	"os"
 
-	"github.com/caio-silva/openviking-mcp/internal/cli"
-	"github.com/caio-silva/openviking-mcp/internal/config"
-	"github.com/caio-silva/openviking-mcp/internal/mcp"
-	"github.com/caio-silva/openviking-mcp/internal/registry"
+	"github.com/caio-silva/heimdall-mcp/internal/cli"
+	"github.com/caio-silva/heimdall-mcp/internal/config"
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
+	"github.com/caio-silva/heimdall-mcp/internal/mcp"
+	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
 
 func main() {
 	log.SetOutput(os.Stderr)
-	log.SetPrefix("openviking-mcp: ")
+	log.SetPrefix("heimdall-mcp: ")
+
+	// Migrate legacy .viking_db directory to .heimdall_db in CWD
+	cwd, _ := os.Getwd()
+	if cwd != "" {
+		heimdall.MigrateDBDir(cwd)
+	}
 
 	cfg := config.LoadConfig()
 

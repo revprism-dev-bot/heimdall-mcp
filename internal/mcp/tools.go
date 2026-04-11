@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/caio-silva/openviking-mcp/internal/openviking"
-	"github.com/caio-silva/openviking-mcp/internal/registry"
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
+	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
 
 func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
@@ -26,7 +26,7 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	}
 
 	ctx := context.Background()
-	client := openviking.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
 		return ErrResult("Ollama not reachable at " + s.Cfg.OllamaEndpoint + ": " + err.Error())
 	}
@@ -34,7 +34,7 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	// Resolve DB directory using registry
 	// 1. If project param given, look up in registry
 	// 2. If no param, try registry.FindByCWD(cwd)
-	// 3. Fallback: cwd/.viking_db/
+	// 3. Fallback: cwd/.heimdall_db/
 	cwd, _ := os.Getwd()
 	dbDir := ""
 
@@ -53,21 +53,21 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	}
 
 	if dbDir == "" {
-		dbDir = filepath.Join(cwd, ".viking_db")
+		dbDir = filepath.Join(cwd, ".heimdall_db")
 	}
 
 	if _, err := os.Stat(dbDir); err != nil {
 		return ErrResult("No index found. Run index_project first.")
 	}
 
-	store, err := openviking.OpenStore(dbDir)
+	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
 		return ErrResult("store error: " + err.Error())
 	}
 	defer store.Close()
 
-	embedder := openviking.NewOllamaEmbedder(client, s.Cfg.Model)
-	retriever := openviking.NewRetriever(embedder, store, input.Limit, s.Cfg.MaxContextTokens)
+	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
+	retriever := heimdall.NewRetriever(embedder, store, input.Limit, s.Cfg.MaxContextTokens)
 
 	blocks, err := retriever.Retrieve(ctx, input.Query)
 	if err != nil {
@@ -124,7 +124,7 @@ func (s *Server) toolIndex(args json.RawMessage) MCPToolResult {
 	s.Index.Mu.Lock()
 	if s.Index.Running {
 		s.Index.Mu.Unlock()
-		return TextResult(fmt.Sprintf("Indexing already in progress: %s (%d/%d files)\nUse openviking_status to check progress.",
+		return TextResult(fmt.Sprintf("Indexing already in progress: %s (%d/%d files)\nUse heimdall_status to check progress.",
 			s.Index.Path, s.Index.Current, s.Index.Total))
 	}
 
@@ -161,7 +161,7 @@ func (s *Server) toolIndex(args json.RawMessage) MCPToolResult {
 
 	go s.runIndex(ctx, absPath)
 
-	return TextResult(fmt.Sprintf("Indexing started in background: %s\nUse openviking_status to check progress. Call index_project again when done to get results.", absPath))
+	return TextResult(fmt.Sprintf("Indexing started in background: %s\nUse heimdall_status to check progress. Call heimdall_index again when done to get results.", absPath))
 }
 
 func (s *Server) runIndex(ctx context.Context, absPath string) {
@@ -174,7 +174,7 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 		s.Index.Mu.Unlock()
 	}()
 
-	client := openviking.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
 
 	if err := client.Ping(ctx); err != nil {
 		s.Index.Mu.Lock()
@@ -185,8 +185,8 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 	}
 
 	cwd, _ := os.Getwd()
-	dbDir := filepath.Join(cwd, ".viking_db")
-	store, err := openviking.OpenStore(dbDir)
+	dbDir := filepath.Join(cwd, ".heimdall_db")
+	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
 		s.Index.Mu.Lock()
 		s.Index.Running = false
@@ -196,14 +196,14 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 	}
 	defer store.Close()
 
-	embedder := openviking.NewOllamaEmbedder(client, s.Cfg.Model)
-	indexer := openviking.NewIndexer(absPath, embedder, store, openviking.ChunkerOpts{
+	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
+	indexer := heimdall.NewIndexer(absPath, embedder, store, heimdall.ChunkerOpts{
 		MaxChunkSize: 1500,
 		ContextDepth: s.Cfg.ContextDepth,
 		ExcludeGlobs: s.Cfg.ExcludePatterns,
 	})
 
-	progressCh := make(chan openviking.IndexProgress, 64)
+	progressCh := make(chan heimdall.IndexProgress, 64)
 	indexer.IndexProjectAsync(ctx, progressCh)
 
 	const stallTimeout = 30 * time.Minute
@@ -271,7 +271,7 @@ func (s *Server) toolStatus() MCPToolResult {
 		"excludePatterns": s.Cfg.ExcludePatterns,
 	}
 
-	client := openviking.NewOllamaClient(endpoint)
+	client := heimdall.NewOllamaClient(endpoint)
 	if err := client.Ping(ctx); err != nil {
 		status["ollamaRunning"] = false
 	} else {
@@ -290,9 +290,9 @@ func (s *Server) toolStatus() MCPToolResult {
 	}
 
 	cwd, _ := os.Getwd()
-	dbDir := filepath.Join(cwd, ".viking_db")
+	dbDir := filepath.Join(cwd, ".heimdall_db")
 	if _, err := os.Stat(dbDir); err == nil {
-		store, err := openviking.OpenStore(dbDir)
+		store, err := heimdall.OpenStore(dbDir)
 		if err == nil {
 			defer store.Close()
 			stats := store.Stats()

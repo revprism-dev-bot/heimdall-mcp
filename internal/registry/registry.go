@@ -11,7 +11,7 @@ import (
 type ProjectEntry struct {
 	Name   string `json:"name"`   // short name (e.g. "payments-analyzer")
 	Path   string `json:"path"`   // absolute path to project root
-	DBPath string `json:"dbPath"` // absolute path to .viking_db directory
+	DBPath string `json:"dbPath"` // absolute path to .heimdall_db directory
 }
 
 // Registry manages the list of indexed projects.
@@ -28,7 +28,7 @@ func registryPath() string {
 		home, _ := os.UserHomeDir()
 		xdgConfig = filepath.Join(home, ".config")
 	}
-	return filepath.Join(xdgConfig, "openviking-mcp", "projects.json")
+	return filepath.Join(xdgConfig, "heimdall-mcp", "projects.json")
 }
 
 // LoadRegistry loads the project registry from disk.

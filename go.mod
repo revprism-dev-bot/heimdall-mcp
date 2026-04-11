@@ -1,4 +1,4 @@
-module github.com/caio-silva/openviking-mcp
+module github.com/caio-silva/heimdall-mcp
 
 go 1.25.0
 

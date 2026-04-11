@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/caio-silva/openviking-mcp/internal/openviking"
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
 
 // --- JSON-RPC / MCP types ---
@@ -82,7 +82,7 @@ type IndexState struct {
 	Total      int
 	StartedAt  time.Time
 	LastUpdate time.Time
-	Result     *openviking.IndexResult
+	Result     *heimdall.IndexResult
 	Err        error
 	Cancel     context.CancelFunc
 }

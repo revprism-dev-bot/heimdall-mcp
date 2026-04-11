@@ -1,4 +1,4 @@
-// Package mcp implements the JSON-RPC based MCP server for OpenViking.
+// Package mcp implements the JSON-RPC based MCP server for Heimdall.
 package mcp
 
 import (
@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/caio-silva/openviking-mcp/internal/config"
-	"github.com/caio-silva/openviking-mcp/internal/openviking"
-	"github.com/caio-silva/openviking-mcp/internal/registry"
+	"github.com/caio-silva/heimdall-mcp/internal/config"
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
+	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
 
 // Server holds runtime state for the MCP server.
@@ -64,7 +64,7 @@ func (s *Server) handleInitialize(req JSONRPCRequest) *JSONRPCResponse {
 				"tools": map[string]any{},
 			},
 			"serverInfo": map[string]any{
-				"name":    "openviking-mcp",
+				"name":    "heimdall-mcp",
 				"version": "1.0.0",
 			},
 		},
@@ -74,7 +74,7 @@ func (s *Server) handleInitialize(req JSONRPCRequest) *JSONRPCResponse {
 func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 	tools := []MCPToolInfo{
 		{
-			Name:        "search_context",
+			Name:        "heimdall_search",
 			Description: "Search indexed project files for code relevant to a query. Uses local Ollama embeddings and a SQLite vector store.",
 			InputSchema: map[string]any{
 				"type": "object",
@@ -97,8 +97,8 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 			},
 		},
 		{
-			Name:        "index_project",
-			Description: "Index a directory for semantic search. Runs in the background — call openviking_status to check progress. Creates or updates the .viking_db/ vector store.",
+			Name:        "heimdall_index",
+			Description: "Index a directory for semantic search. Runs in the background — call heimdall_status to check progress. Creates or updates the .heimdall_db/ vector store.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -111,16 +111,16 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 			},
 		},
 		{
-			Name:        "openviking_status",
-			Description: "Check the status of the OpenViking context engine: Ollama reachability, model availability, index statistics, and indexing progress.",
+			Name:        "heimdall_status",
+			Description: "Check the status of the Heimdall context engine: Ollama reachability, model availability, index statistics, and indexing progress.",
 			InputSchema: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
 			},
 		},
 		{
-			Name:        "index_text",
-			Description: "Index arbitrary text content for semantic search. Use this to store context from external sources (Jira tickets, Confluence pages, Slack messages, changelogs, etc.) so it can be found via search_context alongside code.",
+			Name:        "heimdall_index_text",
+			Description: "Index arbitrary text content for semantic search. Use this to store context from external sources (Jira tickets, Confluence pages, Slack messages, changelogs, etc.) so it can be found via heimdall_search alongside code.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -145,8 +145,8 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 			},
 		},
 		{
-			Name:        "list_projects",
-			Description: "List all projects registered in the OpenViking index registry. Shows project names, paths, and database locations.",
+			Name:        "heimdall_projects",
+			Description: "List all projects registered in the Heimdall index registry. Shows project names, paths, and database locations.",
 			InputSchema: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
@@ -176,15 +176,15 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 
 	var result MCPToolResult
 	switch params.Name {
-	case "search_context":
+	case "heimdall_search":
 		result = s.toolSearch(params.Arguments)
-	case "index_project":
+	case "heimdall_index":
 		result = s.toolIndex(params.Arguments)
-	case "openviking_status":
+	case "heimdall_status":
 		result = s.toolStatus()
-	case "index_text":
+	case "heimdall_index_text":
 		result = s.toolIndexText(params.Arguments)
-	case "list_projects":
+	case "heimdall_projects":
 		result = s.toolListProjects()
 	default:
 		return &JSONRPCResponse{
@@ -210,7 +210,7 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 	}
 
 	ctx := context.Background()
-	client := openviking.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
 		return ErrResult("Ollama not reachable: " + err.Error())
 	}
@@ -227,17 +227,17 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 		if p := s.Registry.FindByCWD(cwd); p != nil {
 			dbDir = p.DBPath
 		} else {
-			dbDir = filepath.Join(cwd, ".viking_db")
+			dbDir = filepath.Join(cwd, ".heimdall_db")
 		}
 	}
 
-	store, err := openviking.OpenStore(dbDir)
+	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
 		return ErrResult("store error: " + err.Error())
 	}
 	defer store.Close()
 
-	embedder := openviking.NewOllamaEmbedder(client, s.Cfg.Model)
+	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
 
 	// Prepend source metadata so it shows up in search results
 	content := input.Content
@@ -248,13 +248,13 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 	// Chunk the text
 	chunks := chunkText(content, input.Source, 1500)
 
-	var records []openviking.VectorRecord
+	var records []heimdall.VectorRecord
 	for i, chunk := range chunks {
 		vec, err := embedder.Embed(ctx, chunk.Content)
 		if err != nil {
 			return ErrResult(fmt.Sprintf("embedding error on chunk %d: %v", i, err))
 		}
-		records = append(records, openviking.VectorRecord{
+		records = append(records, heimdall.VectorRecord{
 			ID:          fmt.Sprintf("ext:%s:%d", input.Source, i),
 			FilePath:    input.Source,
 			StartLine:   chunk.Start,

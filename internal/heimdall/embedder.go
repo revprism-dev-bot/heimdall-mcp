@@ -1,4 +1,4 @@
-package openviking
+package heimdall
 
 import "context"
 

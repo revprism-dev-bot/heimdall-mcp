@@ -1,4 +1,4 @@
-package openviking
+package heimdall
 
 // ChunkerOpts controls chunking behavior.
 type ChunkerOpts struct {

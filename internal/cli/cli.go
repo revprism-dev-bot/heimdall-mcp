@@ -1,4 +1,4 @@
-// Package cli implements the command-line interface for openviking-mcp.
+// Package cli implements the command-line interface for heimdall-mcp.
 package cli
 
 import (
@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/caio-silva/openviking-mcp/internal/config"
-	"github.com/caio-silva/openviking-mcp/internal/openviking"
-	"github.com/caio-silva/openviking-mcp/internal/registry"
+	"github.com/caio-silva/heimdall-mcp/internal/config"
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
+	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
 
 // RunCLI dispatches the CLI subcommand.
@@ -31,7 +31,7 @@ func RunCLI(cfg config.Config, args []string) {
 	switch cmd {
 	case "index":
 		if len(cleanArgs) < 1 {
-			fmt.Fprintf(os.Stderr, "Usage: openviking-mcp index <path> [--out /path/to/output/dir]\n")
+			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp index <path> [--out /path/to/output/dir]\n")
 			os.Exit(1)
 		}
 		cliIndex(cfg, cleanArgs[0], outPath)
@@ -39,29 +39,29 @@ func RunCLI(cfg config.Config, args []string) {
 		cliStatus(cfg, outPath)
 	case "search":
 		if len(cleanArgs) < 1 {
-			fmt.Fprintf(os.Stderr, "Usage: openviking-mcp search <query> [--out /path/to/db/dir]\n")
+			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp search <query> [--out /path/to/db/dir]\n")
 			os.Exit(1)
 		}
 		cliSearch(cfg, cleanArgs[0], outPath)
 	case "projects":
 		cliProjects()
 	case "help", "--help", "-h":
-		fmt.Println("openviking-mcp — local semantic code search")
+		fmt.Println("heimdall-mcp — local semantic code search")
 		fmt.Println()
 		fmt.Println("CLI usage:")
-		fmt.Println("  openviking-mcp index <path> [--out <dir>]   Index a directory")
-		fmt.Println("  openviking-mcp status [--out <dir>]         Show index stats")
-		fmt.Println("  openviking-mcp search <query> [--out <dir>] Search indexed files")
-		fmt.Println("  openviking-mcp projects                     List registered projects")
+		fmt.Println("  heimdall-mcp index <path> [--out <dir>]   Index a directory")
+		fmt.Println("  heimdall-mcp status [--out <dir>]         Show index stats")
+		fmt.Println("  heimdall-mcp search <query> [--out <dir>] Search indexed files")
+		fmt.Println("  heimdall-mcp projects                     List registered projects")
 		fmt.Println()
 		fmt.Println("Options:")
-		fmt.Println("  --out, -o <dir>  Where to store the database (default: <path>/.viking_db/)")
+		fmt.Println("  --out, -o <dir>  Where to store the database (default: <path>/.heimdall_db/)")
 		fmt.Println("                   The DB is a single file: <dir>/vectors.db")
 		fmt.Println()
 		fmt.Println("MCP usage (no args):")
-		fmt.Println("  claude mcp add openviking /path/to/openviking-mcp")
+		fmt.Println("  claude mcp add heimdall /path/to/heimdall-mcp")
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\nRun: openviking-mcp help\n", cmd)
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\nRun: heimdall-mcp help\n", cmd)
 		os.Exit(1)
 	}
 }
@@ -82,8 +82,11 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 		os.Exit(1)
 	}
 
+	// Migrate legacy .viking_db directory to .heimdall_db
+	heimdall.MigrateDBDir(absPath)
+
 	ctx := context.Background()
-	client := openviking.NewOllamaClient(cfg.OllamaEndpoint)
+	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
 	fmt.Printf("Connecting to Ollama at %s...\n", cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Ollama not reachable: %v\n", err)
@@ -93,17 +96,17 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 
 	dbDir := dbPath
 	if dbDir == "" {
-		dbDir = filepath.Join(absPath, ".viking_db")
+		dbDir = filepath.Join(absPath, ".heimdall_db")
 	}
-	store, err := openviking.OpenStore(dbDir)
+	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Store error: %v\n", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 
-	embedder := openviking.NewOllamaEmbedder(client, cfg.Model)
-	indexer := openviking.NewIndexer(absPath, embedder, store, openviking.ChunkerOpts{
+	embedder := heimdall.NewOllamaEmbedder(client, cfg.Model)
+	indexer := heimdall.NewIndexer(absPath, embedder, store, heimdall.ChunkerOpts{
 		MaxChunkSize: 1500,
 		ContextDepth: cfg.ContextDepth,
 		ExcludeGlobs: cfg.ExcludePatterns,
@@ -117,7 +120,7 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 	// Use async with progress so we get live updates.
 	// Incremental: skips files already indexed with same modtime.
 	// If you stop and restart, it picks up where it left off.
-	progressCh := make(chan openviking.IndexProgress, 64)
+	progressCh := make(chan heimdall.IndexProgress, 64)
 	indexer.IndexProjectAsync(ctx, progressCh)
 
 	lastPrint := time.Now()
@@ -175,7 +178,7 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 
 func cliStatus(cfg config.Config, dbPath string) {
 	ctx := context.Background()
-	client := openviking.NewOllamaClient(cfg.OllamaEndpoint)
+	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
 
 	fmt.Printf("Ollama: %s\n", cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
@@ -202,10 +205,10 @@ func cliStatus(cfg config.Config, dbPath string) {
 	statusDbDir := dbPath
 	if statusDbDir == "" {
 		cwd, _ := os.Getwd()
-		statusDbDir = filepath.Join(cwd, ".viking_db")
+		statusDbDir = filepath.Join(cwd, ".heimdall_db")
 	}
 	if _, err := os.Stat(statusDbDir); err == nil {
-		store, err := openviking.OpenStore(statusDbDir)
+		store, err := heimdall.OpenStore(statusDbDir)
 		if err == nil {
 			defer store.Close()
 			stats := store.Stats()
@@ -238,7 +241,7 @@ func cliStatus(cfg config.Config, dbPath string) {
 
 func cliSearch(cfg config.Config, query string, dbPath string) {
 	ctx := context.Background()
-	client := openviking.NewOllamaClient(cfg.OllamaEndpoint)
+	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Ollama not reachable: %v\n", err)
 		os.Exit(1)
@@ -247,17 +250,17 @@ func cliSearch(cfg config.Config, query string, dbPath string) {
 	searchDbDir := dbPath
 	if searchDbDir == "" {
 		cwd, _ := os.Getwd()
-		searchDbDir = filepath.Join(cwd, ".viking_db")
+		searchDbDir = filepath.Join(cwd, ".heimdall_db")
 	}
-	store, err := openviking.OpenStore(searchDbDir)
+	store, err := heimdall.OpenStore(searchDbDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Store error: %v\n", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 
-	embedder := openviking.NewOllamaEmbedder(client, cfg.Model)
-	retriever := openviking.NewRetriever(embedder, store, 5, cfg.MaxContextTokens)
+	embedder := heimdall.NewOllamaEmbedder(client, cfg.Model)
+	retriever := heimdall.NewRetriever(embedder, store, 5, cfg.MaxContextTokens)
 
 	blocks, err := retriever.Retrieve(ctx, query)
 	if err != nil {
@@ -300,7 +303,7 @@ func cliProjects() {
 
 		// Try to show stats
 		if _, err := os.Stat(p.DBPath); err == nil {
-			store, err := openviking.OpenStore(p.DBPath)
+			store, err := heimdall.OpenStore(p.DBPath)
 			if err == nil {
 				stats := store.Stats()
 				fmt.Printf("    Files: %d  Chunks: %d", stats.TotalFiles, stats.TotalRecords)

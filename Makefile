@@ -3,13 +3,13 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 .PHONY: build install clean test
 
 build:
-	go build -ldflags "-X main.version=$(VERSION)" -o openviking-mcp ./cmd/openviking-mcp
+	go build -ldflags "-X main.version=$(VERSION)" -o heimdall-mcp ./cmd/heimdall-mcp
 
 install:
-	go install ./cmd/openviking-mcp
+	go install ./cmd/heimdall-mcp
 
 clean:
-	rm -f openviking-mcp
+	rm -f heimdall-mcp
 
 test:
 	go test ./... -race -count=1 -timeout 60s

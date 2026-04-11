@@ -1,4 +1,4 @@
-package openviking
+package heimdall
 
 import (
 	"context"
@@ -356,7 +356,7 @@ func (idx *Indexer) chunkFile(path, relPath string) ([]Chunk, error) {
 // shouldExclude checks if a relative path matches any exclude pattern.
 func (idx *Indexer) shouldExclude(relPath string) bool {
 	// Always exclude common directories
-	defaultExcludes := []string{".git", "node_modules", ".viking_db", "vendor", "__pycache__", ".idea"}
+	defaultExcludes := []string{".git", "node_modules", ".heimdall_db", "vendor", "__pycache__", ".idea"}
 	allExcludes := append(defaultExcludes, idx.opts.ExcludeGlobs...)
 
 	parts := strings.Split(filepath.ToSlash(relPath), "/")
