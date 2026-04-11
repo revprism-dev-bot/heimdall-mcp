@@ -246,6 +246,25 @@ Search with filters:
 
 When a result has relationships, `heimdall_explain` includes related items with snippets.
 
+## Incremental Indexing
+
+Re-indexing is fast because Heimdall only processes files that actually changed:
+
+1. **Modtime check** — If the file's modification time hasn't changed since it was last indexed, skip it. This is the fast path and handles most cases.
+2. **Content hash fallback** — If the modtime changed but the SHA-256 hash of the file content is the same (e.g. `git checkout`, copied DB, `touch`), skip it anyway.
+3. **New files** — Files not in the index are always processed.
+
+This means if you have 500 indexed files and change 1, re-indexing makes 1 embedding call instead of 500.
+
+The CLI shows this in action:
+```
+heimdall-mcp index /path/to/project
+  [0:02] 500/500 files 100% (12 chunks) — done
+  Scanned:  500 files
+  Indexed:  1 file       ← only the changed one
+  Skipped:  499 files (unchanged)
+```
+
 ## Portable Indexes
 
 The `.heimdall_db/` directory contains a single `vectors.db` SQLite file. You can copy it between machines as long as the same embedding model is used (the model name is stored in the DB and checked automatically). File paths stored in the index are relative, so projects can live at different absolute paths.
@@ -262,7 +281,7 @@ source ollama-env.sh && ollama serve
 
 1. **Index** — `heimdall_index` scans files, chunks them, generates embeddings via Ollama, stores in `.heimdall_db/vectors.db`. Git commits are indexed automatically if `.git/` exists.
 2. **Search** — `heimdall_search` embeds your query, finds similar chunks via cosine similarity with freshness decay, updates `last_accessed` timestamps, and triggers lifecycle maintenance.
-3. **Incremental** — Re-indexing only processes changed files (based on modtime + content hash). Background indexing with progress tracking and stall detection.
+3. **Incremental** — Re-indexing only processes files that actually changed. Two-tier detection: fast modtime check first, then SHA-256 content hash fallback (handles copied DBs and git clones). Unchanged files are skipped entirely — no embedding calls, no DB writes. Background indexing with progress tracking and stall detection.
 4. **Memory** — `heimdall_remember` embeds and stores memories with two-tier deduplication (content hash + semantic similarity). `heimdall_recall` retrieves them via vector search.
 5. **Lifecycle** — Stale external content is progressively archived then pruned. Code and memory entries are exempt. Size caps prevent unbounded growth.
 
