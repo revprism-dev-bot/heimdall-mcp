@@ -1,0 +1,344 @@
+package mcp
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+
+	"github.com/caio-silva/heimdall-mcp/internal/config"
+)
+
+// --- Input types ---
+
+type configureInput struct {
+	Action string `json:"action"` // "get" or "set"
+	Key    string `json:"key"`    // dot-notation key (optional for "get")
+	Value  any    `json:"value"`  // value to set (required for "set")
+}
+
+type managePathsInput struct {
+	Action string `json:"action"` // "add", "remove", "list"
+	Path   string `json:"path"`   // required for add/remove
+}
+
+// --- Config key definitions ---
+
+type configKeyDef struct {
+	Type    string // "bool", "int", "[]string"
+	Get     func(c *config.Config) any
+	Set     func(c *config.Config, v any) error
+}
+
+var configKeys = map[string]configKeyDef{
+	"git.enabled": {
+		Type: "bool",
+		Get:  func(c *config.Config) any { return c.GitEnabled },
+		Set: func(c *config.Config, v any) error {
+			b, ok := v.(bool)
+			if !ok {
+				return fmt.Errorf("expected bool for git.enabled")
+			}
+			c.GitEnabled = b
+			return nil
+		},
+	},
+	"git.depth": {
+		Type: "int",
+		Get:  func(c *config.Config) any { return c.GitDepth },
+		Set: func(c *config.Config, v any) error {
+			n, err := toInt(v)
+			if err != nil {
+				return fmt.Errorf("expected int for git.depth: %w", err)
+			}
+			c.GitDepth = n
+			return nil
+		},
+	},
+	"git.include_diffs": {
+		Type: "bool",
+		Get:  func(c *config.Config) any { return c.GitIncludeDiffs },
+		Set: func(c *config.Config, v any) error {
+			b, ok := v.(bool)
+			if !ok {
+				return fmt.Errorf("expected bool for git.include_diffs")
+			}
+			c.GitIncludeDiffs = b
+			return nil
+		},
+	},
+	"git.branches": {
+		Type: "[]string",
+		Get:  func(c *config.Config) any { return c.GitBranches },
+		Set: func(c *config.Config, v any) error {
+			s, err := toStringSlice(v)
+			if err != nil {
+				return fmt.Errorf("expected []string for git.branches: %w", err)
+			}
+			c.GitBranches = s
+			return nil
+		},
+	},
+	"stale_timeout_minutes": {
+		Type: "int",
+		Get:  func(c *config.Config) any { return c.StaleTimeoutMin },
+		Set: func(c *config.Config, v any) error {
+			n, err := toInt(v)
+			if err != nil {
+				return fmt.Errorf("expected int for stale_timeout_minutes: %w", err)
+			}
+			c.StaleTimeoutMin = n
+			return nil
+		},
+	},
+	"lifecycle.active_days": {
+		Type: "int",
+		Get:  func(c *config.Config) any { return c.LifecycleActiveDays },
+		Set: func(c *config.Config, v any) error {
+			n, err := toInt(v)
+			if err != nil {
+				return fmt.Errorf("expected int for lifecycle.active_days: %w", err)
+			}
+			c.LifecycleActiveDays = n
+			return nil
+		},
+	},
+	"lifecycle.archive_days": {
+		Type: "int",
+		Get:  func(c *config.Config) any { return c.LifecycleArchiveDays },
+		Set: func(c *config.Config, v any) error {
+			n, err := toInt(v)
+			if err != nil {
+				return fmt.Errorf("expected int for lifecycle.archive_days: %w", err)
+			}
+			c.LifecycleArchiveDays = n
+			return nil
+		},
+	},
+	"max_chunks_per_project": {
+		Type: "int",
+		Get:  func(c *config.Config) any { return c.MaxChunksPerProject },
+		Set: func(c *config.Config, v any) error {
+			n, err := toInt(v)
+			if err != nil {
+				return fmt.Errorf("expected int for max_chunks_per_project: %w", err)
+			}
+			c.MaxChunksPerProject = n
+			return nil
+		},
+	},
+}
+
+// --- Tool handlers ---
+
+func (s *Server) toolConfigure(args json.RawMessage) MCPToolResult {
+	var input configureInput
+	if err := json.Unmarshal(args, &input); err != nil {
+		return ErrResult("invalid arguments: " + err.Error())
+	}
+
+	switch input.Action {
+	case "get":
+		return s.configureGet(input.Key)
+	case "set":
+		return s.configureSet(input.Key, input.Value)
+	case "":
+		return ErrResult("action is required: must be \"get\" or \"set\"")
+	default:
+		return ErrResult(fmt.Sprintf("invalid action %q: must be \"get\" or \"set\"", input.Action))
+	}
+}
+
+func (s *Server) configureGet(key string) MCPToolResult {
+	if key == "" {
+		// Return full config
+		out, err := json.MarshalIndent(s.Cfg, "", "  ")
+		if err != nil {
+			return ErrResult("marshal error: " + err.Error())
+		}
+		return TextResult(string(out))
+	}
+
+	def, ok := configKeys[key]
+	if !ok {
+		return ErrResult(fmt.Sprintf("unknown config key %q — valid keys: %s", key, validKeysList()))
+	}
+
+	value := def.Get(&s.Cfg)
+	out, _ := json.MarshalIndent(map[string]any{
+		"key":   key,
+		"value": value,
+	}, "", "  ")
+	return TextResult(string(out))
+}
+
+func (s *Server) configureSet(key string, value any) MCPToolResult {
+	if key == "" {
+		return ErrResult("key is required for set action")
+	}
+	if value == nil {
+		return ErrResult("value is required for set action")
+	}
+
+	def, ok := configKeys[key]
+	if !ok {
+		return ErrResult(fmt.Sprintf("unknown config key %q — valid keys: %s", key, validKeysList()))
+	}
+
+	if err := def.Set(&s.Cfg, value); err != nil {
+		return ErrResult(err.Error())
+	}
+
+	// Persist to disk
+	if err := config.SaveConfig(s.Cfg); err != nil {
+		return ErrResult("config saved in memory but failed to persist: " + err.Error())
+	}
+
+	out, _ := json.MarshalIndent(map[string]any{
+		"key":   key,
+		"value": def.Get(&s.Cfg),
+		"saved": true,
+	}, "", "  ")
+	return TextResult(string(out))
+}
+
+func (s *Server) toolManagePaths(args json.RawMessage) MCPToolResult {
+	var input managePathsInput
+	if err := json.Unmarshal(args, &input); err != nil {
+		return ErrResult("invalid arguments: " + err.Error())
+	}
+
+	switch input.Action {
+	case "list":
+		return s.managePathsList()
+	case "add":
+		return s.managePathsAdd(input.Path)
+	case "remove":
+		return s.managePathsRemove(input.Path)
+	case "":
+		return ErrResult("action is required: must be \"add\", \"remove\", or \"list\"")
+	default:
+		return ErrResult(fmt.Sprintf("invalid action %q: must be \"add\", \"remove\", or \"list\"", input.Action))
+	}
+}
+
+func (s *Server) managePathsList() MCPToolResult {
+	out, _ := json.MarshalIndent(s.Cfg.IndexedPaths, "", "  ")
+	return TextResult(string(out))
+}
+
+func (s *Server) managePathsAdd(path string) MCPToolResult {
+	if path == "" {
+		return ErrResult("path is required for add action")
+	}
+
+	// Validate path exists and is a directory
+	info, err := os.Stat(path)
+	if err != nil {
+		return ErrResult(fmt.Sprintf("path does not exist: %s", path))
+	}
+	if !info.IsDir() {
+		return ErrResult(fmt.Sprintf("path is not a directory: %s", path))
+	}
+
+	// Check for duplicate
+	for _, existing := range s.Cfg.IndexedPaths {
+		if existing == path {
+			out, _ := json.MarshalIndent(map[string]any{
+				"path":    path,
+				"status":  "already indexed",
+				"message": "Path is already in the indexed paths list.",
+			}, "", "  ")
+			return TextResult(string(out))
+		}
+	}
+
+	// Add and persist
+	s.Cfg.IndexedPaths = append(s.Cfg.IndexedPaths, path)
+	if err := config.SaveConfig(s.Cfg); err != nil {
+		return ErrResult("path added in memory but failed to persist: " + err.Error())
+	}
+
+	out, _ := json.MarshalIndent(map[string]any{
+		"path":   path,
+		"status": "added",
+		"total":  len(s.Cfg.IndexedPaths),
+	}, "", "  ")
+	return TextResult(string(out))
+}
+
+func (s *Server) managePathsRemove(path string) MCPToolResult {
+	if path == "" {
+		return ErrResult("path is required for remove action")
+	}
+
+	idx := -1
+	for i, p := range s.Cfg.IndexedPaths {
+		if p == path {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return ErrResult(fmt.Sprintf("path not found in indexed paths: %s", path))
+	}
+
+	// Remove by index
+	s.Cfg.IndexedPaths = append(s.Cfg.IndexedPaths[:idx], s.Cfg.IndexedPaths[idx+1:]...)
+
+	if err := config.SaveConfig(s.Cfg); err != nil {
+		return ErrResult("path removed in memory but failed to persist: " + err.Error())
+	}
+
+	out, _ := json.MarshalIndent(map[string]any{
+		"path":   path,
+		"status": "removed",
+		"total":  len(s.Cfg.IndexedPaths),
+	}, "", "  ")
+	return TextResult(string(out))
+}
+
+// --- Helpers ---
+
+// toInt converts a JSON-decoded value to int. JSON numbers arrive as float64.
+func toInt(v any) (int, error) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), nil
+	case int:
+		return n, nil
+	case json.Number:
+		i, err := n.Int64()
+		return int(i), err
+	default:
+		return 0, fmt.Errorf("cannot convert %T to int", v)
+	}
+}
+
+// toStringSlice converts a JSON-decoded value to []string.
+func toStringSlice(v any) ([]string, error) {
+	switch s := v.(type) {
+	case []any:
+		result := make([]string, 0, len(s))
+		for _, item := range s {
+			str, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("array element is not a string: %T", item)
+			}
+			result = append(result, str)
+		}
+		return result, nil
+	case []string:
+		return s, nil
+	default:
+		return nil, fmt.Errorf("cannot convert %T to []string", v)
+	}
+}
+
+// validKeysList returns a comma-separated list of valid config keys.
+func validKeysList() string {
+	keys := make([]string, 0, len(configKeys))
+	for k := range configKeys {
+		keys = append(keys, k)
+	}
+	return fmt.Sprintf("%v", keys)
+}

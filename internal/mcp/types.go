@@ -135,6 +135,7 @@ type SourceCounts struct {
 	Code     int `json:"code"`
 	External int `json:"external"`
 	Memory   int `json:"memory"`
+	Commit   int `json:"commit"`
 }
 
 // IndexStatsInfo holds high-level index statistics for explain output.
