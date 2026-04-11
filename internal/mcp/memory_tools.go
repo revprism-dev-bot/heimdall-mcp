@@ -50,7 +50,7 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 	}
 	if existing != nil {
 		// Update existing: merge tags, update type and timestamp
-		existing.Tags = mergeTags(existing.Tags, input.Tags)
+		existing.Tags = heimdall.MergeTags(existing.Tags, input.Tags)
 		existing.Type = memType
 		existing.UpdatedAt = time.Now().Unix()
 		if err := s.MemoryStore.UpsertMemory(*existing); err != nil {
@@ -90,7 +90,7 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 			similar.Vector = vec
 			similar.ContentHash = hash
 		}
-		similar.Tags = mergeTags(similar.Tags, input.Tags)
+		similar.Tags = heimdall.MergeTags(similar.Tags, input.Tags)
 		similar.Type = memType
 		similar.Source = heimdall.MemorySourceExplicit
 		similar.UpdatedAt = time.Now().Unix()
@@ -149,6 +149,9 @@ func (s *Server) toolRecall(args json.RawMessage) MCPToolResult {
 
 	if input.Limit <= 0 {
 		input.Limit = 5
+	}
+	if input.Limit > 100 {
+		input.Limit = 100
 	}
 
 	if s.MemoryStore == nil {
@@ -250,21 +253,3 @@ func (s *Server) toolIngestSession(args json.RawMessage) MCPToolResult {
 	return TextResult(string(out))
 }
 
-// mergeTags merges two tag slices, deduplicating and capping at 20.
-func mergeTags(existing, new []string) []string {
-	seen := make(map[string]bool, len(existing)+len(new))
-	var result []string
-	for _, t := range existing {
-		if !seen[t] {
-			seen[t] = true
-			result = append(result, t)
-		}
-	}
-	for _, t := range new {
-		if !seen[t] && len(result) < 20 {
-			seen[t] = true
-			result = append(result, t)
-		}
-	}
-	return result
-}

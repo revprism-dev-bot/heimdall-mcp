@@ -180,7 +180,7 @@ func TestToolIngestSession_NilMemoryStore(t *testing.T) {
 }
 
 func TestMergeTags(t *testing.T) {
-	result := mergeTags([]string{"a", "b"}, []string{"b", "c"})
+	result := heimdall.MergeTags([]string{"a", "b"}, []string{"b", "c"})
 	if len(result) != 3 {
 		t.Errorf("mergeTags = %v, want 3 items", result)
 	}
@@ -190,7 +190,7 @@ func TestMergeTags(t *testing.T) {
 	for i := range many {
 		many[i] = string(rune('a' + i))
 	}
-	result = mergeTags(many[:15], many[10:])
+	result = heimdall.MergeTags(many[:15], many[10:])
 	if len(result) > 20 {
 		t.Errorf("mergeTags exceeded cap: %d > 20", len(result))
 	}

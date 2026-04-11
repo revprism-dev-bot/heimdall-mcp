@@ -84,7 +84,7 @@ func IngestSession(ctx context.Context, summary string, project string, embedder
 					} else {
 						// Session + session: update content if new, merge tags
 						existingMem.Content = chunk
-						existingMem.Tags = mergeTags(existingMem.Tags, tags)
+						existingMem.Tags = MergeTags(existingMem.Tags, tags)
 						existingMem.Vector = vec
 						existingMem.UpdatedAt = time.Now().Unix()
 						existingMem.ContentHash = hash
@@ -282,13 +282,21 @@ func uniqueStrings(ss []string) []string {
 	return result
 }
 
-func mergeTags(existing, new []string) []string {
-	all := append([]string{}, existing...)
-	all = append(all, new...)
-	merged := uniqueStrings(all)
-	// Enforce max 20 tags
-	if len(merged) > 20 {
-		merged = merged[:20]
+// MergeTags merges two tag slices, deduplicating and capping at 20.
+func MergeTags(existing, newTags []string) []string {
+	seen := make(map[string]bool, len(existing)+len(newTags))
+	var result []string
+	for _, t := range existing {
+		if !seen[t] {
+			seen[t] = true
+			result = append(result, t)
+		}
 	}
-	return merged
+	for _, t := range newTags {
+		if !seen[t] && len(result) < 20 {
+			seen[t] = true
+			result = append(result, t)
+		}
+	}
+	return result
 }

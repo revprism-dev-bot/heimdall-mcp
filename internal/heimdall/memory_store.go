@@ -3,9 +3,11 @@ package heimdall
 import (
 	"database/sql"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -88,7 +90,27 @@ func (s *MemoryStore) SearchMemories(query []float32, topK int, filters MemoryFi
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query(`SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash FROM memories`)
+	// Push indexed filters to SQL WHERE to reduce scan set
+	sqlQuery := `SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash FROM memories`
+	var conditions []string
+	var args []any
+	if filters.Type != "" {
+		conditions = append(conditions, `type = ?`)
+		args = append(args, string(filters.Type))
+	}
+	if filters.Project != "" {
+		conditions = append(conditions, `project = ?`)
+		args = append(args, filters.Project)
+	}
+	if filters.Source != "" {
+		conditions = append(conditions, `source = ?`)
+		args = append(args, string(filters.Source))
+	}
+	if len(conditions) > 0 {
+		sqlQuery += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+
+	rows, err := s.db.Query(sqlQuery, args...)
 	if err != nil {
 		return nil
 	}
@@ -101,16 +123,7 @@ func (s *MemoryStore) SearchMemories(query []float32, topK int, filters MemoryFi
 			continue
 		}
 
-		// Apply filters
-		if filters.Type != "" && m.Type != filters.Type {
-			continue
-		}
-		if filters.Project != "" && m.Project != filters.Project {
-			continue
-		}
-		if filters.Source != "" && m.Source != filters.Source {
-			continue
-		}
+		// Tags filter is post-scan (stored as JSON, not indexed)
 		if len(filters.Tags) > 0 && !hasAnyTag(m.Tags, filters.Tags) {
 			continue
 		}
@@ -202,7 +215,9 @@ func (s *MemoryStore) GetMemoryByHash(hash string) (*Memory, error) {
 	m.Source = MemorySource(source)
 	m.Vector = DecodeFloat32Vec(vecBlob)
 	if tagsJSON != "" {
-		json.Unmarshal([]byte(tagsJSON), &m.Tags)
+		if err := json.Unmarshal([]byte(tagsJSON), &m.Tags); err != nil {
+			log.Printf("heimdall: failed to unmarshal tags for memory %s: %v", m.ID, err)
+		}
 	}
 	return &m, nil
 }
@@ -231,7 +246,9 @@ func (s *MemoryStore) GetMemoryByID(id string) (*Memory, error) {
 	m.Source = MemorySource(source)
 	m.Vector = DecodeFloat32Vec(vecBlob)
 	if tagsJSON != "" {
-		json.Unmarshal([]byte(tagsJSON), &m.Tags)
+		if err := json.Unmarshal([]byte(tagsJSON), &m.Tags); err != nil {
+			log.Printf("heimdall: failed to unmarshal tags for memory %s: %v", m.ID, err)
+		}
 	}
 	return &m, nil
 }
@@ -343,7 +360,9 @@ func scanMemory(rows *sql.Rows) (Memory, error) {
 	m.Source = MemorySource(source)
 	m.Vector = DecodeFloat32Vec(vecBlob)
 	if tagsJSON != "" {
-		json.Unmarshal([]byte(tagsJSON), &m.Tags)
+		if err := json.Unmarshal([]byte(tagsJSON), &m.Tags); err != nil {
+			log.Printf("heimdall: failed to unmarshal tags for memory %s: %v", m.ID, err)
+		}
 	}
 	return m, nil
 }
