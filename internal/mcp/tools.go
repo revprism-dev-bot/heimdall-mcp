@@ -241,7 +241,7 @@ func (s *Server) toolIndex(args json.RawMessage) MCPToolResult {
 
 	go s.runIndex(ctx, absPath)
 
-	return TextResult(fmt.Sprintf("Indexing started in background: %s\nUse heimdall_status to check progress. Call heimdall_index again when done to get results.", absPath))
+	return TextResult(fmt.Sprintf("Indexing started in background: %s\nModel: %s\nUse heimdall_status to check progress. Call heimdall_index again when done to get results.", absPath, s.Cfg.Model))
 }
 
 func (s *Server) runIndex(ctx context.Context, absPath string) {
@@ -410,7 +410,8 @@ func (s *Server) autoIndexOnSearch() MCPToolResult {
 
 	out, _ := json.MarshalIndent(map[string]any{
 		"status":  "indexing_started",
-		"message": fmt.Sprintf("No index found. Auto-indexing started for %s. Use heimdall_status to check progress, then retry your search.", absPath),
+		"model":   s.Cfg.Model,
+		"message": fmt.Sprintf("No index found. Auto-indexing started for %s using model %q. Use heimdall_status to check progress, then retry your search.", absPath, s.Cfg.Model),
 	}, "", "  ")
 	return TextResult(string(out))
 }

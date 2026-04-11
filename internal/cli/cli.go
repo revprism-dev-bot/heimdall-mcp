@@ -127,6 +127,7 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 
 	startTime := time.Now()
 	fmt.Printf("Indexing %s...\n", absPath)
+	fmt.Printf("Model:    %s\n", cfg.Model)
 	fmt.Printf("Started:  %s\n", startTime.Format("2006-01-02 15:04:05"))
 	fmt.Printf("Database: %s\n\n", dbDir)
 
@@ -194,6 +195,7 @@ func cliStatus(cfg config.Config, dbPath string) {
 	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
 
 	fmt.Printf("Ollama: %s\n", cfg.OllamaEndpoint)
+	fmt.Printf("Model:  %s\n", cfg.Model)
 	if err := client.Ping(ctx); err != nil {
 		fmt.Println("  Status: offline")
 	} else {

@@ -119,6 +119,10 @@ func TestResolveDBDir(t *testing.T) {
 }
 
 func TestResolveDBDirForRead(t *testing.T) {
+	// Clean up any .heimdall_db left by other tests (e.g. auto-index background goroutine)
+	cwd, _ := os.Getwd()
+	os.RemoveAll(filepath.Join(cwd, ".heimdall_db"))
+
 	reg := &registry.Registry{}
 	srv := &Server{
 		Cfg:      config.DefaultConfig(),

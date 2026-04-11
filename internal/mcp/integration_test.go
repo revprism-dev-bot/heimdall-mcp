@@ -433,6 +433,10 @@ func TestAutoIndexOnSearch_ReturnsIndexingStarted(t *testing.T) {
 		srv.Index.Cancel()
 	}
 	srv.Index.Mu.Unlock()
+
+	// Clean up: remove .heimdall_db created by runIndex in CWD
+	cwd, _ := os.Getwd()
+	os.RemoveAll(filepath.Join(cwd, ".heimdall_db"))
 }
 
 func TestAutoIndexOnSearch_AlreadyRunning(t *testing.T) {
