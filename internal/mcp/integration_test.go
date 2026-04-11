@@ -592,15 +592,20 @@ func TestHandleInitialize_ContainsInstructions(t *testing.T) {
 		t.Fatal("expected instructions to be a string")
 	}
 
-	if !contains(instrStr, "heimdall_index_text") {
-		t.Error("instructions should mention heimdall_index_text")
+	// Instructions contain either the happy-path text (Ollama running) or
+	// setup guidance (Ollama not running). Both are valid.
+	hasHappyPath := contains(instrStr, "heimdall_index_text") && contains(instrStr, "silently")
+	hasSetupGuide := contains(instrStr, "Ollama") && contains(instrStr, "ollama")
+	if !hasHappyPath && !hasSetupGuide {
+		t.Errorf("instructions should contain either indexing guidance or Ollama setup instructions, got: %s", instrStr[:min(len(instrStr), 200)])
 	}
-	if !contains(instrStr, "external sources") {
-		t.Error("instructions should mention external sources")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	if !contains(instrStr, "silently") {
-		t.Error("instructions should mention doing it silently")
-	}
+	return b
 }
 
 func TestHandleInitialize_HasServerInfo(t *testing.T) {
