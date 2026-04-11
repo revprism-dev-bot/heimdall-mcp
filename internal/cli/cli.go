@@ -107,10 +107,13 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 	}
 	fmt.Println("Ollama: connected")
 
-	dbDir := dbPath
-	if dbDir == "" {
-		dbDir = filepath.Join(absPath, ".heimdall_db")
+	baseDir := dbPath
+	if baseDir == "" {
+		baseDir = filepath.Join(absPath, ".heimdall_db")
 	}
+	// Migrate legacy single-model DB to model-specific subdirectory
+	heimdall.MigrateToModelDir(baseDir, cfg.Model)
+	dbDir := heimdall.ModelDBDir(baseDir, cfg.Model)
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Store error: %v\n", err)
@@ -156,10 +159,10 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 			fmt.Printf("  Chunks:   %d\n", r.ChunksCreated)
 			fmt.Printf("  Database: %s\n", dbDir)
 
-			// Register project in registry
+			// Register project in registry (uses base dir, not model-specific)
 			name := filepath.Base(absPath)
 			reg := registry.LoadRegistry()
-			reg.Register(name, absPath, dbDir)
+			reg.Register(name, absPath, baseDir)
 			if err := reg.Save(); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to save project registry: %v\n", err)
 			}
@@ -217,17 +220,26 @@ func cliStatus(cfg config.Config, dbPath string) {
 		}
 	}
 
-	statusDbDir := dbPath
-	if statusDbDir == "" {
+	baseDir := dbPath
+	if baseDir == "" {
 		cwd, _ := os.Getwd()
-		statusDbDir = filepath.Join(cwd, ".heimdall_db")
+		baseDir = filepath.Join(cwd, ".heimdall_db")
 	}
-	if _, err := os.Stat(statusDbDir); err == nil {
-		store, err := heimdall.OpenStore(statusDbDir)
+
+	// Show all available model DBs
+	available := heimdall.ListAvailableModels(baseDir)
+	if len(available) > 0 {
+		fmt.Printf("\nAvailable models: %v\n", available)
+	}
+
+	// Show stats for the current model's DB
+	modelDir := heimdall.ModelDBDir(baseDir, cfg.Model)
+	if _, err := os.Stat(modelDir); err == nil {
+		store, err := heimdall.OpenStore(modelDir)
 		if err == nil {
 			defer store.Close()
 			stats := store.Stats()
-			fmt.Printf("\nIndex: %s\n", statusDbDir)
+			fmt.Printf("\nIndex (%s): %s\n", cfg.Model, modelDir)
 			fmt.Printf("  Files: %d\n", stats.TotalFiles)
 			fmt.Printf("  Chunks: %d\n", stats.TotalRecords)
 			if stats.LastModified > 0 {
@@ -235,7 +247,10 @@ func cliStatus(cfg config.Config, dbPath string) {
 			}
 		}
 	} else {
-		fmt.Printf("\nNo index found at %s\n", statusDbDir)
+		fmt.Printf("\nNo index found for model %q at %s\n", cfg.Model, modelDir)
+		if len(available) > 0 {
+			fmt.Printf("  Available models: %v\n", available)
+		}
 	}
 
 	// Show registered projects
@@ -262,10 +277,22 @@ func cliSearch(cfg config.Config, query string, dbPath string) {
 		os.Exit(1)
 	}
 
-	searchDbDir := dbPath
-	if searchDbDir == "" {
+	searchBaseDir := dbPath
+	if searchBaseDir == "" {
 		cwd, _ := os.Getwd()
-		searchDbDir = filepath.Join(cwd, ".heimdall_db")
+		searchBaseDir = filepath.Join(cwd, ".heimdall_db")
+	}
+	searchDbDir := heimdall.ModelDBDir(searchBaseDir, cfg.Model)
+	if _, err := os.Stat(searchDbDir); err != nil {
+		// No model-specific DB — check for other models
+		available := heimdall.ListAvailableModels(searchBaseDir)
+		if len(available) > 0 {
+			fmt.Fprintf(os.Stderr, "No index for model %q. Available models: %v\n", cfg.Model, available)
+			fmt.Fprintf(os.Stderr, "Use: heimdall-mcp config set model <name>\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "No index found. Run: heimdall-mcp index <path>\n")
+		}
+		os.Exit(1)
 	}
 	store, err := heimdall.OpenStore(searchDbDir)
 	if err != nil {
@@ -316,17 +343,21 @@ func cliProjects() {
 		fmt.Printf("    Path: %s\n", p.Path)
 		fmt.Printf("    DB:   %s\n", p.DBPath)
 
-		// Try to show stats
-		if _, err := os.Stat(p.DBPath); err == nil {
-			store, err := heimdall.OpenStore(p.DBPath)
-			if err == nil {
-				stats := store.Stats()
-				fmt.Printf("    Files: %d  Chunks: %d", stats.TotalFiles, stats.TotalRecords)
-				if stats.LastModified > 0 {
-					fmt.Printf("  Last indexed: %s", time.Unix(stats.LastModified, 0).Format("2006-01-02 15:04:05"))
+		// Show available models and stats per model
+		models := heimdall.ListAvailableModels(p.DBPath)
+		if len(models) > 0 {
+			for _, m := range models {
+				modelDir := filepath.Join(p.DBPath, m)
+				store, err := heimdall.OpenStore(modelDir)
+				if err == nil {
+					stats := store.Stats()
+					fmt.Printf("    [%s] Files: %d  Chunks: %d", m, stats.TotalFiles, stats.TotalRecords)
+					if stats.LastModified > 0 {
+						fmt.Printf("  Last indexed: %s", time.Unix(stats.LastModified, 0).Format("2006-01-02 15:04:05"))
+					}
+					fmt.Println()
+					store.Close()
 				}
-				fmt.Println()
-				store.Close()
 			}
 		}
 	}
