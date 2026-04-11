@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,14 +46,23 @@ func RunCLI(cfg config.Config, args []string) {
 		cliSearch(cfg, cleanArgs[0], outPath)
 	case "projects":
 		cliProjects()
+	case "configure", "config":
+		cliConfigure(cleanArgs)
+	case "paths":
+		cliManagePaths(cfg, cleanArgs)
 	case "help", "--help", "-h":
-		fmt.Println("heimdall-mcp — local semantic code search")
+		fmt.Println("heimdall-mcp — local semantic code search + memory")
 		fmt.Println()
 		fmt.Println("CLI usage:")
-		fmt.Println("  heimdall-mcp index <path> [--out <dir>]   Index a directory")
-		fmt.Println("  heimdall-mcp status [--out <dir>]         Show index stats")
-		fmt.Println("  heimdall-mcp search <query> [--out <dir>] Search indexed files")
-		fmt.Println("  heimdall-mcp projects                     List registered projects")
+		fmt.Println("  heimdall-mcp index <path> [--out <dir>]    Index a directory")
+		fmt.Println("  heimdall-mcp status [--out <dir>]          Show index stats")
+		fmt.Println("  heimdall-mcp search <query> [--out <dir>]  Search indexed files")
+		fmt.Println("  heimdall-mcp projects                      List registered projects")
+		fmt.Println("  heimdall-mcp config get [key]              Get config (full or key)")
+		fmt.Println("  heimdall-mcp config set <key> <value>      Set a config key")
+		fmt.Println("  heimdall-mcp paths list                    List indexed paths")
+		fmt.Println("  heimdall-mcp paths add <path>              Add a path to index")
+		fmt.Println("  heimdall-mcp paths remove <path>           Remove a path")
 		fmt.Println()
 		fmt.Println("Options:")
 		fmt.Println("  --out, -o <dir>  Where to store the database (default: <path>/.heimdall_db/)")
@@ -314,5 +324,212 @@ func cliProjects() {
 				store.Close()
 			}
 		}
+	}
+}
+
+func cliConfigure(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  heimdall-mcp config get [key]        Get config (full or specific key)\n")
+		fmt.Fprintf(os.Stderr, "  heimdall-mcp config set <key> <val>  Set a config key\n")
+		fmt.Fprintf(os.Stderr, "\nKeys: git.enabled, git.depth, git.include_diffs, git.branches,\n")
+		fmt.Fprintf(os.Stderr, "      stale_timeout_minutes, lifecycle.active_days,\n")
+		fmt.Fprintf(os.Stderr, "      lifecycle.archive_days, max_chunks_per_project\n")
+		os.Exit(1)
+	}
+
+	switch args[0] {
+	case "get":
+		cfg := config.LoadConfig()
+		if len(args) > 1 {
+			key := args[1]
+			val, ok := getConfigKey(&cfg, key)
+			if !ok {
+				fmt.Fprintf(os.Stderr, "Unknown config key: %s\n", key)
+				os.Exit(1)
+			}
+			out, _ := json.MarshalIndent(map[string]any{"key": key, "value": val}, "", "  ")
+			fmt.Println(string(out))
+		} else {
+			out, _ := json.MarshalIndent(cfg, "", "  ")
+			fmt.Println(string(out))
+		}
+	case "set":
+		if len(args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp config set <key> <value>\n")
+			os.Exit(1)
+		}
+		cfg := config.LoadConfig()
+		key, rawVal := args[1], args[2]
+		if err := setConfigKey(&cfg, key, rawVal); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := config.SaveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to save config: %v\n", err)
+			os.Exit(1)
+		}
+		val, _ := getConfigKey(&cfg, key)
+		fmt.Printf("%s = %v (saved)\n", key, val)
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown config action: %s (use 'get' or 'set')\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func getConfigKey(cfg *config.Config, key string) (any, bool) {
+	switch key {
+	case "git.enabled":
+		return cfg.GitEnabled, true
+	case "git.depth":
+		return cfg.GitDepth, true
+	case "git.include_diffs":
+		return cfg.GitIncludeDiffs, true
+	case "git.branches":
+		return cfg.GitBranches, true
+	case "stale_timeout_minutes":
+		return cfg.StaleTimeoutMin, true
+	case "lifecycle.active_days":
+		return cfg.LifecycleActiveDays, true
+	case "lifecycle.archive_days":
+		return cfg.LifecycleArchiveDays, true
+	case "max_chunks_per_project":
+		return cfg.MaxChunksPerProject, true
+	default:
+		return nil, false
+	}
+}
+
+func setConfigKey(cfg *config.Config, key, rawVal string) error {
+	switch key {
+	case "git.enabled":
+		cfg.GitEnabled = rawVal == "true"
+	case "git.depth":
+		var n int
+		if _, err := fmt.Sscanf(rawVal, "%d", &n); err != nil {
+			return fmt.Errorf("git.depth requires an integer: %w", err)
+		}
+		cfg.GitDepth = n
+	case "git.include_diffs":
+		cfg.GitIncludeDiffs = rawVal == "true"
+	case "git.branches":
+		var branches []string
+		if err := json.Unmarshal([]byte(rawVal), &branches); err != nil {
+			return fmt.Errorf("git.branches requires a JSON array: %w", err)
+		}
+		cfg.GitBranches = branches
+	case "stale_timeout_minutes":
+		var n int
+		if _, err := fmt.Sscanf(rawVal, "%d", &n); err != nil {
+			return fmt.Errorf("stale_timeout_minutes requires an integer: %w", err)
+		}
+		cfg.StaleTimeoutMin = n
+	case "lifecycle.active_days":
+		var n int
+		if _, err := fmt.Sscanf(rawVal, "%d", &n); err != nil {
+			return fmt.Errorf("lifecycle.active_days requires an integer: %w", err)
+		}
+		cfg.LifecycleActiveDays = n
+	case "lifecycle.archive_days":
+		var n int
+		if _, err := fmt.Sscanf(rawVal, "%d", &n); err != nil {
+			return fmt.Errorf("lifecycle.archive_days requires an integer: %w", err)
+		}
+		cfg.LifecycleArchiveDays = n
+	case "max_chunks_per_project":
+		var n int
+		if _, err := fmt.Sscanf(rawVal, "%d", &n); err != nil {
+			return fmt.Errorf("max_chunks_per_project requires an integer: %w", err)
+		}
+		cfg.MaxChunksPerProject = n
+	default:
+		return fmt.Errorf("unknown config key: %s", key)
+	}
+	return nil
+}
+
+func cliManagePaths(cfg config.Config, args []string) {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  heimdall-mcp paths list              List indexed paths\n")
+		fmt.Fprintf(os.Stderr, "  heimdall-mcp paths add <path>        Add a directory to index\n")
+		fmt.Fprintf(os.Stderr, "  heimdall-mcp paths remove <path>     Remove a directory\n")
+		os.Exit(1)
+	}
+
+	switch args[0] {
+	case "list":
+		cfg := config.LoadConfig()
+		if len(cfg.IndexedPaths) == 0 {
+			fmt.Println("No indexed paths configured.")
+			return
+		}
+		fmt.Printf("Indexed paths (%d):\n", len(cfg.IndexedPaths))
+		for _, p := range cfg.IndexedPaths {
+			fmt.Printf("  %s\n", p)
+		}
+	case "add":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp paths add <path>\n")
+			os.Exit(1)
+		}
+		path := args[1]
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid path: %v\n", err)
+			os.Exit(1)
+		}
+		info, err := os.Stat(absPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Path does not exist: %s\n", absPath)
+			os.Exit(1)
+		}
+		if !info.IsDir() {
+			fmt.Fprintf(os.Stderr, "Not a directory: %s\n", absPath)
+			os.Exit(1)
+		}
+
+		cfg := config.LoadConfig()
+		for _, existing := range cfg.IndexedPaths {
+			if existing == absPath {
+				fmt.Printf("Path already indexed: %s\n", absPath)
+				return
+			}
+		}
+		cfg.IndexedPaths = append(cfg.IndexedPaths, absPath)
+		if err := config.SaveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to save config: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Added: %s (%d total paths)\n", absPath, len(cfg.IndexedPaths))
+	case "remove":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp paths remove <path>\n")
+			os.Exit(1)
+		}
+		path := args[1]
+		absPath, _ := filepath.Abs(path)
+
+		cfg := config.LoadConfig()
+		idx := -1
+		for i, p := range cfg.IndexedPaths {
+			if p == path || p == absPath {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			fmt.Fprintf(os.Stderr, "Path not found: %s\n", path)
+			os.Exit(1)
+		}
+		cfg.IndexedPaths = append(cfg.IndexedPaths[:idx], cfg.IndexedPaths[idx+1:]...)
+		if err := config.SaveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to save config: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Removed: %s (%d remaining paths)\n", path, len(cfg.IndexedPaths))
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown paths action: %s (use 'list', 'add', or 'remove')\n", args[0])
+		os.Exit(1)
 	}
 }
