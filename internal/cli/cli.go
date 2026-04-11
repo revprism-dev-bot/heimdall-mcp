@@ -50,6 +50,8 @@ func RunCLI(cfg config.Config, args []string) {
 		cliConfigure(cleanArgs)
 	case "paths":
 		cliManagePaths(cfg, cleanArgs)
+	case "models":
+		cliModels(cfg)
 	case "help", "--help", "-h":
 		fmt.Println("heimdall-mcp — local semantic code search + memory")
 		fmt.Println()
@@ -63,6 +65,7 @@ func RunCLI(cfg config.Config, args []string) {
 		fmt.Println("  heimdall-mcp paths list                    List indexed paths")
 		fmt.Println("  heimdall-mcp paths add <path>              Add a path to index")
 		fmt.Println("  heimdall-mcp paths remove <path>           Remove a path")
+		fmt.Println("  heimdall-mcp models                        List available embedding models")
 		fmt.Println()
 		fmt.Println("Options:")
 		fmt.Println("  --out, -o <dir>  Where to store the database (default: <path>/.heimdall_db/)")
@@ -332,7 +335,7 @@ func cliConfigure(args []string) {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  heimdall-mcp config get [key]        Get config (full or specific key)\n")
 		fmt.Fprintf(os.Stderr, "  heimdall-mcp config set <key> <val>  Set a config key\n")
-		fmt.Fprintf(os.Stderr, "\nKeys: git.enabled, git.depth, git.include_diffs, git.branches,\n")
+		fmt.Fprintf(os.Stderr, "\nKeys: model, git.enabled, git.depth, git.include_diffs, git.branches,\n")
 		fmt.Fprintf(os.Stderr, "      stale_timeout_minutes, lifecycle.active_days,\n")
 		fmt.Fprintf(os.Stderr, "      lifecycle.archive_days, max_chunks_per_project\n")
 		os.Exit(1)
@@ -361,6 +364,25 @@ func cliConfigure(args []string) {
 		}
 		cfg := config.LoadConfig()
 		key, rawVal := args[1], args[2]
+
+		// Validate model before saving — verify it exists and can embed
+		if key == "model" {
+			fmt.Printf("Verifying model %q with Ollama...\n", rawVal)
+			client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+			ctx := context.Background()
+			if err := client.VerifyModel(ctx, rawVal); err != nil {
+				fmt.Fprintf(os.Stderr, "Model verification failed: %v\n", err)
+				fmt.Fprintf(os.Stderr, "\nThe model must be pulled in Ollama and support embeddings.\n")
+				fmt.Fprintf(os.Stderr, "Run: ollama pull %s\n", rawVal)
+				fmt.Fprintf(os.Stderr, "Run: heimdall-mcp models   (to see available models)\n")
+				os.Exit(1)
+			}
+			fmt.Println("Model verified: produces embeddings.")
+			if !heimdall.IsKnownEmbeddingModel(rawVal) {
+				fmt.Println("Note: this model is not in our curated list but it works for embeddings.")
+			}
+		}
+
 		if err := setConfigKey(&cfg, key, rawVal); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -371,6 +393,9 @@ func cliConfigure(args []string) {
 		}
 		val, _ := getConfigKey(&cfg, key)
 		fmt.Printf("%s = %v (saved)\n", key, val)
+		if key == "model" {
+			fmt.Println("Important: re-index your projects for the new model to take effect.")
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown config action: %s (use 'get' or 'set')\n", args[0])
 		os.Exit(1)
@@ -379,6 +404,8 @@ func cliConfigure(args []string) {
 
 func getConfigKey(cfg *config.Config, key string) (any, bool) {
 	switch key {
+	case "model":
+		return cfg.Model, true
 	case "git.enabled":
 		return cfg.GitEnabled, true
 	case "git.depth":
@@ -402,6 +429,8 @@ func getConfigKey(cfg *config.Config, key string) (any, bool) {
 
 func setConfigKey(cfg *config.Config, key, rawVal string) error {
 	switch key {
+	case "model":
+		cfg.Model = rawVal
 	case "git.enabled":
 		cfg.GitEnabled = rawVal == "true"
 	case "git.depth":
@@ -532,4 +561,68 @@ func cliManagePaths(cfg config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "Unknown paths action: %s (use 'list', 'add', or 'remove')\n", args[0])
 		os.Exit(1)
 	}
+}
+
+func cliModels(cfg config.Config) {
+	ctx := context.Background()
+	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+
+	fmt.Printf("Current model: %s\n", cfg.Model)
+	fmt.Println()
+
+	// Show curated list
+	fmt.Println("Recommended embedding models:")
+	fmt.Println()
+	fmt.Printf("  %-28s %-18s %-6s %-5s %s\n", "MODEL", "ORIGIN", "SIZE", "DIM", "NOTES")
+	fmt.Printf("  %-28s %-18s %-6s %-5s %s\n", "-----", "------", "----", "---", "-----")
+	for _, m := range heimdall.KnownEmbeddingModels {
+		marker := " "
+		if m.Name == cfg.Model {
+			marker = "*"
+		}
+		fmt.Printf(" %s%-28s %-18s %-6s %-5d %s\n", marker, m.Name, m.Origin, m.Params, m.Dimensions, m.Notes)
+	}
+	fmt.Println()
+
+	// Check what's actually pulled in Ollama
+	if err := client.Ping(ctx); err != nil {
+		fmt.Println("Ollama: offline — cannot check local models")
+		fmt.Println("Run: ollama serve")
+		return
+	}
+
+	models, err := client.ListModels(ctx)
+	if err != nil {
+		fmt.Printf("Could not list Ollama models: %v\n", err)
+		return
+	}
+
+	fmt.Println("Local Ollama models:")
+	fmt.Println()
+	if len(models) == 0 {
+		fmt.Println("  (none pulled)")
+		return
+	}
+
+	for _, m := range models {
+		status := ""
+		if heimdall.IsKnownEmbeddingModel(m.Name) {
+			info := heimdall.LookupEmbeddingModel(m.Name)
+			if info != nil {
+				status = fmt.Sprintf("embedding (%s, %dd)", info.Params, info.Dimensions)
+			} else {
+				status = "embedding (known)"
+			}
+		} else {
+			status = "unknown — use 'config set model' to test"
+		}
+		marker := " "
+		if m.Name == cfg.Model || (len(m.Name) > len(cfg.Model) && m.Name[:len(cfg.Model)] == cfg.Model) {
+			marker = "*"
+		}
+		fmt.Printf(" %s%-35s %s\n", marker, m.Name, status)
+	}
+	fmt.Println()
+	fmt.Println("To use a model: heimdall-mcp config set model <name>")
+	fmt.Println("To pull a model: ollama pull <name>")
 }

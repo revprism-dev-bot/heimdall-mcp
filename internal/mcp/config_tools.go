@@ -1,11 +1,13 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
 
 // --- Input types ---
@@ -30,6 +32,21 @@ type configKeyDef struct {
 }
 
 var configKeys = map[string]configKeyDef{
+	"model": {
+		Type: "string",
+		Get:  func(c *config.Config) any { return c.Model },
+		Set: func(c *config.Config, v any) error {
+			s, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("expected string for model")
+			}
+			if s == "" {
+				return fmt.Errorf("model cannot be empty")
+			}
+			c.Model = s
+			return nil
+		},
+	},
 	"git.enabled": {
 		Type: "bool",
 		Get:  func(c *config.Config) any { return c.GitEnabled },
@@ -184,6 +201,18 @@ func (s *Server) configureSet(key string, value any) MCPToolResult {
 		return ErrResult(fmt.Sprintf("unknown config key %q — valid keys: %s", key, validKeysList()))
 	}
 
+	// Validate model before applying — verify it exists and can embed
+	if key == "model" {
+		modelName, _ := value.(string)
+		if modelName != "" {
+			client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+			ctx := context.Background()
+			if err := client.VerifyModel(ctx, modelName); err != nil {
+				return ErrResult(fmt.Sprintf("model verification failed: %v. The model must be pulled in Ollama and support embeddings. Run: ollama pull %s", err, modelName))
+			}
+		}
+	}
+
 	if err := def.Set(&s.Cfg, value); err != nil {
 		return ErrResult(err.Error())
 	}
@@ -193,11 +222,16 @@ func (s *Server) configureSet(key string, value any) MCPToolResult {
 		return ErrResult("config saved in memory but failed to persist: " + err.Error())
 	}
 
-	out, _ := json.MarshalIndent(map[string]any{
+	response := map[string]any{
 		"key":   key,
 		"value": def.Get(&s.Cfg),
 		"saved": true,
-	}, "", "  ")
+	}
+	if key == "model" {
+		response["note"] = "Model changed. Re-index your projects for this to take effect."
+	}
+
+	out, _ := json.MarshalIndent(response, "", "  ")
 	return TextResult(string(out))
 }
 
