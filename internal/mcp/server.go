@@ -530,8 +530,10 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
 
-	// Resolve DB path — write tools use resolveDBDir (creates if needed)
-	dbDir := s.resolveDBDir(input.Project)
+	// Resolve DB path — write tools use model-specific dir (creates if needed)
+	baseDir := s.resolveDBDir(input.Project)
+	heimdall.MigrateToModelDir(baseDir, s.Cfg.Model)
+	dbDir := heimdall.ModelDBDir(baseDir, s.Cfg.Model)
 
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
@@ -719,6 +721,23 @@ func (s *Server) resolveDBDirForRead(project string) string {
 	return dbDir
 }
 
+// resolveModelDBDir returns the model-specific DB directory for a project.
+// Used by write paths (index, index_text) that need to create the directory.
+func (s *Server) resolveModelDBDir(project string) string {
+	base := s.resolveDBDir(project)
+	return heimdall.ModelDBDir(base, s.Cfg.Model)
+}
+
+// resolveModelDBDirForRead returns the model-specific DB directory, or empty
+// string if it doesn't exist. Used by read paths (search, explain).
+func (s *Server) resolveModelDBDirForRead(project string) string {
+	dir := s.resolveModelDBDir(project)
+	if _, err := os.Stat(dir); err != nil {
+		return ""
+	}
+	return dir
+}
+
 // classifySource maps a VectorRecord.Kind to a source category.
 func classifySource(kind string) string {
 	switch kind {
@@ -789,10 +808,16 @@ func (s *Server) toolExplain(args json.RawMessage) MCPToolResult {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
 
-	// Resolve DB path (read-only)
-	dbDir := s.resolveDBDirForRead(input.Project)
+	// Resolve DB path (read-only, model-specific)
+	dbDir := s.resolveModelDBDirForRead(input.Project)
 	if dbDir == "" {
-		return ErrResult("No index found. Run index_project first.")
+		// Check if base dir has other model DBs and suggest them
+		baseDir := s.resolveDBDir(input.Project)
+		available := heimdall.ListAvailableModels(baseDir)
+		if len(available) > 0 {
+			return ErrResult(fmt.Sprintf("No index for model %q. Available models: %v. Change model with heimdall_configure or re-index.", s.Cfg.Model, available))
+		}
+		return ErrResult("No index found. Run heimdall_index first.")
 	}
 
 	store, err := heimdall.OpenStore(dbDir)

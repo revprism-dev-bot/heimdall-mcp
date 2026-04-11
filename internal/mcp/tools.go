@@ -31,9 +31,15 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
 
-	// Resolve DB directory (read-only)
-	dbDir := s.resolveDBDirForRead(input.Project)
+	// Resolve DB directory (read-only, model-specific)
+	dbDir := s.resolveModelDBDirForRead(input.Project)
 	if dbDir == "" {
+		// Check if base dir has other model DBs and suggest them
+		baseDir := s.resolveDBDir(input.Project)
+		available := heimdall.ListAvailableModels(baseDir)
+		if len(available) > 0 {
+			return ErrResult(fmt.Sprintf("No index for model %q. Available models: %v. Change model with heimdall_configure or re-index.", s.Cfg.Model, available))
+		}
 		// 4.1: Auto-index on first search
 		return s.autoIndexOnSearch()
 	}
@@ -265,7 +271,9 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 	}
 
 	cwd, _ := os.Getwd()
-	dbDir := filepath.Join(cwd, ".heimdall_db")
+	baseDir := filepath.Join(cwd, ".heimdall_db")
+	heimdall.MigrateToModelDir(baseDir, s.Cfg.Model)
+	dbDir := heimdall.ModelDBDir(baseDir, s.Cfg.Model)
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
 		s.Index.Mu.Lock()
@@ -308,7 +316,7 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 				// Register project in registry after successful indexing
 				if p.Err == nil {
 					name := filepath.Base(absPath)
-					s.Registry.Register(name, absPath, dbDir)
+					s.Registry.Register(name, absPath, baseDir)
 					if err := s.Registry.Save(); err != nil {
 						log.Printf("failed to save registry: %v", err)
 					}
@@ -429,10 +437,12 @@ func (s *Server) checkAndTriggerReindex(store *heimdall.VectorStore, dbDir strin
 		return ""
 	}
 
-	// Find the project path from registry
+	// Find the project path from registry.
+	// dbDir may be a model-specific subdirectory of the registered DBPath,
+	// so check both exact match and parent match.
 	var projectPath string
 	for _, p := range s.Registry.All() {
-		if p.DBPath == dbDir {
+		if p.DBPath == dbDir || registry.IsSubpath(dbDir, p.DBPath) {
 			projectPath = p.Path
 			break
 		}
@@ -496,9 +506,18 @@ func (s *Server) toolStatus() MCPToolResult {
 	}
 
 	cwd, _ := os.Getwd()
-	dbDir := filepath.Join(cwd, ".heimdall_db")
-	if _, err := os.Stat(dbDir); err == nil {
-		store, err := heimdall.OpenStore(dbDir)
+	baseDir := filepath.Join(cwd, ".heimdall_db")
+
+	// Show all available model DBs for this project
+	available := heimdall.ListAvailableModels(baseDir)
+	if len(available) > 0 {
+		status["availableModels"] = available
+	}
+
+	// Show stats for the current model's DB
+	modelDir := heimdall.ModelDBDir(baseDir, model)
+	if _, err := os.Stat(modelDir); err == nil {
+		store, err := heimdall.OpenStore(modelDir)
 		if err == nil {
 			defer store.Close()
 			stats := store.Stats()
@@ -508,13 +527,6 @@ func (s *Server) toolStatus() MCPToolResult {
 				status["lastIndexed"] = time.Unix(stats.LastModified, 0).Format("2006-01-02 15:04:05")
 			} else {
 				status["lastIndexed"] = "never"
-			}
-			// Show which model the index was built with
-			if indexModel := store.GetMetadata("embedding_model"); indexModel != "" {
-				status["indexModel"] = indexModel
-				if indexModel != model {
-					status["modelMismatch"] = fmt.Sprintf("index built with %q, configured model is %q — re-index to fix", indexModel, model)
-				}
 			}
 			if indexDim := store.GetMetadata("embedding_dim"); indexDim != "" {
 				status["indexEmbeddingDim"] = indexDim
