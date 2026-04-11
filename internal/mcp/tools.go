@@ -31,32 +31,9 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 		return ErrResult("Ollama not reachable at " + s.Cfg.OllamaEndpoint + ": " + err.Error())
 	}
 
-	// Resolve DB directory using registry
-	// 1. If project param given, look up in registry
-	// 2. If no param, try registry.FindByCWD(cwd)
-	// 3. Fallback: cwd/.heimdall_db/
-	cwd, _ := os.Getwd()
-	dbDir := ""
-
-	if input.Project != "" {
-		if entry := s.Registry.Find(input.Project); entry != nil {
-			dbDir = entry.DBPath
-		} else {
-			return ErrResult(fmt.Sprintf("Project %q not found in registry. Run list_projects to see registered projects.", input.Project))
-		}
-	}
-
+	// Resolve DB directory (read-only)
+	dbDir := s.resolveDBDirForRead(input.Project)
 	if dbDir == "" {
-		if entry := s.Registry.FindByCWD(cwd); entry != nil {
-			dbDir = entry.DBPath
-		}
-	}
-
-	if dbDir == "" {
-		dbDir = filepath.Join(cwd, ".heimdall_db")
-	}
-
-	if _, err := os.Stat(dbDir); err != nil {
 		return ErrResult("No index found. Run index_project first.")
 	}
 
@@ -67,6 +44,13 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	defer store.Close()
 
 	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
+
+	// If filters are present, use filtered search path
+	if input.SourceType != "" || len(input.MetadataFilter) > 0 {
+		return s.toolSearchFiltered(ctx, input, store, embedder)
+	}
+
+	// Standard retriever path (with enriched results)
 	retriever := heimdall.NewRetriever(embedder, store, input.Limit, s.Cfg.MaxContextTokens)
 
 	blocks, err := retriever.Retrieve(ctx, input.Query)
@@ -78,25 +62,56 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 		return TextResult("No relevant results found.")
 	}
 
-	type result struct {
-		File      string  `json:"file"`
-		StartLine int     `json:"startLine"`
-		EndLine   int     `json:"endLine"`
-		Content   string  `json:"content"`
-		Score     float64 `json:"score"`
-	}
-	var results []result
+	var results []SearchResultEnriched
 	for _, b := range blocks {
-		results = append(results, result{
-			File:      b.FilePath,
-			StartLine: b.StartLine,
-			EndLine:   b.EndLine,
-			Content:   b.Content,
-			Score:     b.Score,
+		results = append(results, SearchResultEnriched{
+			File:           b.FilePath,
+			StartLine:      b.StartLine,
+			EndLine:        b.EndLine,
+			Content:        b.Content,
+			Score:          b.Score,
+			Source:         classifySource(b.Kind),
+			ChunkID:        b.ChunkID,
+			EmbeddingModel: s.Cfg.Model,
 		})
 	}
 
 	out, _ := json.MarshalIndent(results, "", "  ")
+	return TextResult(string(out))
+}
+
+func (s *Server) toolSearchFiltered(ctx context.Context, input searchInput, store *heimdall.VectorStore, embedder heimdall.Embedder) MCPToolResult {
+	queryVec, err := embedder.Embed(ctx, input.Query)
+	if err != nil {
+		return ErrResult("embedding error: " + err.Error())
+	}
+
+	var metaFilter map[string]any
+	if len(input.MetadataFilter) > 0 {
+		json.Unmarshal(input.MetadataFilter, &metaFilter)
+	}
+
+	searchResults := store.SearchFiltered(queryVec, input.Limit, input.SourceType, metaFilter)
+
+	if len(searchResults) == 0 {
+		return TextResult("No relevant results found.")
+	}
+
+	var enriched []SearchResultEnriched
+	for _, r := range searchResults {
+		enriched = append(enriched, SearchResultEnriched{
+			File:           r.Record.FilePath,
+			StartLine:      r.Record.StartLine,
+			EndLine:        r.Record.EndLine,
+			Content:        r.Record.Content,
+			Score:          r.Similarity,
+			Source:         classifySource(r.Record.Kind),
+			ChunkID:        r.Record.ID,
+			EmbeddingModel: s.Cfg.Model,
+		})
+	}
+
+	out, _ := json.MarshalIndent(enriched, "", "  ")
 	return TextResult(string(out))
 }
 

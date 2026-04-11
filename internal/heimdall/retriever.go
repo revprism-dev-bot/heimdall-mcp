@@ -15,6 +15,7 @@ type ContextBlock struct {
 	Kind       string  // "function", "type", "paragraph", etc.
 	Identifier string  // function/type name if applicable
 	Score      float64 // similarity score [0, 1]
+	ChunkID    string  // VectorRecord.ID for this chunk
 }
 
 // Retriever finds relevant project context for a given query.
@@ -64,6 +65,7 @@ func (r *Retriever) Retrieve(ctx context.Context, query string) ([]ContextBlock,
 			Kind:       result.Record.Kind,
 			Identifier: result.Record.Identifier,
 			Score:      result.Similarity,
+			ChunkID:    result.Record.ID,
 		})
 		tokenCount += chunkTokens
 	}

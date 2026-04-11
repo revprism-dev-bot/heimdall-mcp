@@ -252,16 +252,19 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 			}
 
 			records = append(records, VectorRecord{
-				ID:          fmt.Sprintf("%s:%d:%d", relPath, chunk.StartLine, chunk.EndLine),
-				FilePath:    relPath,
-				StartLine:   chunk.StartLine,
-				EndLine:     chunk.EndLine,
-				Content:     chunk.Content,
-				Kind:        chunk.Kind,
-				Identifier:  chunk.Identifier,
-				Embedding:   vec,
-				ModTime:     mtime,
-				ContentHash: fileHash,
+				ID:            fmt.Sprintf("%s:%d:%d", relPath, chunk.StartLine, chunk.EndLine),
+				FilePath:      relPath,
+				StartLine:     chunk.StartLine,
+				EndLine:       chunk.EndLine,
+				Content:       chunk.Content,
+				Kind:          chunk.Kind,
+				Identifier:    chunk.Identifier,
+				Embedding:     vec,
+				ModTime:       mtime,
+				ContentHash:   fileHash,
+				SourceType:    "code",
+				Metadata:      "{}",
+				Relationships: "[]",
 			})
 		}
 
