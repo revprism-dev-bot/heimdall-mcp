@@ -103,17 +103,57 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 	fmt.Printf("Connecting to Ollama at %s...\n", cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Ollama not reachable: %v\n", err)
+		fmt.Fprintf(os.Stderr, "\nInstall: https://ollama.ai\nStart:   ollama serve\n")
 		os.Exit(1)
 	}
 	fmt.Println("Ollama: connected")
+
+	// Discover available embedding models
+	fmt.Println("\nDiscovering embedding models...")
+	discovered, err := discoverEmbeddingModels(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Model discovery failed: %v\n", err)
+		os.Exit(1)
+	}
+	formatDiscoveryResults(discovered)
+
+	// Let user select which models to index with
+	fmt.Println()
+	selectedModels, err := promptModelSelection(discovered, cfg.Model)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n%v\n", err)
+		os.Exit(1)
+	}
 
 	baseDir := dbPath
 	if baseDir == "" {
 		baseDir = filepath.Join(absPath, ".heimdall_db")
 	}
-	// Migrate legacy single-model DB to model-specific subdirectory
-	heimdall.MigrateToModelDir(baseDir, cfg.Model)
-	dbDir := heimdall.ModelDBDir(baseDir, cfg.Model)
+
+	// Index with each selected model
+	for i, modelName := range selectedModels {
+		if i > 0 {
+			fmt.Println()
+		}
+		indexWithModel(ctx, cfg, client, absPath, baseDir, modelName)
+	}
+
+	// Register project in registry (uses base dir)
+	name := filepath.Base(absPath)
+	reg := registry.LoadRegistry()
+	reg.Register(name, absPath, baseDir)
+	if err := reg.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save project registry: %v\n", err)
+	}
+
+	if len(selectedModels) > 1 {
+		fmt.Printf("\nDone. %d indexes created.\n", len(selectedModels))
+	}
+}
+
+func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.OllamaClient, absPath, baseDir, modelName string) {
+	heimdall.MigrateToModelDir(baseDir, modelName)
+	dbDir := heimdall.ModelDBDir(baseDir, modelName)
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Store error: %v\n", err)
@@ -121,7 +161,7 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 	}
 	defer store.Close()
 
-	embedder := heimdall.NewOllamaEmbedder(client, cfg.Model)
+	embedder := heimdall.NewOllamaEmbedder(client, modelName)
 	indexer := heimdall.NewIndexer(absPath, embedder, store, heimdall.ChunkerOpts{
 		MaxChunkSize: 1500,
 		ContextDepth: cfg.ContextDepth,
@@ -130,13 +170,10 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 
 	startTime := time.Now()
 	fmt.Printf("Indexing %s...\n", absPath)
-	fmt.Printf("Model:    %s\n", cfg.Model)
+	fmt.Printf("Model:    %s\n", modelName)
 	fmt.Printf("Started:  %s\n", startTime.Format("2006-01-02 15:04:05"))
 	fmt.Printf("Database: %s\n\n", dbDir)
 
-	// Use async with progress so we get live updates.
-	// Incremental: skips files already indexed with same modtime.
-	// If you stop and restart, it picks up where it left off.
 	progressCh := make(chan heimdall.IndexProgress, 64)
 	indexer.IndexProjectAsync(ctx, progressCh)
 
@@ -145,13 +182,12 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 		if p.Done {
 			if p.Err != nil {
 				fmt.Fprintf(os.Stderr, "\nIndexing failed: %v\n", p.Err)
-				os.Exit(1)
+				return
 			}
 			r := p.Result
 			elapsed := time.Since(startTime).Round(time.Second)
 			fmt.Printf("\n\nDone.\n")
-			fmt.Printf("  Started:  %s\n", startTime.Format("2006-01-02 15:04:05"))
-			fmt.Printf("  Finished: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+			fmt.Printf("  Model:    %s\n", modelName)
 			fmt.Printf("  Elapsed:  %s\n", elapsed)
 			fmt.Printf("  Scanned:  %d files\n", r.FilesScanned)
 			fmt.Printf("  Indexed:  %d files\n", r.FilesIndexed)
@@ -159,12 +195,10 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 			fmt.Printf("  Chunks:   %d\n", r.ChunksCreated)
 			fmt.Printf("  Database: %s\n", dbDir)
 
-			// Register project in registry (uses base dir, not model-specific)
-			name := filepath.Base(absPath)
-			reg := registry.LoadRegistry()
-			reg.Register(name, absPath, baseDir)
-			if err := reg.Save(); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to save project registry: %v\n", err)
+			// Stamp model metadata
+			store.SetMetadata("embedding_model", modelName)
+			if vec, err := embedder.Embed(ctx, "test"); err == nil {
+				store.SetMetadata("embedding_dim", fmt.Sprintf("%d", len(vec)))
 			}
 			return
 		}
