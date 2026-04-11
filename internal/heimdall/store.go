@@ -97,7 +97,28 @@ func OpenStore(dbDir string) (*VectorStore, error) {
 	// Migrate: add last_accessed column for content lifecycle tracking.
 	db.Exec(`ALTER TABLE entries ADD COLUMN last_accessed INTEGER DEFAULT 0`)
 
+	// Metadata table for store-level properties (model, dimensions, etc.)
+	db.Exec(`CREATE TABLE IF NOT EXISTS store_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
+
 	return &VectorStore{db: db}, nil
+}
+
+// SetMetadata stores a key-value pair in the store metadata table.
+func (s *VectorStore) SetMetadata(key, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO store_metadata (key, value) VALUES (?, ?)`, key, value)
+	return err
+}
+
+// GetMetadata retrieves a value from the store metadata table.
+// Returns empty string if the key doesn't exist.
+func (s *VectorStore) GetMetadata(key string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var value string
+	s.db.QueryRow(`SELECT value FROM store_metadata WHERE key = ?`, key).Scan(&value)
+	return value
 }
 
 // Close closes the underlying database connection.

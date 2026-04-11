@@ -8,7 +8,7 @@ No cloud APIs. No API keys. Everything runs on your machine.
 
 - [Go 1.25+](https://go.dev/dl/)
 - [Ollama](https://ollama.ai) installed and running
-- BGE-M3 model pulled: `ollama pull bge-m3`
+- An embedding model pulled: `ollama pull nomic-embed-text` (default, recommended)
 
 ## Install
 
@@ -136,7 +136,7 @@ Create `~/.config/heimdall-mcp/config.json` or use `heimdall_configure` / `heimd
 ```json
 {
   "ollamaEndpoint": "http://localhost:11434",
-  "model": "bge-m3",
+  "model": "nomic-embed-text",
   "contextDepth": 1,
   "maxContextTokens": 4096,
   "excludePatterns": [".git", "node_modules", "vendor", ".heimdall_db", "__pycache__", ".idea"],
@@ -171,6 +171,33 @@ Config precedence:
 | `lifecycle.active_days` | int | `30` | Days before content is archived |
 | `lifecycle.archive_days` | int | `90` | Days before content is pruned |
 | `max_chunks_per_project` | int | `10000` | Hard cap on chunks per project DB |
+
+## Embedding Models
+
+Heimdall defaults to `nomic-embed-text` (Nomic AI, Apache 2.0, 137M params, 768 dimensions). You can use any Ollama embedding model.
+
+To switch models:
+```bash
+ollama pull <model-name>
+heimdall-mcp config set model <model-name>
+```
+
+Then re-index your projects — Heimdall detects model mismatches and warns you if the index was built with a different model.
+
+### Recommended models
+
+| Model | Origin | Size | Dims | Best for |
+|-------|--------|------|------|----------|
+| `nomic-embed-text` | Nomic AI (US) | 137M | 768 | **Default.** Best balance of quality and speed. |
+| `snowflake-arctic-embed:s` | Snowflake (US) | 33M | 384 | Minimal resource usage. |
+| `snowflake-arctic-embed` | Snowflake (US) | 110M | 768 | Medium footprint, good quality. |
+| `all-minilm` | Microsoft (US) | 33M | 384 | Fastest, smallest. Lower quality. |
+| `mxbai-embed-large` | Mixedbread (DE) | 335M | 1024 | High quality, heavier. |
+| `bge-m3` | BAAI (CN) | 567M | 1024 | Multilingual, heaviest. |
+
+### Model mismatch protection
+
+Heimdall stores which model was used to build each index. If you change your model without re-indexing, `heimdall_search` returns a warning and `heimdall_status` shows the mismatch. Different models produce incompatible embedding spaces — cosine similarity across models is meaningless.
 
 ## Project Registry
 
@@ -221,7 +248,7 @@ When a result has relationships, `heimdall_explain` includes related items with 
 
 ## Portable Indexes
 
-The `.heimdall_db/` directory contains a single `vectors.db` SQLite file. You can copy it between machines as long as the same embedding model (bge-m3) is used. File paths stored in the index are relative, so projects can live at different absolute paths.
+The `.heimdall_db/` directory contains a single `vectors.db` SQLite file. You can copy it between machines as long as the same embedding model is used (the model name is stored in the DB and checked automatically). File paths stored in the index are relative, so projects can live at different absolute paths.
 
 ## Ollama Tuning
 

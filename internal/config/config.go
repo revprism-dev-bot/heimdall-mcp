@@ -31,7 +31,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		OllamaEndpoint:       "http://localhost:11434",
-		Model:                "bge-m3",
+		Model:                "nomic-embed-text",
 		ContextDepth:         1,
 		MaxContextTokens:     4096,
 		ExcludePatterns:      []string{".git", "node_modules", "vendor", ".heimdall_db", "__pycache__", ".idea"},
