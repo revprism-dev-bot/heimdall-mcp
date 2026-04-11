@@ -44,6 +44,9 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	}
 	defer store.Close()
 
+	// Check for model mismatch — warn if index was built with a different model
+	modelWarning := checkModelMismatch(store, s.Cfg.Model)
+
 	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
 
 	// If filters are present, use filtered search path
@@ -100,10 +103,19 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	// 4.3: Stale index check — trigger background re-index if stale
 	staleNote := s.checkAndTriggerReindex(store, dbDir)
 
+	// Build notes from warnings
+	var notes []string
+	if modelWarning != "" {
+		notes = append(notes, modelWarning)
+	}
 	if staleNote != "" {
+		notes = append(notes, staleNote)
+	}
+
+	if len(notes) > 0 {
 		response := map[string]any{
-			"results": results,
-			"note":    staleNote,
+			"results":  results,
+			"warnings": notes,
 		}
 		out, _ := json.MarshalIndent(response, "", "  ")
 		return TextResult(string(out))
@@ -301,6 +313,15 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 						log.Printf("failed to save registry: %v", err)
 					}
 
+					// Stamp model metadata so we can detect mismatches later
+					store.SetMetadata("embedding_model", s.Cfg.Model)
+					if dim := store.GetMetadata("embedding_dim"); dim == "" {
+						// Do a test embed to record dimension
+						if vec, err := embedder.Embed(ctx, "test"); err == nil {
+							store.SetMetadata("embedding_dim", fmt.Sprintf("%d", len(vec)))
+						}
+					}
+
 					// 4.2: Auto-detect git repo and index commits
 					gitDir := filepath.Join(absPath, ".git")
 					if info, err := os.Stat(gitDir); err == nil && info.IsDir() {
@@ -487,6 +508,16 @@ func (s *Server) toolStatus() MCPToolResult {
 			} else {
 				status["lastIndexed"] = "never"
 			}
+			// Show which model the index was built with
+			if indexModel := store.GetMetadata("embedding_model"); indexModel != "" {
+				status["indexModel"] = indexModel
+				if indexModel != model {
+					status["modelMismatch"] = fmt.Sprintf("index built with %q, configured model is %q — re-index to fix", indexModel, model)
+				}
+			}
+			if indexDim := store.GetMetadata("embedding_dim"); indexDim != "" {
+				status["indexEmbeddingDim"] = indexDim
+			}
 		}
 	} else {
 		status["indexedFiles"] = 0
@@ -546,4 +577,18 @@ func (s *Server) toolStatus() MCPToolResult {
 
 	out, _ := json.MarshalIndent(status, "", "  ")
 	return TextResult(string(out))
+}
+
+// checkModelMismatch returns a warning string if the configured model
+// differs from the model that was used to build the index.
+// Returns empty string if no mismatch or if the index has no model metadata.
+func checkModelMismatch(store *heimdall.VectorStore, currentModel string) string {
+	indexModel := store.GetMetadata("embedding_model")
+	if indexModel == "" {
+		return "" // pre-metadata index, can't check
+	}
+	if indexModel != currentModel {
+		return fmt.Sprintf("MODEL MISMATCH: index was built with %q but current model is %q. Search results will be unreliable. Re-index with heimdall_index to fix.", indexModel, currentModel)
+	}
+	return ""
 }

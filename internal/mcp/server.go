@@ -502,6 +502,14 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 		log.Printf("store save warning: %v", err)
 	}
 
+	// Stamp model metadata if not already set
+	if store.GetMetadata("embedding_model") == "" {
+		store.SetMetadata("embedding_model", s.Cfg.Model)
+		if len(records) > 0 && len(records[0].Embedding) > 0 {
+			store.SetMetadata("embedding_dim", fmt.Sprintf("%d", len(records[0].Embedding)))
+		}
+	}
+
 	out, _ := json.MarshalIndent(map[string]any{
 		"source":   input.Source,
 		"type":     sourceType,
