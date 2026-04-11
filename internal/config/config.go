@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,16 +15,35 @@ type Config struct {
 	ContextDepth     int      `json:"contextDepth"`
 	MaxContextTokens int      `json:"maxContextTokens"`
 	ExcludePatterns  []string `json:"excludePatterns"`
+	// Phase 4-6 fields
+	GitEnabled           bool     `json:"gitEnabled"`
+	GitDepth             int      `json:"gitDepth"`
+	GitIncludeDiffs      bool     `json:"gitIncludeDiffs"`
+	GitBranches          []string `json:"gitBranches"`
+	StaleTimeoutMin      int      `json:"staleTimeoutMinutes"`
+	LifecycleActiveDays  int      `json:"lifecycleActiveDays"`
+	LifecycleArchiveDays int      `json:"lifecycleArchiveDays"`
+	MaxChunksPerProject  int      `json:"maxChunksPerProject"`
+	IndexedPaths         []string `json:"indexedPaths"`
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		OllamaEndpoint:   "http://localhost:11434",
-		Model:            "bge-m3",
-		ContextDepth:     1,
-		MaxContextTokens: 4096,
-		ExcludePatterns:  []string{".git", "node_modules", "vendor", ".heimdall_db", "__pycache__", ".idea"},
+		OllamaEndpoint:       "http://localhost:11434",
+		Model:                "bge-m3",
+		ContextDepth:         1,
+		MaxContextTokens:     4096,
+		ExcludePatterns:      []string{".git", "node_modules", "vendor", ".heimdall_db", "__pycache__", ".idea"},
+		GitEnabled:           true,
+		GitDepth:             200,
+		GitIncludeDiffs:      false,
+		GitBranches:          []string{},
+		StaleTimeoutMin:      30,
+		LifecycleActiveDays:  30,
+		LifecycleArchiveDays: 90,
+		MaxChunksPerProject:  10000,
+		IndexedPaths:         []string{},
 	}
 }
 
@@ -59,8 +79,52 @@ func LoadConfig() Config {
 	if len(cfg.ExcludePatterns) == 0 {
 		cfg.ExcludePatterns = defaults.ExcludePatterns
 	}
+	// Phase 4-6 defaults: use a marker to distinguish "not set" from "explicitly false/zero"
+	// For booleans, we cannot distinguish false from unset via JSON unmarshal into bool,
+	// so we use GitDepth==0 as the sentinel (it was not in older configs).
+	if cfg.GitDepth == 0 {
+		cfg.GitEnabled = defaults.GitEnabled
+		cfg.GitDepth = defaults.GitDepth
+	}
+	if cfg.StaleTimeoutMin == 0 {
+		cfg.StaleTimeoutMin = defaults.StaleTimeoutMin
+	}
+	if cfg.LifecycleActiveDays == 0 {
+		cfg.LifecycleActiveDays = defaults.LifecycleActiveDays
+	}
+	if cfg.LifecycleArchiveDays == 0 {
+		cfg.LifecycleArchiveDays = defaults.LifecycleArchiveDays
+	}
+	if cfg.MaxChunksPerProject == 0 {
+		cfg.MaxChunksPerProject = defaults.MaxChunksPerProject
+	}
 
 	return cfg
+}
+
+// SaveConfig writes the config to the resolved config path, creating the directory if needed.
+func SaveConfig(cfg Config) error {
+	path := resolveConfigPath()
+	if path == "" {
+		// No existing config file — create one in the default location
+		dir := resolveConfigDir()
+		path = filepath.Join(dir, "config.json")
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
 }
 
 // resolveConfigPath finds the config file using this precedence:

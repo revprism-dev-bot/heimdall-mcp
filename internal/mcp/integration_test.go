@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
 	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
@@ -391,6 +392,253 @@ func TestExplainResult_JSON(t *testing.T) {
 			t.Errorf("missing key %q in ExplainResult JSON", key)
 		}
 	}
+}
+
+// --- Phase 4.1: Auto-index on first search ---
+
+func TestAutoIndexOnSearch_ReturnsIndexingStarted(t *testing.T) {
+	reg := &registry.Registry{}
+	srv := &Server{
+		Cfg:      config.DefaultConfig(),
+		Registry: reg,
+	}
+
+	// autoIndexOnSearch should return a message with "indexing_started"
+	// since the CWD will exist but no DB exists
+	result := srv.autoIndexOnSearch()
+
+	if result.IsError {
+		t.Fatalf("expected non-error result, got error: %s", result.Content[0].Text)
+	}
+
+	text := result.Content[0].Text
+	if !contains(text, "indexing_started") && !contains(text, "indexing_in_progress") {
+		t.Errorf("expected indexing_started or indexing_in_progress in response, got: %s", text)
+	}
+
+	// The index should now be marked as running
+	srv.Index.Mu.Lock()
+	running := srv.Index.Running
+	srv.Index.Mu.Unlock()
+
+	if !running {
+		// It may have already completed or failed (since Ollama isn't running in test),
+		// which is fine - we just verify the trigger path works
+		t.Log("indexing not running (expected in test environment without Ollama)")
+	}
+
+	// Clean up: cancel any running index
+	srv.Index.Mu.Lock()
+	if srv.Index.Cancel != nil {
+		srv.Index.Cancel()
+	}
+	srv.Index.Mu.Unlock()
+}
+
+func TestAutoIndexOnSearch_AlreadyRunning(t *testing.T) {
+	reg := &registry.Registry{}
+	srv := &Server{
+		Cfg:      config.DefaultConfig(),
+		Registry: reg,
+	}
+
+	// Pre-set indexing as running
+	srv.Index.Mu.Lock()
+	srv.Index.Running = true
+	srv.Index.Path = "/some/path"
+	srv.Index.Mu.Unlock()
+
+	result := srv.autoIndexOnSearch()
+
+	if result.IsError {
+		t.Fatalf("expected non-error result, got error")
+	}
+
+	text := result.Content[0].Text
+	if !contains(text, "indexing_in_progress") {
+		t.Errorf("expected indexing_in_progress in response, got: %s", text)
+	}
+
+	// Clean up
+	srv.Index.Mu.Lock()
+	srv.Index.Running = false
+	srv.Index.Mu.Unlock()
+}
+
+// --- Phase 4.3: Stale index check ---
+
+func TestCheckAndTriggerReindex_FreshIndex(t *testing.T) {
+	srv, store, dbDir := setupTestServer(t)
+	defer store.Close()
+
+	// Insert a record with a recent modtime
+	records := []heimdall.VectorRecord{
+		{
+			ID: "r1", FilePath: "a.go", Content: "func main",
+			Embedding: []float32{1.0}, ModTime: time.Now().Unix(),
+			SourceType: "code",
+		},
+	}
+	if err := store.Upsert(records); err != nil {
+		t.Fatal(err)
+	}
+
+	note := srv.checkAndTriggerReindex(store, dbDir)
+	if note != "" {
+		t.Errorf("expected empty note for fresh index, got: %s", note)
+	}
+}
+
+func TestCheckAndTriggerReindex_StaleIndex(t *testing.T) {
+	srv, store, dbDir := setupTestServer(t)
+	defer store.Close()
+
+	// Insert a record with an old modtime (older than 30 minutes)
+	oldTime := time.Now().Unix() - staleTimeoutSeconds - 100
+	records := []heimdall.VectorRecord{
+		{
+			ID: "r1", FilePath: "a.go", Content: "func main",
+			Embedding: []float32{1.0}, ModTime: oldTime,
+			SourceType: "code",
+		},
+	}
+	if err := store.Upsert(records); err != nil {
+		t.Fatal(err)
+	}
+
+	note := srv.checkAndTriggerReindex(store, dbDir)
+	if note == "" {
+		t.Error("expected stale note, got empty")
+	}
+	if !contains(note, "stale") {
+		t.Errorf("expected note to mention 'stale', got: %s", note)
+	}
+}
+
+func TestCheckAndTriggerReindex_NoProjectPath(t *testing.T) {
+	// Server with empty registry — no project path can be found
+	reg := &registry.Registry{}
+	srv := &Server{
+		Cfg:      config.DefaultConfig(),
+		Registry: reg,
+	}
+
+	tmpDir := t.TempDir()
+	dbDir := filepath.Join(tmpDir, ".heimdall_db")
+	store, err := heimdall.OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Insert old record
+	oldTime := time.Now().Unix() - staleTimeoutSeconds - 100
+	store.Upsert([]heimdall.VectorRecord{
+		{ID: "r1", FilePath: "a.go", Content: "test", Embedding: []float32{1.0}, ModTime: oldTime},
+	})
+
+	// dbDir won't match any registered project, so no re-index should trigger
+	note := srv.checkAndTriggerReindex(store, dbDir)
+	if note != "" {
+		t.Errorf("expected empty note when no project matches, got: %s", note)
+	}
+}
+
+func TestCheckAndTriggerReindex_EmptyStore(t *testing.T) {
+	srv, store, dbDir := setupTestServer(t)
+	defer store.Close()
+
+	// Empty store — LastModified is 0
+	note := srv.checkAndTriggerReindex(store, dbDir)
+	if note != "" {
+		t.Errorf("expected empty note for empty store, got: %s", note)
+	}
+}
+
+// --- Phase 4.4: MCP instructions ---
+
+func TestHandleInitialize_ContainsInstructions(t *testing.T) {
+	srv := &Server{
+		Cfg:      config.DefaultConfig(),
+		Registry: &registry.Registry{},
+	}
+
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "initialize",
+	}
+
+	resp := srv.Handle(req)
+	if resp == nil {
+		t.Fatal("expected non-nil response")
+	}
+	if resp.Error != nil {
+		t.Fatalf("expected no error, got: %v", resp.Error)
+	}
+
+	result, ok := resp.Result.(map[string]any)
+	if !ok {
+		t.Fatal("expected result to be a map")
+	}
+
+	instructions, ok := result["instructions"]
+	if !ok {
+		t.Fatal("expected 'instructions' field in initialize response")
+	}
+
+	instrStr, ok := instructions.(string)
+	if !ok {
+		t.Fatal("expected instructions to be a string")
+	}
+
+	if !contains(instrStr, "heimdall_index_text") {
+		t.Error("instructions should mention heimdall_index_text")
+	}
+	if !contains(instrStr, "external sources") {
+		t.Error("instructions should mention external sources")
+	}
+	if !contains(instrStr, "silently") {
+		t.Error("instructions should mention doing it silently")
+	}
+}
+
+func TestHandleInitialize_HasServerInfo(t *testing.T) {
+	srv := &Server{
+		Cfg:      config.DefaultConfig(),
+		Registry: &registry.Registry{},
+	}
+
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "initialize",
+	}
+
+	resp := srv.Handle(req)
+	result := resp.Result.(map[string]any)
+
+	serverInfo, ok := result["serverInfo"].(map[string]any)
+	if !ok {
+		t.Fatal("expected serverInfo")
+	}
+	if serverInfo["name"] != "heimdall-mcp" {
+		t.Errorf("expected name 'heimdall-mcp', got %v", serverInfo["name"])
+	}
+}
+
+// helper
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsStr(s, substr))
+}
+
+func containsStr(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDBDir_WrittenOnFirstUse(t *testing.T) {

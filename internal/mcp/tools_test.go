@@ -142,3 +142,23 @@ func TestResolveDBDirForRead(t *testing.T) {
 		t.Errorf("resolveDBDirForRead('existing') = %q, want %q", result, dbDir)
 	}
 }
+
+func TestClassifySource_Commit(t *testing.T) {
+	got := classifySource("commit")
+	if got != "commit" {
+		t.Errorf("classifySource(%q) = %q, want %q", "commit", got, "commit")
+	}
+}
+
+func TestValidateSourceType_Commit(t *testing.T) {
+	got := validateSourceType("commit")
+	if got != "commit" {
+		t.Errorf("validateSourceType(%q) = %q, want %q", "commit", got, "commit")
+	}
+}
+
+func TestStaleTimeoutConstant(t *testing.T) {
+	if staleTimeoutSeconds != 1800 {
+		t.Errorf("staleTimeoutSeconds = %d, want 1800", staleTimeoutSeconds)
+	}
+}

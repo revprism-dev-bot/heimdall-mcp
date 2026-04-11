@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -28,6 +29,7 @@ type VectorRecord struct {
 	SourceType    string    `json:"sourceType"`    // "code", "ticket", "doc", "pr", etc.
 	Metadata      string    `json:"metadata"`      // JSON object string
 	Relationships string    `json:"relationships"` // JSON array string
+	LastAccessed  int64     `json:"lastAccessed"`  // unix timestamp of last search hit
 }
 
 // SearchResult is a record with its similarity score.
@@ -45,8 +47,9 @@ type StoreStats struct {
 
 // VectorStore manages the SQLite-backed vector database.
 type VectorStore struct {
-	mu sync.RWMutex
-	db *sql.DB
+	mu               sync.RWMutex
+	db               *sql.DB
+	lastLifecycleRun int64 // unix timestamp, protected by mu
 }
 
 // OpenStore loads or creates a vector store at the given directory.
@@ -91,6 +94,9 @@ func OpenStore(dbDir string) (*VectorStore, error) {
 	db.Exec(`ALTER TABLE entries ADD COLUMN relationships TEXT DEFAULT '[]'`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_source_type ON entries(source_type)`)
 
+	// Migrate: add last_accessed column for content lifecycle tracking.
+	db.Exec(`ALTER TABLE entries ADD COLUMN last_accessed INTEGER DEFAULT 0`)
+
 	return &VectorStore{db: db}, nil
 }
 
@@ -113,7 +119,7 @@ func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType strin
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	sqlQuery := `SELECT id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, source_type, metadata, relationships FROM entries`
+	sqlQuery := `SELECT id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, source_type, metadata, relationships, last_accessed FROM entries`
 	var args []any
 	if sourceType != "" {
 		sqlQuery += ` WHERE source_type = ?`
@@ -131,8 +137,9 @@ func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType strin
 		var rec VectorRecord
 		var vecBlob []byte
 		var kind, identifier, srcType, meta, rels sql.NullString
+		var lastAccessed sql.NullInt64
 		if err := rows.Scan(&rec.ID, &rec.FilePath, &rec.StartLine, &rec.EndLine, &rec.Content,
-			&kind, &identifier, &vecBlob, &rec.ModTime, &srcType, &meta, &rels); err != nil {
+			&kind, &identifier, &vecBlob, &rec.ModTime, &srcType, &meta, &rels, &lastAccessed); err != nil {
 			continue
 		}
 		rec.Kind = kind.String
@@ -140,6 +147,7 @@ func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType strin
 		rec.SourceType = srcType.String
 		rec.Metadata = meta.String
 		rec.Relationships = rels.String
+		rec.LastAccessed = lastAccessed.Int64
 		rec.Embedding = DecodeFloat32Vec(vecBlob)
 
 		// Post-filter: metadata match
@@ -147,7 +155,7 @@ func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType strin
 			continue
 		}
 
-		sim := CosineSimilarity(query, rec.Embedding)
+		sim := CosineSimilarity(query, rec.Embedding) * freshnessWeight(rec.LastAccessed)
 		results = append(results, SearchResult{Record: rec, Similarity: sim})
 	}
 
@@ -300,4 +308,83 @@ func (s *VectorStore) SnippetBySource(source string) string {
 		content = content[:200] + "..."
 	}
 	return content
+}
+
+// UpdateLastAccessed batch-updates the last_accessed timestamp to the current
+// unix time for the given entry IDs.
+func (s *VectorStore) UpdateLastAccessed(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().Unix()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1] // trim trailing comma
+
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, now)
+	for _, id := range ids {
+		args = append(args, id)
+	}
+
+	_, err = tx.Exec(`UPDATE entries SET last_accessed = ? WHERE id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// freshnessWeight applies a linear decay from 1.0 to 0.5 over 90 days based
+// on the last_accessed timestamp. Entries that have never been accessed
+// (last_accessed <= 0) are treated as fresh and receive no penalty.
+func freshnessWeight(lastAccessed int64) float64 {
+	if lastAccessed <= 0 {
+		return 1.0 // never accessed = treat as fresh (new content)
+	}
+	age := float64(time.Now().Unix() - lastAccessed)
+	if age <= 0 {
+		return 1.0
+	}
+	const maxAge = float64(90 * 24 * 3600) // 90 days in seconds
+	if age >= maxAge {
+		return 0.5
+	}
+	// Linear decay from 1.0 to 0.5 over 90 days
+	return 1.0 - 0.5*(age/maxAge)
+}
+
+// ShouldRunLifecycle returns true if at least one hour has elapsed since the
+// last lifecycle run. Safe for concurrent use.
+func (s *VectorStore) ShouldRunLifecycle() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return time.Now().Unix()-s.lastLifecycleRun > 3600
+}
+
+// MarkLifecycleRun records that a lifecycle run just completed.
+func (s *VectorStore) MarkLifecycleRun() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastLifecycleRun = time.Now().Unix()
+}
+
+// DB exposes the underlying *sql.DB for lifecycle operations.
+// This is intentionally package-internal — only lifecycle.go uses it.
+func (s *VectorStore) DB() *sql.DB {
+	return s.db
+}
+
+// Mu exposes the store mutex for lifecycle operations that need
+// write-level coordination with the store.
+func (s *VectorStore) Mu() *sync.RWMutex {
+	return &s.mu
 }
