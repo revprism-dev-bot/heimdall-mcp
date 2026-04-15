@@ -650,3 +650,20 @@ func TestLastAccessedMigration(t *testing.T) {
 		t.Errorf("default last_accessed = %d, want 0", la)
 	}
 }
+
+// TestSearchFiltered_BudgetTimeout is a placeholder for the budget-timeout
+// contract called out by TEST-B-003. SearchFiltered currently has the
+// signature (query []float32, topK int, sourceType string, metadataFilter
+// map[string]any) []SearchResult — no context, no error. Asserting a
+// ctx-deadline-fired behavior without adding a context parameter is not
+// possible, and the Wave 1 Stream B scope explicitly forbids breaking the
+// API this cycle (Wave 2 T4 owns the ctx-aware rewrite).
+//
+// When T4 lands, this test should:
+//  1. Build a store with enough rows that a linear scan takes measurable time.
+//  2. Call SearchFiltered with a ctx whose deadline has already fired.
+//  3. Assert: no panic, returned slice is empty-or-partial, ctx.Err() != nil,
+//     and no goroutine leak.
+func TestSearchFiltered_BudgetTimeout(t *testing.T) {
+	t.Skip("Wave 2 T4: SearchFiltered needs a context parameter before a timeout contract can be asserted")
+}

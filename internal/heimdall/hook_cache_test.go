@@ -305,3 +305,135 @@ func TestOpenStore_MigratesFromLegacySchema(t *testing.T) {
 		t.Errorf("hook_cache unusable after migration: %v", err)
 	}
 }
+
+// TestHookCacheGet_ZeroTTL pins the documented contract for ttl=0: the
+// `if ttl > 0` guard in HookCacheGet skips the freshness check entirely,
+// so ttl=0 means "don't gate on age — always return the row if it
+// exists." A row written this instant must therefore come back as a hit.
+func TestHookCacheGet_ZeroTTL(t *testing.T) {
+	store := newTestStore(t)
+	payload := []byte("zero-ttl-payload")
+	if err := store.HookCachePut("zt", payload, 0, 0); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	got, err := store.HookCacheGet("zt", 0)
+	if err != nil {
+		t.Fatalf("ttl=0 should not gate freshness, got %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("payload mismatch: got %q want %q", got, payload)
+	}
+
+	// And the same semantics hold for a row aged into the distant past:
+	// ttl=0 must still return it.
+	if _, err := store.db.Exec(
+		`UPDATE hook_cache SET created_at = ? WHERE key = ?`,
+		time.Now().Add(-365*24*time.Hour).Unix(), "zt",
+	); err != nil {
+		t.Fatalf("rewind: %v", err)
+	}
+	if _, err := store.HookCacheGet("zt", 0); err != nil {
+		t.Errorf("ttl=0 on ancient row should still hit, got %v", err)
+	}
+}
+
+// TestHookCache_ConcurrentClearDuringGet exercises the two-phase lock in
+// HookCacheGet against a concurrent HookCacheClear. Under `-race` this
+// asserts there is no data race, no panic, and that every Get either
+// returns the exact stored payload or ErrHookCacheMiss — never garbage.
+func TestHookCache_ConcurrentClearDuringGet(t *testing.T) {
+	store := newTestStore(t)
+	payload := []byte("concurrent-payload")
+
+	// A writer goroutine keeps re-putting the row so clears don't
+	// permanently starve the readers.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = store.HookCachePut("ck", payload, time.Minute, 0)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = store.HookCacheClear()
+		}
+	}()
+
+	const readers = 4
+	const iterations = 250
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				got, err := store.HookCacheGet("ck", time.Minute)
+				if err != nil {
+					if !errors.Is(err, ErrHookCacheMiss) {
+						t.Errorf("unexpected error: %v", err)
+						return
+					}
+					continue
+				}
+				if !bytes.Equal(got, payload) {
+					t.Errorf("garbage payload: got %q want %q", got, payload)
+					return
+				}
+			}
+		}()
+	}
+
+	// Cap the run so a slow CI box can't hang.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// TestHookCachePut_BinaryStdout asserts the BLOB column round-trips
+// arbitrary bytes — NUL, 0xFF, and multi-byte Unicode — byte-for-byte.
+func TestHookCachePut_BinaryStdout(t *testing.T) {
+	store := newTestStore(t)
+	payload := []byte{
+		0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd,
+		'h', 'e', 'l', 'l', 'o',
+		0xe2, 0x98, 0x83, // ☃ snowman
+		0xf0, 0x9f, 0x9a, 0x80, // 🚀 rocket
+		0x00, 0x00,
+	}
+
+	if err := store.HookCachePut("bin", payload, time.Minute, 0); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	got, err := store.HookCacheGet("bin", time.Minute)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("binary round-trip failed:\n got: % x\nwant: % x", got, payload)
+	}
+}

@@ -113,17 +113,23 @@ func (s *VectorStore) HookCachePut(key string, stdout []byte, ttl time.Duration,
 
 // HookCacheGet returns the cached stdout for the given key, or
 // ErrHookCacheMiss if nothing fresh is stored. A hit increments hit_count
-// atomically. A stored row older than ttl is reported as a miss (the row
-// is left in place — eviction happens via rowCap or explicit clear).
+// on a best-effort basis. A stored row older than ttl is reported as a
+// miss (the row is left in place — eviction happens via rowCap or
+// explicit clear).
+//
+// The lookup runs under RLock so concurrent cache-hit readers don't
+// serialize behind each other; the hit_count bump takes a brief write
+// lock afterward and its error is intentionally swallowed so a failed
+// bump cannot mask a successful read.
 func (s *VectorStore) HookCacheGet(key string, ttl time.Duration) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	s.mu.RLock()
 	var stdout []byte
 	var createdAt int64
 	err := s.db.QueryRow(
 		`SELECT stdout, created_at FROM hook_cache WHERE key = ?`, key,
 	).Scan(&stdout, &createdAt)
+	s.mu.RUnlock()
+
 	if err == sql.ErrNoRows {
 		return nil, ErrHookCacheMiss
 	}
@@ -138,11 +144,12 @@ func (s *VectorStore) HookCacheGet(key string, ttl time.Duration) ([]byte, error
 		}
 	}
 
-	if _, err := s.db.Exec(
+	s.mu.Lock()
+	_, _ = s.db.Exec(
 		`UPDATE hook_cache SET hit_count = hit_count + 1 WHERE key = ?`, key,
-	); err != nil {
-		return nil, err
-	}
+	)
+	s.mu.Unlock()
+
 	return stdout, nil
 }
 
