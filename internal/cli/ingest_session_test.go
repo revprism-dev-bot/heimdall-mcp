@@ -153,6 +153,102 @@ func TestCLIIngestSession_MissingBufferFile(t *testing.T) {
 	}
 }
 
+// TEST-A-002: malformed / oversized / zero-length buffer records.
+//
+// These drive CLIIngestSession through --buffer <path> so we cover the CLI
+// wiring in addition to the heimdall.ReadLengthPrefixedBuffer unit tests.
+// The expectation in all three cases is no panic.
+
+func TestCLIIngestSession_BufferTruncatedPrefix(t *testing.T) {
+	store := openIngestStore(t)
+	deps := testIngestDeps(store)
+
+	// Write only 2 of the 4 prefix bytes — hard error expected.
+	dir := t.TempDir()
+	bufPath := filepath.Join(dir, "buf.log")
+	if err := os.WriteFile(bufPath, []byte{0x00, 0x01}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	code := CLIIngestSession(strings.NewReader(""), &stdout, &stderr, nil,
+		[]string{"--buffer", bufPath, "--session-id", "sess"}, deps)
+	if code != 1 {
+		t.Errorf("expected exit 1 for truncated prefix, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "parse buffer") {
+		t.Errorf("expected parse error in stderr, got %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("expected silent stdout on error, got %q", stdout.String())
+	}
+}
+
+func TestCLIIngestSession_BufferOversizedLength(t *testing.T) {
+	store := openIngestStore(t)
+	deps := testIngestDeps(store)
+
+	// 4-byte length prefix declaring 3 MB (over the 2 MB cap).
+	dir := t.TempDir()
+	bufPath := filepath.Join(dir, "buf.log")
+	var lb [4]byte
+	binary.BigEndian.PutUint32(lb[:], 3*1024*1024)
+	if err := os.WriteFile(bufPath, lb[:], 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	code := CLIIngestSession(strings.NewReader(""), &stdout, &stderr, nil,
+		[]string{"--buffer", bufPath, "--session-id", "sess"}, deps)
+	if code != 1 {
+		t.Errorf("expected exit 1 for oversized length, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "parse buffer") {
+		t.Errorf("expected parse error in stderr, got %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "too large") {
+		t.Errorf("expected 'too large' detail in stderr, got %q", stderr.String())
+	}
+}
+
+func TestCLIIngestSession_BufferZeroLengthRecordsSkipped(t *testing.T) {
+	store := openIngestStore(t)
+	deps := testIngestDeps(store)
+
+	// Record 1: length 0 (skipped). Record 2: length 20 payload.
+	dir := t.TempDir()
+	bufPath := filepath.Join(dir, "buf.log")
+	f, err := os.Create(bufPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lb [4]byte
+	binary.BigEndian.PutUint32(lb[:], 0)
+	f.Write(lb[:])
+	payload := "kept payload content"
+	binary.BigEndian.PutUint32(lb[:], uint32(len(payload)))
+	f.Write(lb[:])
+	f.WriteString(payload)
+	f.Close()
+
+	var stdout, stderr strings.Builder
+	code := CLIIngestSession(strings.NewReader(""), &stdout, &stderr, nil,
+		[]string{"--buffer", bufPath, "--session-id", "sess"}, deps)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d stderr=%q", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("expected silent stderr, got %q", stderr.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(stdout.String()), &got); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, stdout.String())
+	}
+	if got["ok"] != true {
+		t.Errorf("expected ok=true, got %v", got["ok"])
+	}
+}
+
 func TestCLIIngestSession_OllamaUnavailable(t *testing.T) {
 	store := openIngestStore(t)
 	deps := testIngestDeps(store)

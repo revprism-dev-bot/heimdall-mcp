@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -98,12 +101,31 @@ func TestCLIStatus_TextOnlineModelAvailable(t *testing.T) {
 	}
 }
 
+// TEST-A-003: golden file for status JSON shape.
+//
+// Uses a deterministic offline configuration:
+//   - endpoint pointing at a closed port (Ollama offline)
+//   - fixed model name
+//   - empty baseDir (no index yet)
+//   - no registered projects
+//
+// Compares the full JSON document (canonicalized via re-marshal in sorted key
+// order) against internal/cli/testdata/status.golden.json. The golden file
+// uses {{BASE_DIR}} and {{MODEL_DB_DIR}} placeholders which the test fills in
+// with the tempdir values before comparison.
 func TestCLIStatus_JSONFormat(t *testing.T) {
-	srv := fakeOllama(t, []string{"nomic-embed-text:latest"})
-	defer srv.Close()
-
 	baseDir := t.TempDir()
-	deps := testStatusDeps(t, srv.URL, "nomic-embed-text", baseDir)
+	deps := StatusDeps{
+		LoadConfig: func() config.Config {
+			return config.Config{
+				OllamaEndpoint: "http://127.0.0.1:0",
+				Model:          "nomic-embed-text",
+			}
+		},
+		LoadRegistry:    func() *registry.Registry { return &registry.Registry{} },
+		NewClient:       func(e string) *heimdall.OllamaClient { return heimdall.NewOllamaClient(e) },
+		BaseDirOverride: baseDir,
+	}
 
 	var stdout, stderr strings.Builder
 	code := CLIStatus(strings.NewReader(""), &stdout, &stderr, nil,
@@ -112,24 +134,41 @@ func TestCLIStatus_JSONFormat(t *testing.T) {
 		t.Fatalf("exit %d stderr=%q", code, stderr.String())
 	}
 
-	var info heimdall.StatusInfo
-	if err := json.Unmarshal([]byte(stdout.String()), &info); err != nil {
-		t.Fatalf("invalid json: %v\n%s", err, stdout.String())
+	// Parse actual output.
+	var got heimdall.StatusInfo
+	if err := json.Unmarshal([]byte(stdout.String()), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout.String())
 	}
-	if info.Endpoint != srv.URL {
-		t.Errorf("endpoint: %q", info.Endpoint)
+
+	// Load golden, substitute placeholders, parse expected.
+	goldenPath := filepath.Join("testdata", "status.golden.json")
+	goldenBytes, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
 	}
-	if info.Model != "nomic-embed-text" {
-		t.Errorf("model: %q", info.Model)
+	modelDBDir := heimdall.ModelDBDir(baseDir, "nomic-embed-text")
+	goldenStr := string(goldenBytes)
+	goldenStr = strings.ReplaceAll(goldenStr, "{{BASE_DIR}}", baseDir)
+	goldenStr = strings.ReplaceAll(goldenStr, "{{MODEL_DB_DIR}}", modelDBDir)
+
+	var want heimdall.StatusInfo
+	if err := json.Unmarshal([]byte(goldenStr), &want); err != nil {
+		t.Fatalf("invalid golden JSON after substitution: %v\n%s", err, goldenStr)
 	}
-	if !info.OllamaRunning {
-		t.Error("expected OllamaRunning true")
+
+	// Canonicalize both via Marshal with a stable struct — json.Marshal on a
+	// struct emits fields in declaration order, so equal structs produce
+	// byte-identical output.
+	gotBytes, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("remarshal got: %v", err)
 	}
-	if info.ModelAvailable == nil || !*info.ModelAvailable {
-		t.Errorf("expected modelAvailable true, got %v", info.ModelAvailable)
+	wantBytes, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("remarshal want: %v", err)
 	}
-	if info.LastIndexed != "no index" {
-		t.Errorf("last indexed: %q", info.LastIndexed)
+	if !bytes.Equal(gotBytes, wantBytes) {
+		t.Errorf("status JSON shape mismatch:\n got:  %s\n want: %s", gotBytes, wantBytes)
 	}
 }
 
