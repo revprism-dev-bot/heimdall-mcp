@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,12 +13,31 @@ import (
 	"time"
 )
 
+// winAbsPathRe matches Windows-style absolute paths at the very start of the
+// string: either a drive-letter prefix (`C:\`, `d:/`) or a UNC prefix
+// (`\\server\`). Compiled once at package init so the hot path stays
+// allocation-free on non-matches. Only the leading prefix needs to match —
+// once confirmed, the whole value is redacted.
+var winAbsPathRe = regexp.MustCompile(`^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\)`)
+
 // hook log file constants.
 const (
-	hookLogMaxBytes = 5 * 1024 * 1024 // 5 MB size cap per §5.8
-	hookLogFileMode = 0o600           // user-only; never leak to other users
+	hookLogFileMode = 0o600 // user-only; never leak to other users
 	hookLogDirMode  = 0o755
 )
+
+// hookLogMaxBytes is the rotation threshold (§5.8). A var (not const) so the
+// rotation end-to-end test can shrink it to a few KB via SetHookLogMaxBytesForTest
+// instead of writing 5 MB of data.
+var hookLogMaxBytes int64 = 5 * 1024 * 1024
+
+// SetHookLogMaxBytesForTest overrides the rotation threshold for the duration
+// of one test. Returns a restore closure; callers defer it. Test-only.
+func SetHookLogMaxBytesForTest(n int64) func() {
+	prev := hookLogMaxBytes
+	hookLogMaxBytes = n
+	return func() { hookLogMaxBytes = prev }
+}
 
 // hookLogMu serializes concurrent writers. A single mutex for the whole process
 // is fine: the hot path writes one short line, holds the lock for microseconds,
@@ -194,6 +214,18 @@ func redactLogString(s string) string {
 	if strings.HasPrefix(s, "/") && len(s) > 1 && !strings.ContainsAny(s[:2], " \t") {
 		// Leave one-component absolute paths (e.g. `/`) alone, redact rest.
 		if strings.Contains(s[1:], "/") {
+			return "<redacted>"
+		}
+	}
+	// Windows-style absolute paths: drive-letter (C:\..., d:/...) and UNC
+	// (\\server\share\...). Cheap byte-level pre-check keeps the common
+	// no-match path regex-free. SEC-008.
+	if len(s) >= 3 {
+		first := s[0]
+		second := s[1]
+		winLike := (first == '\\' && second == '\\') ||
+			((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z')) && second == ':'
+		if winLike && winAbsPathRe.MatchString(s) {
 			return "<redacted>"
 		}
 	}

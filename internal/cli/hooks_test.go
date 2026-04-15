@@ -150,6 +150,40 @@ func TestHooksTail_BadSinceReturns2(t *testing.T) {
 	}
 }
 
+// TEST-C-004: malformed --since values must produce a clean usage-class exit
+// (2), a short human-readable stderr message, and NO stdout output. We must
+// not leak internal wrapped errors or Go stack traces to the user.
+func TestHooksTail_MalformedSince(t *testing.T) {
+	seedHookLog(t, []string{"2026-04-14T10:00:00Z INFO event=a"})
+	cases := []string{
+		"invalid-date",
+		"2026-13-45", // looks like a date, not a Go duration
+		"",
+		"5",       // no unit
+		"forever", // garbage
+	}
+	for _, v := range cases {
+		out, errb, code := runTail(t, "--since", v)
+		if code != 2 {
+			t.Errorf("--since %q: exit=%d want 2", v, code)
+		}
+		if out != "" {
+			t.Errorf("--since %q: stdout not empty: %q", v, out)
+		}
+		if errb == "" {
+			t.Errorf("--since %q: stderr empty", v)
+		}
+		// No Go runtime stack trace / panic artifacts leaked.
+		if strings.Contains(errb, "goroutine ") || strings.Contains(errb, "runtime.") {
+			t.Errorf("--since %q: stderr leaks runtime details: %q", v, errb)
+		}
+		// Message should mention --since for the user to self-correct.
+		if !strings.Contains(errb, "--since") {
+			t.Errorf("--since %q: stderr missing context: %q", v, errb)
+		}
+	}
+}
+
 func TestHooksTail_BadLevelReturns2(t *testing.T) {
 	seedHookLog(t, []string{"2026-04-14T10:00:00Z INFO event=a"})
 	_, _, code := runTail(t, "--level", "TRACE")

@@ -109,6 +109,198 @@ func TestLogHookEvent_Redaction(t *testing.T) {
 	}
 }
 
+// SEC-008: Windows-style absolute paths (drive-letter and UNC) must redact.
+// Covers both `\` and `/` separators, upper/lower case drive letters, UNC
+// prefixes, plus negative cases for relative paths and empty strings.
+func TestRedactLogString_WindowsPaths(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// Positive — drive-letter absolute, backslash
+		{`C:\Users\alice\secret.key`, "<redacted>"},
+		{`D:\Projects\code.go`, "<redacted>"},
+		{`c:\lower\drive.txt`, "<redacted>"},
+		// Positive — drive-letter absolute, forward slash
+		{`C:/Users/alice/forward.key`, "<redacted>"},
+		{`d:/projects/x.go`, "<redacted>"},
+		// Positive — UNC
+		{`\\server\share\file`, "<redacted>"},
+		{`\\SERVER\share\file`, "<redacted>"},
+		{`\\fileserver\share\data\nested\thing.bin`, "<redacted>"},
+		// Negative — relative Windows-style (no drive prefix, no UNC)
+		{`foo\bar`, `foo\bar`},
+		// Negative — empty
+		{"", ""},
+		// Negative — drive letter but not absolute (no slash after colon)
+		{`C:notabsolute`, `C:notabsolute`},
+		// Negative — single leading backslash is NOT UNC
+		{`\single\back`, `\single\back`},
+	}
+	for _, tc := range cases {
+		got := redactLogString(tc.in)
+		if got != tc.want {
+			t.Errorf("redactLogString(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Keep POSIX redaction behavior unchanged.
+func TestRedactLogString_PosixStillRedacts(t *testing.T) {
+	for _, in := range []string{
+		"/home/alice/secret.key",
+		"/tmp/x/y",
+		"/var/log/foo",
+		"/Users/bob/Documents/a.txt",
+	} {
+		if got := redactLogString(in); got != "<redacted>" {
+			t.Errorf("POSIX redaction regressed for %q: got %q", in, got)
+		}
+	}
+	// `/` alone is not redacted (one-component absolute path).
+	if got := redactLogString("/"); got != "/" {
+		t.Errorf("single-slash should not redact: got %q", got)
+	}
+}
+
+// QUAL-001: end-to-end rotation against a real (tiny) threshold. Uses
+// SetHookLogMaxBytesForTest to avoid writing 5 MB per test run.
+func TestLogRotationAtRealBoundary(t *testing.T) {
+	path := setupTmpHookLog(t)
+	restore := SetHookLogMaxBytesForTest(4096)
+	defer restore()
+
+	// Write enough entries to exceed 4 KB. Each line is well under 200 B so
+	// ~50 lines is comfortably above the threshold.
+	for i := 0; i < 60; i++ {
+		LogHookEvent("INFO", "boundary-test", map[string]any{
+			"iter": i,
+			"pad":  strings.Repeat("q", 64),
+		})
+	}
+
+	// hooks.log must be <= 4 KB (the live file after rotation).
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat live log: %v", err)
+	}
+	if fi.Size() > 4096 {
+		t.Errorf("live log exceeded threshold: size=%d", fi.Size())
+	}
+	// hooks.log.1 must exist and hold the earlier lines.
+	rotated := path + ".1"
+	rb, err := os.ReadFile(rotated)
+	if err != nil {
+		t.Fatalf("read rotated log: %v", err)
+	}
+	if len(rb) == 0 {
+		t.Errorf("rotated log is empty")
+	}
+	if !bytes.Contains(rb, []byte("event=boundary-test")) {
+		t.Errorf("rotated log missing expected event lines")
+	}
+	// No third generation.
+	if _, err := os.Stat(path + ".2"); err == nil {
+		t.Errorf("unexpected hooks.log.2 was created")
+	}
+
+	// Subsequent write reopens hooks.log cleanly.
+	LogHookEvent("INFO", "post-rotation", map[string]any{"k": "v"})
+	fi2, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat live log after append: %v", err)
+	}
+	if fi2.Size() < fi.Size() {
+		t.Errorf("append did not grow the live log: before=%d after=%d", fi.Size(), fi2.Size())
+	}
+	finalBytes, _ := os.ReadFile(path)
+	if !bytes.Contains(finalBytes, []byte("event=post-rotation")) {
+		t.Errorf("post-rotation append missing: %q", finalBytes)
+	}
+}
+
+// TEST-C-001: external deletion of the log file mid-stream must not panic.
+// Documents observed behavior: os.OpenFile with O_CREATE recreates the file,
+// so the next write succeeds and lands in a fresh hooks.log.
+func TestLogHookEvent_FileDeletedMidStream(t *testing.T) {
+	path := setupTmpHookLog(t)
+
+	LogHookEvent("INFO", "before-delete", map[string]any{"k": 1})
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("log missing after first write: %v", err)
+	}
+
+	// Delete the file while holding no lock — simulates a janitor script or
+	// user running `rm` mid-session.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	// Must not panic.
+	LogHookEvent("INFO", "after-delete", map[string]any{"k": 2})
+
+	// Current behavior: the file is recreated by O_CREATE on the next
+	// write. Assert that (preferred branch of §5.9).
+	b, err := os.ReadFile(path)
+	if err != nil {
+		// Acceptable fallback: silently dropped, no recreate. In that case
+		// there must still be no panic and no file — not an error.
+		if os.IsNotExist(err) {
+			return
+		}
+		t.Fatalf("read after recreate: %v", err)
+	}
+	if !bytes.Contains(b, []byte("event=after-delete")) {
+		t.Errorf("recreated log missing post-delete line: %q", b)
+	}
+	if bytes.Contains(b, []byte("event=before-delete")) {
+		t.Errorf("recreated log unexpectedly contains pre-delete line: %q", b)
+	}
+}
+
+// TEST-C-002: ReadHookLog must tolerate a malformed trailing line (no
+// terminating newline, or garbled UTF-8) without panic.
+func TestReadHookLog_HandlesPartialLastLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", path)
+
+	// Two valid lines plus a malformed trailing line (no final newline, with
+	// a raw invalid UTF-8 byte sequence thrown in for good measure).
+	content := []byte(
+		"2026-04-14T10:00:00Z INFO event=one\n" +
+			"2026-04-14T10:00:01Z INFO event=two\n" +
+			"2026-04-14T10:00:02Z INFO event=partial \xff\xfe partial-no-newline",
+	)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rc, err := ReadHookLog(0, false)
+	if err != nil {
+		t.Fatalf("ReadHookLog: %v", err)
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read all: %v", err)
+	}
+	s := string(b)
+	if !strings.Contains(s, "event=one") || !strings.Contains(s, "event=two") {
+		t.Errorf("lost valid lines: %q", s)
+	}
+
+	// Subsequent reads still work (reopen).
+	rc2, err := ReadHookLog(0, false)
+	if err != nil {
+		t.Fatalf("second ReadHookLog: %v", err)
+	}
+	defer rc2.Close()
+	if _, err := io.ReadAll(rc2); err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+}
+
 func TestLogHookEvent_RotationAt5MB(t *testing.T) {
 	path := setupTmpHookLog(t)
 	// Pre-fill the log to just under 5 MB so a single subsequent write
@@ -116,7 +308,7 @@ func TestLogHookEvent_RotationAt5MB(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	initial := bytes.Repeat([]byte("x"), hookLogMaxBytes-50)
+	initial := bytes.Repeat([]byte("x"), int(hookLogMaxBytes)-50)
 	if err := os.WriteFile(path, initial, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +333,7 @@ func TestLogHookEvent_RotationAt5MB(t *testing.T) {
 	}
 	// Rotated file should hold the original pre-filled bytes.
 	rb, _ := os.ReadFile(rotated)
-	if len(rb) < hookLogMaxBytes-100 {
+	if int64(len(rb)) < hookLogMaxBytes-100 {
 		t.Errorf("rotated file unexpectedly small: %d", len(rb))
 	}
 }
@@ -155,7 +347,7 @@ func TestLogHookEvent_RotationIdempotent(t *testing.T) {
 	if err := os.WriteFile(path+".1", []byte("previous rotation"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, bytes.Repeat([]byte("y"), hookLogMaxBytes-10), 0o600); err != nil {
+	if err := os.WriteFile(path, bytes.Repeat([]byte("y"), int(hookLogMaxBytes)-10), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
