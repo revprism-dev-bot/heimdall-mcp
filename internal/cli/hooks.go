@@ -322,29 +322,51 @@ func HooksCacheClear(cfg config.Config, stdin io.Reader, stdout, stderr io.Write
 		return 0
 	}
 
-	// TODO(task-10-merge-swap-in): replace this stub block. Stream B clarified
-	// that HookCacheClear returns `error` only — to report `cleared=N` in the
-	// CLI output, call HookCacheStats first for the pre-clear `count`, then
-	// HookCacheClear, then emit `cleared: count` from the snapshot.
-	//
-	// Concrete wiring (requires flags.allModels loop across
-	// heimdall.ListAvailableModels + heimdall.ModelDBDir + heimdall.OpenStore):
-	//
-	//	store, err := heimdall.OpenStore(modelDir)
-	//	if err != nil { return 1 }
-	//	defer store.Close()
-	//	count, _, _, _ := store.HookCacheStats()
-	//	if err := store.HookCacheClear(); err != nil {
-	//	    fmt.Fprintln(stderr, "hooks cache-clear: store error")
-	//	    return 1
-	//	}
-	//	writeJSON(stdout, map[string]any{"cleared": count})
-	_ = flags.allModels
-	writeJSON(stdout, map[string]any{
-		"cleared": 0,
-		"reason":  "hook_cache_not_yet_available",
-	})
+	modelDirs := selectCacheModelDirs(baseDir, cfg.Model, flags.allModels)
+	var totalCleared int64
+	for _, modelDir := range modelDirs {
+		store, err := heimdall.OpenStore(modelDir)
+		if err != nil {
+			fmt.Fprintln(stderr, "hooks cache-clear: store error")
+			return 1
+		}
+		count, _, _, statsErr := store.HookCacheStats()
+		if statsErr != nil {
+			store.Close()
+			fmt.Fprintln(stderr, "hooks cache-clear: stats error")
+			return 1
+		}
+		if clearErr := store.HookCacheClear(); clearErr != nil {
+			store.Close()
+			fmt.Fprintln(stderr, "hooks cache-clear: clear error")
+			return 1
+		}
+		store.Close()
+		totalCleared += count
+	}
+	writeJSON(stdout, map[string]any{"cleared": totalCleared})
 	return 0
+}
+
+// selectCacheModelDirs returns the list of per-model DB directories the cache
+// admin commands should operate over. In allModels mode it walks every model
+// subdir under baseDir; otherwise it returns just the configured model's dir.
+// Empty result means "no model index present" and callers should emit the
+// equivalent of a no-op success rather than an error.
+func selectCacheModelDirs(baseDir, configuredModel string, allModels bool) []string {
+	if allModels {
+		available := heimdall.ListAvailableModels(baseDir)
+		dirs := make([]string, 0, len(available))
+		for _, name := range available {
+			dirs = append(dirs, filepath.Join(baseDir, name))
+		}
+		return dirs
+	}
+	modelDir := heimdall.ModelDBDir(baseDir, configuredModel)
+	if _, err := os.Stat(modelDir); err != nil {
+		return nil
+	}
+	return []string{modelDir}
 }
 
 // HooksCacheStats implements `heimdall-mcp hooks cache-stats`.
@@ -361,23 +383,38 @@ func HooksCacheStats(cfg config.Config, stdin io.Reader, stdout, stderr io.Write
 	project := resolveCacheProject(flags.project)
 	baseDir := filepath.Join(project, ".heimdall_db")
 	payload := map[string]any{
-		"entries":   0,
-		"bytes":     0,
-		"hit_count": 0,
+		"entries":   int64(0),
+		"bytes":     int64(0),
+		"hit_count": int64(0),
 	}
 	if _, err := os.Stat(baseDir); err != nil {
 		payload["reason"] = "no_db"
 	} else {
-		// TODO(task-10-merge-swap-in): replace this stub. Stream B confirmed:
-		//
-		//	count, totalBytes, hitCount, err := store.HookCacheStats()
-		//	if err != nil { return 1 }
-		//	payload["entries"]   = count
-		//	payload["bytes"]     = totalBytes
-		//	payload["hit_count"] = hitCount
-		//
-		// (Loop across model subdirs if flags.allModels — aggregate sums.)
-		payload["reason"] = "hook_cache_not_yet_available"
+		modelDirs := selectCacheModelDirs(baseDir, cfg.Model, flags.allModels)
+		if len(modelDirs) == 0 {
+			payload["reason"] = "no_model_index"
+		} else {
+			var entries, bytes, hits int64
+			for _, modelDir := range modelDirs {
+				store, err := heimdall.OpenStore(modelDir)
+				if err != nil {
+					fmt.Fprintln(stderr, "hooks cache-stats: store error")
+					return 1
+				}
+				count, totalBytes, hitCount, statsErr := store.HookCacheStats()
+				store.Close()
+				if statsErr != nil {
+					fmt.Fprintln(stderr, "hooks cache-stats: stats error")
+					return 1
+				}
+				entries += count
+				bytes += totalBytes
+				hits += hitCount
+			}
+			payload["entries"] = entries
+			payload["bytes"] = bytes
+			payload["hit_count"] = hits
+		}
 	}
 
 	if flags.format == "json" {
