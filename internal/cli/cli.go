@@ -52,6 +52,12 @@ func RunCLI(cfg config.Config, args []string) {
 		cliManagePaths(cfg, cleanArgs)
 	case "models":
 		cliModels(cfg)
+	case "hooks":
+		env := envMap()
+		code := DispatchHooks(cfg, os.Stdin, os.Stdout, os.Stderr, env, cleanArgs)
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "help", "--help", "-h":
 		fmt.Println("heimdall-mcp — local semantic code search + memory")
 		fmt.Println()
@@ -66,6 +72,9 @@ func RunCLI(cfg config.Config, args []string) {
 		fmt.Println("  heimdall-mcp paths add <path>              Add a path to index")
 		fmt.Println("  heimdall-mcp paths remove <path>           Remove a path")
 		fmt.Println("  heimdall-mcp models                        List available embedding models")
+		fmt.Println("  heimdall-mcp hooks tail [flags]            Tail the hook log with filters")
+		fmt.Println("  heimdall-mcp hooks cache-clear [flags]     Drop hook_cache contents")
+		fmt.Println("  heimdall-mcp hooks cache-stats [flags]     Show hook_cache stats")
 		fmt.Println()
 		fmt.Println("Options:")
 		fmt.Println("  --out, -o <dir>  Where to store the database (default: <path>/.heimdall_db/)")
