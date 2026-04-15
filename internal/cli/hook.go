@@ -21,32 +21,47 @@ import (
 // retrieval-hook dispatcher (singular `hook`), distinct from the admin
 // `hooks` dispatcher (plural) for tail/cache-clear/cache-stats.
 //
-// Retrieval-hook handlers all follow the OQ-5 rule: return 0 regardless of
+// Retrieval-hook handlers follow the OQ-5 rule: return 0 regardless of
 // internal errors. Never block Claude Code. Errors are logged via
-// LogHookEvent; nothing is ever written to stderr on this path.
+// LogHookEvent; nothing is ever written to stderr on the retrieval path.
 //
-// Stream D owns the `session-start` case. Stream E extends this switch with
-// a `post-edit` case when rebased on top of this branch.
+// DispatchHook itself may still return a non-zero code on developer CLI
+// usage errors (empty args, unknown subcommand) because those paths are
+// hit from a shell prompt, not from Claude Code — Claude Code always
+// passes a known subcommand. The retrieval-path OQ-5 rule is enforced
+// inside each case handler (HookSessionStart, HookPostEdit, …), not at
+// the dispatcher boundary.
 func DispatchHook(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
 	if len(args) == 0 {
-		// Usage errors go to stderr — this is a developer/install-time
-		// mistake, not a Claude-invoked hook firing. Exit 2 = usage.
-		fmt.Fprintln(stderr, "Usage: heimdall-mcp hook <session-start|post-edit|user-prompt|stop> [flags]")
-		return 2
+		// Empty args: a misconfigured install could bake a truncated command
+		// into settings.json. Log for developers, print a short usage line to
+		// stderr for interactive shells, but still return 0 so Claude Code
+		// never sees a non-zero exit from a retrieval hook. (OQ-5.)
+		heimdall.LogHookEvent("WARN", "hook", map[string]any{"err": "no_subcommand"})
+		fmt.Fprintln(stderr, "Usage: heimdall-mcp hook <session-start|post-edit|post-edit-actor|user-prompt|stop> [flags]")
+		return 0
 	}
 	sub := args[0]
 	rest := args[1:]
 	switch sub {
 	case "session-start":
 		return HookSessionStart(cfg, stdin, stdout, stderr, env, rest, HookSessionStartDeps{})
+	case "post-edit":
+		return HookPostEdit(cfg, stdin, stdout, stderr, env, rest)
+	case "post-edit-actor":
+		return HookPostEditActor(cfg, stdin, stdout, stderr, env, rest)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "heimdall-mcp hook — Claude Code retrieval hook entry points")
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, "  hook session-start [--budget-ms N] [--project <path>]")
+		fmt.Fprintln(stdout, "  hook post-edit [--project <path>]")
 		return 0
 	default:
+		// Unknown subcommand: same reasoning as empty-args. Log, short stderr
+		// hint for developers, exit 0 so Claude Code continues normally.
+		heimdall.LogHookEvent("WARN", "hook", map[string]any{"err": "unknown_subcommand", "sub": sub})
 		fmt.Fprintf(stderr, "Unknown hook subcommand: %s\n", sub)
-		return 2
+		return 0
 	}
 }
 

@@ -597,15 +597,21 @@ func TestDispatchHook_RoutesSessionStart(t *testing.T) {
 }
 
 func TestDispatchHook_UnknownSubcommand(t *testing.T) {
+	// Per OQ-5 (docs/plans/hooks/06-decisions.md), retrieval hooks must
+	// never return non-zero — that would block Claude Code. The
+	// dispatcher's unknown-subcommand path logs via LogHookEvent and
+	// prints a short hint to stderr for interactive developers, but
+	// returns 0 so Claude Code is never blocked by a misconfigured
+	// install that baked a typo into settings.json.
 	cfg := config.Config{}
 	var stdout, stderr strings.Builder
 	code := DispatchHook(cfg, strings.NewReader(""), &stdout, &stderr, nil,
 		[]string{"nonsense"})
-	if code != 2 {
-		t.Errorf("exit=%d", code)
+	if code != 0 {
+		t.Errorf("exit=%d, want 0 per OQ-5", code)
 	}
 	if !strings.Contains(stderr.String(), "Unknown") {
-		t.Errorf("stderr=%q", stderr.String())
+		t.Errorf("stderr=%q should contain 'Unknown'", stderr.String())
 	}
 }
 
