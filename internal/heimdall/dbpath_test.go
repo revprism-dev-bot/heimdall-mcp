@@ -14,7 +14,8 @@ func TestModelDBDir(t *testing.T) {
 		wantSuf  string // expected suffix after baseDir
 	}{
 		{"simple model", "/tmp/db", "nomic-embed-text", "nomic-embed-text"},
-		{"model with colon", "/tmp/db", "model:latest", "model_latest"},
+		{"model with latest tag stripped", "/tmp/db", "model:latest", "model"},
+		{"model with non-latest tag", "/tmp/db", "model:v2", "model_v2"},
 		{"model with slash", "/tmp/db", "org/model", "org_model"},
 		{"model with both", "/tmp/db", "org/model:v2", "org_model_v2"},
 	}

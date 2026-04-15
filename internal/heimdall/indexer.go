@@ -94,6 +94,10 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 	start := time.Now()
 	result := &IndexResult{}
 
+	// Discover immediate sub-repo directories (dirs with their own .git/)
+	// so we can tag files with their sub-project.
+	subRepoDirs := DiscoverSubRepos(idx.root)
+
 	// Phase 1: discover all indexable files
 	// Determine which directories to walk. If IncludePaths is set, walk
 	// each of those (resolved relative to root); otherwise walk root.
@@ -130,6 +134,13 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 			if d.IsDir() {
 				if idx.shouldExclude(relPath) {
 					return filepath.SkipDir
+				}
+				// Skip directories that are their own git repos (sub-repos)
+				if path != walkRoot {
+					gitDir := filepath.Join(path, ".git")
+					if info, err := os.Stat(gitDir); err == nil && info.IsDir() {
+						return filepath.SkipDir
+					}
 				}
 				return nil
 			}
@@ -235,37 +246,70 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 			continue
 		}
 
-		// Embed and upsert each chunk
+		// Embed all chunks (batch if supported, fallback to one-at-a-time)
 		fileHash := hashFile(path)
+		subProject := subProjectForFile(relPath, subRepoDirs)
+		info, _ := os.Stat(path)
+		var mtime int64
+		if info != nil {
+			mtime = info.ModTime().Unix()
+		}
+
 		var records []VectorRecord
-		for ci, chunk := range chunks {
-			vec, embedErr := idx.embedder.Embed(ctx, chunk.Content)
+		if batchEmb, ok := idx.embedder.(BatchEmbedder); ok {
+			// Batch path: collect texts, embed in one call
+			texts := make([]string, len(chunks))
+			for ci, chunk := range chunks {
+				texts[ci] = chunk.Content
+			}
+			vecs, embedErr := batchEmb.EmbedBatch(ctx, texts)
 			if embedErr != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("%s chunk %d: %v", relPath, ci, embedErr))
+				result.Errors = append(result.Errors, fmt.Sprintf("%s batch embed: %v", relPath, embedErr))
 				continue
 			}
-
-			info, _ := os.Stat(path)
-			var mtime int64
-			if info != nil {
-				mtime = info.ModTime().Unix()
+			for ci, chunk := range chunks {
+				records = append(records, VectorRecord{
+					ID:            fmt.Sprintf("%s:%d:%d", relPath, chunk.StartLine, chunk.EndLine),
+					FilePath:      relPath,
+					StartLine:     chunk.StartLine,
+					EndLine:       chunk.EndLine,
+					Content:       chunk.Content,
+					Kind:          chunk.Kind,
+					Identifier:    chunk.Identifier,
+					Embedding:     vecs[ci],
+					ModTime:       mtime,
+					ContentHash:   fileHash,
+					SourceType:    "code",
+					Metadata:      "{}",
+					Relationships: "[]",
+					SubProject:    subProject,
+				})
 			}
-
-			records = append(records, VectorRecord{
-				ID:            fmt.Sprintf("%s:%d:%d", relPath, chunk.StartLine, chunk.EndLine),
-				FilePath:      relPath,
-				StartLine:     chunk.StartLine,
-				EndLine:       chunk.EndLine,
-				Content:       chunk.Content,
-				Kind:          chunk.Kind,
-				Identifier:    chunk.Identifier,
-				Embedding:     vec,
-				ModTime:       mtime,
-				ContentHash:   fileHash,
-				SourceType:    "code",
-				Metadata:      "{}",
-				Relationships: "[]",
-			})
+		} else {
+			// Fallback: embed one chunk at a time
+			for ci, chunk := range chunks {
+				vec, embedErr := idx.embedder.Embed(ctx, chunk.Content)
+				if embedErr != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("%s chunk %d: %v", relPath, ci, embedErr))
+					continue
+				}
+				records = append(records, VectorRecord{
+					ID:            fmt.Sprintf("%s:%d:%d", relPath, chunk.StartLine, chunk.EndLine),
+					FilePath:      relPath,
+					StartLine:     chunk.StartLine,
+					EndLine:       chunk.EndLine,
+					Content:       chunk.Content,
+					Kind:          chunk.Kind,
+					Identifier:    chunk.Identifier,
+					Embedding:     vec,
+					ModTime:       mtime,
+					ContentHash:   fileHash,
+					SourceType:    "code",
+					Metadata:      "{}",
+					Relationships: "[]",
+					SubProject:    subProject,
+				})
+			}
 		}
 
 		if len(records) > 0 {
@@ -405,6 +449,17 @@ func hashFile(path string) string {
 	}
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
+}
+
+// subProjectForFile returns the sub-project name for a file's relative path.
+// If the first path component matches a known sub-repo directory, that name
+// is returned. Otherwise returns empty string.
+func subProjectForFile(relPath string, subRepoDirs map[string]bool) string {
+	parts := strings.SplitN(filepath.ToSlash(relPath), "/", 2)
+	if len(parts) > 0 && subRepoDirs[parts[0]] {
+		return parts[0]
+	}
+	return ""
 }
 
 // isBinaryFile checks if a file appears to be binary by looking for
