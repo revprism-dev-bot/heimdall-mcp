@@ -3,7 +3,7 @@
 Tracking all outstanding work across the "steal ideas from OpenViking" roadmap.
 Tackled progressively — see status per item.
 
-## 1. Claude Code Hooks Integration (**WAVE 1 MERGED** — Wave 2 next)
+## 1. Claude Code Hooks Integration (**WAVE 2 PHASE 1a MERGED** — dogfood next)
 
 **Goal:** make Claude actually use heimdall on every turn via Claude Code hooks,
 not via hopeful tool exposure. Highest-leverage item by a wide margin.
@@ -22,44 +22,43 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] T22 `HooksDisabled` fast-path (env + marker file, <1µs warm)
 - [x] Review gate: weighted 94.5/100, merged by judgment at structural ceiling
 
-**Wave 2 (pending) — hook commands + install/test/gate:**
-- [ ] T4 `--format=hook-md` on `search` + `--budget-ms` (breaking: adds ctx to `SearchFiltered`)
-- [ ] T5 `hook session-start` command
-- [ ] T6 `hook user-prompt` command (hot path; 250ms p95 budget)
-- [ ] T7 `hook post-edit` command (fork+setsid debouncer)
-- [ ] T8 `hook stop` command (session buffer → ingest-session handoff)
-- [ ] T14 `install-hooks` (blocked on 5 OQs: unknown-field tolerance, opt-in/opt-out, binary name, JSON round-trip, exit-code taxonomy)
-- [ ] T15 `uninstall-hooks`
-- [ ] T16 `hooks doctor`
-- [ ] T19 Layer 1 unit tests for every hook command
-- [ ] T20 Layer 2 integration tests (`os/exec` + fake Ollama)
-- [ ] T21 `BenchmarkUserPromptHook` regression baseline
+**Wave 2 phase 1a shipped** (merges `c7f7f6c`, `12cc751`, `fbcb4dc`):
+- [x] T5 `heimdall-mcp hook session-start` — retrieval, VerifyHookIndex gate, Tier B suppression, EmbedForHook keep_alive, budget-ms context timeout, golden-file tested
+- [x] T7 `heimdall-mcp hook post-edit` — flock debouncer, 2-s coalesce window, fork+setsid detached actor, deadletter JSONL with retry + N=10 hard-drop
+- [x] T14 `heimdall-mcp install-hooks` — settings.json merge with atomic write, backup, `--dry-run`/`--merge`/`--force`/`--only`/`--scope`, dual marker detection (`"source": "heimdall"` + `--source=heimdall` command-string fallback)
+- [x] T15 `heimdall-mcp uninstall-hooks` — symmetric, idempotent
+- [x] T16 `heimdall-mcp hooks doctor` — 11-check pass/fail table, dry-fires each installed hook, skips internal `post-edit-actor`
+- [x] OQ-1..OQ-5 locked in `docs/plans/hooks/06-decisions.md`
+- [x] Review gate: weighted 97.8/100 (Quality 98, Security 99, Performance 97, Tests 96, Design 98). 110 tests in internal/cli, all green under `-race`.
+
+**Dogfood next (session restart required):**
+- [ ] Run `heimdall-mcp index .` against this repo to create the first real index
+- [ ] Run `heimdall-mcp install-hooks --scope=project --dry-run` to preview the settings.json changes
+- [ ] Run `heimdall-mcp install-hooks --scope=project` (without --dry-run)
+- [ ] Run `heimdall-mcp hooks doctor` — expect all-green except possibly Ollama availability
+- [ ] Close and reopen Claude Code → `SessionStart` hook should inject project context into the first turn
+- [ ] Edit a file → `PostToolUse(Edit|Write)` should trigger background reindex; check `heimdall-mcp hooks tail` for confirmation
+
+**Wave 2 phase 1b (pending, hot path):**
+- [ ] T4 `--format=hook-md` on `search` + `--budget-ms` (breaking: adds ctx to `SearchFiltered`; removes the Wave 1 `TestSearchFiltered_BudgetTimeout` skip stub)
+- [ ] T6 `hook user-prompt` command (250ms p95 budget, cache lookup path, skip heuristic for trivial prompts)
+- [ ] T21 `BenchmarkUserPromptHook` regression baseline (must gate merge)
+- [ ] Phase 1b gate criteria: 1a stable ≥1 week; T21 benchmark green; model-mismatch Tier B path exercised end-to-end; cache-invalidation verified against concurrent edit
+
+**Wave 2 phase 2 (pending, session learning):**
+- [ ] T8 `hook stop` command (rolling buffer → ingest-session handoff)
+- [ ] Stop-event payload shape confirmed against real Claude Code
+- [ ] Session buffer retention policy confirmed
+
+**Wave 2 phase 3 (pending, guardrails):**
+- [ ] `PreToolUse(Bash(rm *|git push --force*))` as `agent`-type hook — needs a destructive-op judgment primitive heimdall does not have today
+
+**Carried over / not yet in scope:**
+- [ ] T20 Layer 2 integration tests (`os/exec` + fake Ollama) — deferred, unit tests cover 110 cases; Layer 2 is for future hardening
 - [ ] T23 Layer 3 opt-in e2e harness (`-tags e2e`, `HEIMDALL_E2E_CLAUDE=1`)
-- [ ] T24 Windows path redaction (deferred until Windows adoption — security review flagged)
+- [ ] T24 Windows path redaction (already have the regex in Wave 1; confirm it holds when anyone actually runs on Windows)
 - [ ] Deferred perf optimizations: PERF-002 `bumpIndexVersionTx` single-query, PERF-003 O(cap) eviction → incremental row-count tracking
-- [ ] Wave 2 test gaps: `hook-md` golden files, `SearchFiltered` budget-timeout live test (once ctx param lands)
-
-**Open questions blocking phase 1a of Wave 2** (from consolidated plan §8):
-1. Claude Code unknown-field tolerance on hook entries
-2. Opt-in vs opt-out install
-3. Binary name (`heimdall-mcp` vs `heimdall`)
-4. `settings.json` JSON round-trip fidelity
-5. Exit-code taxonomy vs always-0 for retrieval hooks
-
-Hook surface to design:
-
-- [ ] `SessionStart` → inject project memories + recent context (via `heimdall recall`).
-- [ ] `UserPromptSubmit` → semantic search of the prompt, inject top hits (via `heimdall search`).
-- [ ] `PostToolUse(Edit|Write)` → incremental re-index in the background.
-- [ ] `PostToolUse(Bash(git commit *))` → re-index git commits.
-- [ ] `Stop` / `SessionEnd` → auto-ingest session transcript into long-term memory.
-- [ ] `PreToolUse(Bash(rm *|git push *))` → agent-type hook that queries prior memories about destructive ops for this repo.
-- [ ] CLI flags/subcommands on the `heimdall` binary so hooks can shell out cleanly (stdout formats, exit codes, streaming).
-- [ ] Failure-mode handling: Ollama down, index missing, embedding timeout, stale index, first-run in a fresh repo.
-- [ ] Latency budget: `UserPromptSubmit` fires on every turn — measure + cache + skip heuristic.
-- [ ] Testability: end-to-end harness that spins up Claude Code with test hooks and verifies they fire.
-- [ ] User toggles: per-project on/off, per-hook on/off, quiet mode.
-- [ ] Install/setup UX: a `heimdall install-hooks` command that wires `~/.claude/settings.json` without clobbering existing hooks.
+- [ ] `heimdall-mcp index` first-run hint ("Tip: run `install-hooks` to have Claude Code call heimdall automatically") — OQ-2 follow-up, not blocking anything
 
 ## 2. Tiered retrieval (L0/L1/L2) — **PENDING**
 
