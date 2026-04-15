@@ -61,7 +61,7 @@ func TestToolSearch_EnrichedResults(t *testing.T) {
 	// The toolSearch requires Ollama which isn't available in tests.
 	// Instead, test the filtered search path directly by calling SearchFiltered.
 	_ = srv // srv is used for other tests
-	results := store.SearchFiltered([]float32{1.0, 0.0, 0.0}, 5, "", nil)
+	results := store.SearchFiltered([]float32{1.0, 0.0, 0.0}, 5, "", "", nil)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -92,12 +92,49 @@ func TestToolSearch_FilteredBySourceType(t *testing.T) {
 	}
 
 	// Filter by ticket
-	results := store.SearchFiltered([]float32{1.0, 0.0}, 10, "ticket", nil)
+	results := store.SearchFiltered([]float32{1.0, 0.0}, 10, "ticket", "", nil)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 ticket result, got %d", len(results))
 	}
 	if classifySource(results[0].Record.Kind) != "external" {
 		t.Error("expected external source")
+	}
+}
+
+func TestToolSearch_FilteredBySubProject(t *testing.T) {
+	_, store, _ := setupTestServer(t)
+	defer store.Close()
+
+	// Two records belonging to different sub-projects plus one root-level
+	// record that should never be returned when a sub-project filter is set.
+	records := []heimdall.VectorRecord{
+		{ID: "a1", FilePath: "service-a/main.go", Content: "a", Embedding: []float32{1.0, 0.0}, ModTime: 100, SourceType: "code", Kind: "file", SubProject: "service-a"},
+		{ID: "b1", FilePath: "service-b/main.go", Content: "b", Embedding: []float32{0.9, 0.1}, ModTime: 100, SourceType: "code", Kind: "file", SubProject: "service-b"},
+		{ID: "r1", FilePath: "root.go", Content: "r", Embedding: []float32{0.8, 0.2}, ModTime: 100, SourceType: "code", Kind: "file"},
+	}
+	if err := store.Upsert(records); err != nil {
+		t.Fatal(err)
+	}
+
+	// SearchFiltered signature: (query, limit, sourceType, subProject, metadataFilter)
+	results := store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "service-a", nil)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 service-a result, got %d", len(results))
+	}
+	if results[0].Record.ID != "a1" {
+		t.Errorf("expected a1, got %s", results[0].Record.ID)
+	}
+
+	// Filter on the other sub-project returns only its record.
+	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "service-b", nil)
+	if len(results) != 1 || results[0].Record.ID != "b1" {
+		t.Fatalf("expected only b1, got %+v", results)
+	}
+
+	// No sub-project filter returns all three.
+	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "", nil)
+	if len(results) != 3 {
+		t.Fatalf("expected 3 unfiltered results, got %d", len(results))
 	}
 }
 
@@ -113,7 +150,7 @@ func TestToolSearch_FilteredByMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	results := store.SearchFiltered([]float32{1.0}, 10, "ticket", map[string]any{"status": "open"})
+	results := store.SearchFiltered([]float32{1.0}, 10, "ticket", "", map[string]any{"status": "open"})
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}

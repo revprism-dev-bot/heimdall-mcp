@@ -147,13 +147,6 @@ func (s *Server) toolRecall(args json.RawMessage) MCPToolResult {
 		return ErrResult(err.Error())
 	}
 
-	if input.Limit <= 0 {
-		input.Limit = 5
-	}
-	if input.Limit > 100 {
-		input.Limit = 100
-	}
-
 	if s.MemoryStore == nil {
 		return ErrResult("memory store not initialized")
 	}
@@ -165,48 +158,22 @@ func (s *Server) toolRecall(args json.RawMessage) MCPToolResult {
 	}
 	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
 
-	queryVec, err := embedder.Embed(ctx, input.Query)
-	if err != nil {
-		return ErrResult("embedding error: " + err.Error())
-	}
-
-	filters := heimdall.MemoryFilter{
+	hits, err := heimdall.RunRecall(ctx, heimdall.RecallParams{
+		Query:   input.Query,
+		Type:    input.Type,
 		Tags:    input.Tags,
 		Project: input.Project,
-	}
-	if input.Type != "" {
-		filters.Type = heimdall.MemoryType(input.Type)
+		Limit:   input.Limit,
+	}, embedder, s.MemoryStore)
+	if err != nil {
+		return ErrResult(err.Error())
 	}
 
-	results := s.MemoryStore.SearchMemories(queryVec, input.Limit, filters)
-
-	if len(results) == 0 {
+	if len(hits) == 0 {
 		return TextResult("No memories found matching your query.")
 	}
 
-	type memoryResult struct {
-		ID      string   `json:"id"`
-		Content string   `json:"content"`
-		Type    string   `json:"type"`
-		Tags    []string `json:"tags,omitempty"`
-		Project string   `json:"project,omitempty"`
-		Score   float64  `json:"score"`
-		Source  string   `json:"source"`
-	}
-	var out []memoryResult
-	for _, r := range results {
-		out = append(out, memoryResult{
-			ID:      r.Memory.ID,
-			Content: r.Memory.Content,
-			Type:    string(r.Memory.Type),
-			Tags:    r.Memory.Tags,
-			Project: r.Memory.Project,
-			Score:   r.Similarity,
-			Source:  string(r.Memory.Source),
-		})
-	}
-
-	data, _ := json.MarshalIndent(out, "", "  ")
+	data, _ := json.MarshalIndent(hits, "", "  ")
 	return TextResult(string(data))
 }
 
@@ -220,9 +187,6 @@ func (s *Server) toolIngestSession(args json.RawMessage) MCPToolResult {
 		return ErrResult(err.Error())
 	}
 
-	// Sanitize: strip null bytes
-	input.Summary = strings.ReplaceAll(input.Summary, "\x00", "")
-
 	if s.MemoryStore == nil {
 		return ErrResult("memory store not initialized")
 	}
@@ -234,7 +198,7 @@ func (s *Server) toolIngestSession(args json.RawMessage) MCPToolResult {
 	}
 	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
 
-	result, err := heimdall.IngestSession(ctx, input.Summary, input.Project, embedder, s.MemoryStore)
+	result, err := heimdall.IngestSessionSummary(ctx, input.Summary, input.Project, embedder, s.MemoryStore)
 	if err != nil {
 		return ErrResult("ingestion error: " + err.Error())
 	}

@@ -30,6 +30,7 @@ type VectorRecord struct {
 	Metadata      string    `json:"metadata"`      // JSON object string
 	Relationships string    `json:"relationships"` // JSON array string
 	LastAccessed  int64     `json:"lastAccessed"`  // unix timestamp of last search hit
+	SubProject    string    `json:"subProject"`    // sub-repo directory name (empty = root project)
 }
 
 // SearchResult is a record with its similarity score.
@@ -97,8 +98,29 @@ func OpenStore(dbDir string) (*VectorStore, error) {
 	// Migrate: add last_accessed column for content lifecycle tracking.
 	db.Exec(`ALTER TABLE entries ADD COLUMN last_accessed INTEGER DEFAULT 0`)
 
+	// Migrate: add sub_project column for sub-repo tagging.
+	db.Exec(`ALTER TABLE entries ADD COLUMN sub_project TEXT DEFAULT ''`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sub_project ON entries(sub_project)`)
+
 	// Metadata table for store-level properties (model, dimensions, etc.)
 	db.Exec(`CREATE TABLE IF NOT EXISTS store_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
+
+	// hook_cache: BLOB-valued short-TTL cache keyed by normalized prompt +
+	// index version + filter scope. Co-located with the per-model store so
+	// every row is implicitly scoped to one embedding space. See
+	// docs/plans/hooks §5.3 for the rationale.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS hook_cache (
+			key        TEXT PRIMARY KEY,
+			stdout     BLOB NOT NULL,
+			created_at INTEGER NOT NULL,
+			hit_count  INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE INDEX IF NOT EXISTS idx_hook_cache_created ON hook_cache(created_at);
+	`); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	return &VectorStore{db: db}, nil
 }
@@ -131,20 +153,28 @@ func (s *VectorStore) Close() error {
 
 // Search is a convenience wrapper — delegates to SearchFiltered with no filters.
 func (s *VectorStore) Search(query []float32, topK int) []SearchResult {
-	return s.SearchFiltered(query, topK, "", nil)
+	return s.SearchFiltered(query, topK, "", "", nil)
 }
 
 // SearchFiltered is the single search implementation. Supports optional source_type
-// pre-filter (SQL WHERE) and metadata post-filter (JSON comparison).
-func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType string, metadataFilter map[string]any) []SearchResult {
+// and sub_project pre-filters (SQL WHERE) and metadata post-filter (JSON comparison).
+func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType string, subProject string, metadataFilter map[string]any) []SearchResult {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	sqlQuery := `SELECT id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, source_type, metadata, relationships, last_accessed FROM entries`
+	sqlQuery := `SELECT id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, source_type, metadata, relationships, last_accessed, sub_project FROM entries`
+	var conditions []string
 	var args []any
 	if sourceType != "" {
-		sqlQuery += ` WHERE source_type = ?`
+		conditions = append(conditions, `source_type = ?`)
 		args = append(args, sourceType)
+	}
+	if subProject != "" {
+		conditions = append(conditions, `sub_project = ?`)
+		args = append(args, subProject)
+	}
+	if len(conditions) > 0 {
+		sqlQuery += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
 
 	rows, err := s.db.Query(sqlQuery, args...)
@@ -157,10 +187,10 @@ func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType strin
 	for rows.Next() {
 		var rec VectorRecord
 		var vecBlob []byte
-		var kind, identifier, srcType, meta, rels sql.NullString
+		var kind, identifier, srcType, meta, rels, subProj sql.NullString
 		var lastAccessed sql.NullInt64
 		if err := rows.Scan(&rec.ID, &rec.FilePath, &rec.StartLine, &rec.EndLine, &rec.Content,
-			&kind, &identifier, &vecBlob, &rec.ModTime, &srcType, &meta, &rels, &lastAccessed); err != nil {
+			&kind, &identifier, &vecBlob, &rec.ModTime, &srcType, &meta, &rels, &lastAccessed, &subProj); err != nil {
 			continue
 		}
 		rec.Kind = kind.String
@@ -169,6 +199,7 @@ func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType strin
 		rec.Metadata = meta.String
 		rec.Relationships = rels.String
 		rec.LastAccessed = lastAccessed.Int64
+		rec.SubProject = subProj.String
 		rec.Embedding = DecodeFloat32Vec(vecBlob)
 
 		// Post-filter: metadata match
@@ -225,8 +256,8 @@ func (s *VectorStore) Upsert(records []VectorRecord) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO entries (id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, content_hash, source_type, metadata, relationships)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT OR REPLACE INTO entries (id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, content_hash, source_type, metadata, relationships, sub_project)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -249,11 +280,14 @@ func (s *VectorStore) Upsert(records []VectorRecord) error {
 		if relationships == "" {
 			relationships = "[]"
 		}
-		if _, err := stmt.Exec(r.ID, r.FilePath, r.StartLine, r.EndLine, content, r.Kind, r.Identifier, vecBlob, r.ModTime, r.ContentHash, sourceType, metadata, relationships); err != nil {
+		if _, err := stmt.Exec(r.ID, r.FilePath, r.StartLine, r.EndLine, content, r.Kind, r.Identifier, vecBlob, r.ModTime, r.ContentHash, sourceType, metadata, relationships, r.SubProject); err != nil {
 			return err
 		}
 	}
 
+	if err := bumpIndexVersionTx(tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -262,8 +296,19 @@ func (s *VectorStore) RemoveByFile(filePath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.Exec(`DELETE FROM entries WHERE file_path = ?`, filePath)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM entries WHERE file_path = ?`, filePath); err != nil {
+		return err
+	}
+	if err := bumpIndexVersionTx(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Save is a no-op for SQLite (auto-persists). Kept for API compatibility.
