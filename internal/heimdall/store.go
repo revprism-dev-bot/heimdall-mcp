@@ -2,6 +2,7 @@ package heimdall
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"os"
@@ -152,13 +153,24 @@ func (s *VectorStore) Close() error {
 }
 
 // Search is a convenience wrapper — delegates to SearchFiltered with no filters.
-func (s *VectorStore) Search(query []float32, topK int) []SearchResult {
-	return s.SearchFiltered(query, topK, "", "", nil)
+func (s *VectorStore) Search(ctx context.Context, query []float32, topK int) []SearchResult {
+	return s.SearchFiltered(ctx, query, topK, "", "", nil)
 }
 
 // SearchFiltered is the single search implementation. Supports optional source_type
 // and sub_project pre-filters (SQL WHERE) and metadata post-filter (JSON comparison).
-func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType string, subProject string, metadataFilter map[string]any) []SearchResult {
+//
+// ctx is honored at three points: the SQL QueryContext call (lets the driver
+// cancel a mid-flight statement), a pre-loop check, and per-row in the scan
+// loop (large indexes can take meaningful time in Scan+DecodeFloat32Vec+
+// CosineSimilarity). If ctx fires mid-loop the partial result set is returned
+// rather than nil — the caller can still surface whatever we managed to score
+// before the deadline. A nil ctx is treated as context.Background() so this
+// stays callable from test helpers that don't care about cancellation.
+func (s *VectorStore) SearchFiltered(ctx context.Context, query []float32, topK int, sourceType string, subProject string, metadataFilter map[string]any) []SearchResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -177,7 +189,7 @@ func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType strin
 		sqlQuery += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
 
-	rows, err := s.db.Query(sqlQuery, args...)
+	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
 		return nil
 	}
@@ -185,6 +197,9 @@ func (s *VectorStore) SearchFiltered(query []float32, topK int, sourceType strin
 
 	var results []SearchResult
 	for rows.Next() {
+		if ctx.Err() != nil {
+			break
+		}
 		var rec VectorRecord
 		var vecBlob []byte
 		var kind, identifier, srcType, meta, rels, subProj sql.NullString

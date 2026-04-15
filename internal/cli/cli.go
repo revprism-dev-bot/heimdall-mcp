@@ -4,10 +4,12 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
@@ -18,16 +20,16 @@ import (
 // buildVersion returns a short version string suitable for `--version` output.
 // Reads the module version and vcs.revision from the Go build info so local
 // `go build` and `go install` both produce something meaningful without needing
-// -ldflags injection. Falls back to "wave2-phase1a" (matching the installed hook
+// -ldflags injection. Falls back to "wave2-phase1b" (matching the installed hook
 // envelope's heimdall_version) when build info is unavailable.
 func buildVersion() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
-		return "heimdall-mcp wave2-phase1a"
+		return "heimdall-mcp wave2-phase1b"
 	}
 	version := info.Main.Version
 	if version == "" || version == "(devel)" {
-		version = "wave2-phase1a"
+		version = "wave2-phase1b"
 	}
 	var rev string
 	for _, s := range info.Settings {
@@ -91,11 +93,12 @@ func RunCLI(cfg config.Config, args []string) {
 	case "ingest-session":
 		os.Exit(CLIIngestSession(os.Stdin, os.Stdout, os.Stderr, envToMap(os.Environ()), args[1:], IngestDeps{}))
 	case "search":
-		if len(cleanArgs) < 1 {
-			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp search <query> [--out /path/to/db/dir]\n")
-			os.Exit(1)
-		}
-		cliSearch(cfg, cleanArgs[0], outPath)
+		// Search parses its own flags (including --out, --format, --budget-ms,
+		// --limit) because T4 added --format=hook-md and --budget-ms for the
+		// user-prompt hook path. The cleanArgs top-level parser strips --out
+		// already, but we pass the full args[1:] so --format etc are visible
+		// to the nested flag.FlagSet.
+		os.Exit(cliSearch(cfg, args[1:]))
 	case "projects":
 		cliProjects()
 	case "configure", "config":
@@ -310,23 +313,89 @@ func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.Oll
 	}
 }
 
-func cliSearch(cfg config.Config, query string, dbPath string) {
-	ctx := context.Background()
-	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
-	if err := client.Ping(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Ollama not reachable: %v\n", err)
-		os.Exit(1)
+// cliSearch parses `search <query> [--out <dir>] [--format text|hook-md]
+// [--budget-ms N] [--limit N]` and runs the search. Returns a shell exit code.
+//
+// --format=hook-md emits the same `## Heimdall context` markdown shape as
+// `hook session-start` + `hook user-prompt`, but with a "Relevant code"
+// section built from search hits rather than memory bullets. That lets T6
+// (`hook user-prompt`) call this path with a tight budget.
+//
+// --budget-ms wraps the whole run in a context.WithTimeout. On expiry the
+// partial hits (if any) are still rendered — better to return truncated
+// context than nothing.
+func cliSearch(cfg config.Config, args []string) int {
+	fs := flag.NewFlagSet("search", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	var (
+		outPath  string
+		format   string
+		budgetMs int
+		limit    int
+	)
+	fs.StringVar(&outPath, "out", "", "base directory for the index (default: <cwd>/.heimdall_db)")
+	fs.StringVar(&outPath, "o", "", "alias of --out")
+	fs.StringVar(&format, "format", "text", "output format: text, hook-md")
+	fs.IntVar(&budgetMs, "budget-ms", 0, "hard wall-clock deadline in ms (0 = no budget)")
+	fs.IntVar(&limit, "limit", 5, "max number of hits to return")
+
+	// Go's flag package stops parsing at the first non-flag arg, so
+	// `search <query> --format=hook-md` would miss the format flag. Pre-sort
+	// args into "flags first, positionals last" using the flag set as the
+	// source of truth for which names are flags. The `--flag=value` form and
+	// the bare-bool form are both handled.
+	reordered := reorderFlagsFirst(fs, args)
+	if err := fs.Parse(reordered); err != nil {
+		return 2
+	}
+	rest := fs.Args()
+	if len(rest) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp search <query> [--out <dir>] [--format text|hook-md] [--budget-ms N] [--limit N]\n")
+		return 2
+	}
+	query := strings.Join(rest, " ")
+
+	switch format {
+	case "text", "hook-md":
+	default:
+		fmt.Fprintf(os.Stderr, "error: invalid --format %q (want text|hook-md)\n", format)
+		return 2
+	}
+	if limit <= 0 {
+		limit = 5
 	}
 
-	searchBaseDir := dbPath
+	ctx := context.Background()
+	if budgetMs > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(budgetMs)*time.Millisecond)
+		defer cancel()
+	}
+
+	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	pingCtx, pingCancel := context.WithTimeout(ctx, 1*time.Second)
+	pingErr := client.Ping(pingCtx)
+	pingCancel()
+	if pingErr != nil {
+		if format == "hook-md" {
+			return 0 // retrieval contract — stay quiet
+		}
+		fmt.Fprintf(os.Stderr, "Ollama not reachable: %v\n", pingErr)
+		return 1
+	}
+
+	searchBaseDir := outPath
 	if searchBaseDir == "" {
 		cwd, _ := os.Getwd()
 		searchBaseDir = filepath.Join(cwd, ".heimdall_db")
 	}
 
-	// Auto-resolve: find any index whose model is pulled in Ollama
 	searchDbDir, resolvedModel := resolveAnyLocalModelDB(cfg, searchBaseDir)
 	if searchDbDir == "" {
+		if format == "hook-md" {
+			return 0
+		}
 		available := heimdall.ListAvailableModels(searchBaseDir)
 		if len(available) > 0 {
 			fmt.Fprintf(os.Stderr, "Indexes exist for %v but none of those models are pulled in Ollama.\n", available)
@@ -334,38 +403,138 @@ func cliSearch(cfg config.Config, query string, dbPath string) {
 		} else {
 			fmt.Fprintf(os.Stderr, "No index found. Run: heimdall-mcp index <path>\n")
 		}
-		os.Exit(1)
+		return 1
 	}
-	fmt.Printf("Using model: %s\n", resolvedModel)
+	if format == "text" {
+		fmt.Printf("Using model: %s\n", resolvedModel)
+	}
 
 	store, err := heimdall.OpenStore(searchDbDir)
 	if err != nil {
+		if format == "hook-md" {
+			return 0
+		}
 		fmt.Fprintf(os.Stderr, "Store error: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer store.Close()
 
 	embedder := heimdall.NewOllamaEmbedder(client, resolvedModel)
-	retriever := heimdall.NewRetriever(embedder, store, 5, cfg.MaxContextTokens)
-
-	blocks, err := retriever.Retrieve(ctx, query)
+	queryVec, err := embedder.Embed(ctx, query)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Search error: %v\n", err)
-		os.Exit(1)
+		if format == "hook-md" {
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "Embed error: %v\n", err)
+		return 1
 	}
 
-	if len(blocks) == 0 {
+	results := store.SearchFiltered(ctx, queryVec, limit, "", "", nil)
+
+	if format == "hook-md" {
+		// searchBaseDir is always .../.heimdall_db; the project name is its parent's base.
+		projectName := filepath.Base(filepath.Dir(searchBaseDir))
+		body := formatSearchHookMD(query, resolvedModel, projectName, results)
+		body = capRunes(body, sessionStartMaxRunes)
+		fmt.Print(body)
+		return 0
+	}
+
+	if len(results) == 0 {
 		fmt.Println("No results found.")
-		return
+		return 0
 	}
-
-	for i, b := range blocks {
-		fmt.Printf("\n--- %s (L%d-%d, score: %.2f) ---\n", b.FilePath, b.StartLine, b.EndLine, b.Score)
-		fmt.Println(b.Content)
-		if i < len(blocks)-1 {
+	for i, r := range results {
+		fmt.Printf("\n--- %s (L%d-%d, score: %.2f) ---\n", r.Record.FilePath, r.Record.StartLine, r.Record.EndLine, r.Similarity)
+		fmt.Println(r.Record.Content)
+		if i < len(results)-1 {
 			fmt.Println()
 		}
 	}
+	return 0
+}
+
+// reorderFlagsFirst partitions args into [flags..., positionals...] so
+// stdlib flag.Parse — which stops at the first non-flag token — sees every
+// flag regardless of where the user typed it. Uses `fs` as the source of
+// truth for which names are known flags (so arbitrary positional tokens that
+// happen to start with `-` don't get misclassified).
+//
+// Supported forms per token:
+//   - `--flag=value` or `-flag=value` → single token, routed to flags
+//   - `--flag value` or `-flag value` → two tokens, both routed to flags
+//   - anything else                   → positional
+func reorderFlagsFirst(fs *flag.FlagSet, args []string) []string {
+	var flags, positionals []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if len(a) < 2 || a[0] != '-' || a == "-" || a == "--" {
+			positionals = append(positionals, a)
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		value := ""
+		hasValue := false
+		if eq := strings.IndexByte(name, '='); eq >= 0 {
+			value = name[eq+1:]
+			name = name[:eq]
+			hasValue = true
+		}
+		f := fs.Lookup(name)
+		if f == nil {
+			// Not a known flag — treat as positional so `search -foo` doesn't
+			// silently eat the next token.
+			positionals = append(positionals, a)
+			continue
+		}
+		flags = append(flags, a)
+		if !hasValue && !isBoolFlag(f) && i+1 < len(args) {
+			flags = append(flags, args[i+1])
+			i++
+		}
+		_ = value
+	}
+	return append(flags, positionals...)
+}
+
+// isBoolFlag returns true if the flag's underlying Value reports itself as a
+// bool (implements the `IsBoolFlag() bool` interface per flag package docs).
+// Bool flags don't consume a following token.
+func isBoolFlag(f *flag.Flag) bool {
+	type boolFlag interface {
+		IsBoolFlag() bool
+	}
+	if bf, ok := f.Value.(boolFlag); ok {
+		return bf.IsBoolFlag()
+	}
+	return false
+}
+
+// formatSearchHookMD renders search hits as a `## Heimdall context` block
+// suitable for injection via a retrieval hook. Matches the shape of
+// formatSessionStartBlock so Claude sees one consistent banner shape
+// regardless of which hook emitted it.
+func formatSearchHookMD(query, model, projectName string, results []heimdall.SearchResult) string {
+	var b strings.Builder
+	b.Grow(256 + 120*len(results))
+
+	b.WriteString("## Heimdall context\n\n")
+	fmt.Fprintf(&b, "**Project:** %s  •  **Model:** %s  •  **Hits:** %d\n", projectName, model, len(results))
+	fmt.Fprintf(&b, "**Query:** %s\n", singleLine(query))
+
+	if len(results) > 0 {
+		b.WriteString("\n### Relevant code\n")
+		for _, r := range results {
+			first := singleLine(r.Record.Content)
+			if len(first) > 120 {
+				first = first[:117] + "..."
+			}
+			fmt.Fprintf(&b, "- `%s:%d-%d` — %s\n", r.Record.FilePath, r.Record.StartLine, r.Record.EndLine, first)
+		}
+	}
+
+	b.WriteString("\n_retrieved via heimdall-mcp_\n")
+	return b.String()
 }
 
 func cliProjects() {

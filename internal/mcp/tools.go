@@ -135,7 +135,7 @@ func (s *Server) toolSearchFiltered(ctx context.Context, input searchInput, stor
 		json.Unmarshal(input.MetadataFilter, &metaFilter)
 	}
 
-	searchResults := store.SearchFiltered(queryVec, input.Limit, input.SourceType, input.SubProject, metaFilter)
+	searchResults := store.SearchFiltered(ctx, queryVec, input.Limit, input.SourceType, input.SubProject, metaFilter)
 
 	if len(searchResults) == 0 {
 		return TextResult("No relevant results found.")

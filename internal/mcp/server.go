@@ -860,7 +860,7 @@ func (s *Server) toolExplain(args json.RawMessage) MCPToolResult {
 
 	// 2. Search ALL chunks (topK=0) and time it
 	start := time.Now()
-	allResults := store.Search(queryVec, 0)
+	allResults := store.Search(ctx, queryVec, 0)
 	searchMs := time.Since(start).Milliseconds()
 
 	// 3. Compute score distribution and source counts
