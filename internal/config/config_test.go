@@ -37,6 +37,25 @@ func TestDefaultConfig_NewFields(t *testing.T) {
 	if len(cfg.IndexedPaths) != 0 {
 		t.Errorf("expected empty IndexedPaths, got %v", cfg.IndexedPaths)
 	}
+
+	wantExcludes := map[string]bool{
+		".git":              true,
+		"node_modules":      true,
+		"vendor":            true,
+		".heimdall_db":      true,
+		"__pycache__":       true,
+		".idea":             true,
+		".claude/worktrees": true,
+	}
+	got := make(map[string]bool, len(cfg.ExcludePatterns))
+	for _, p := range cfg.ExcludePatterns {
+		got[p] = true
+	}
+	for want := range wantExcludes {
+		if !got[want] {
+			t.Errorf("default ExcludePatterns missing %q (got %v)", want, cfg.ExcludePatterns)
+		}
+	}
 }
 
 func TestLoadConfig_AppliesNewDefaults(t *testing.T) {

@@ -7,12 +7,40 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
 	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
+
+// buildVersion returns a short version string suitable for `--version` output.
+// Reads the module version and vcs.revision from the Go build info so local
+// `go build` and `go install` both produce something meaningful without needing
+// -ldflags injection. Falls back to "wave2-phase1a" (matching the installed hook
+// envelope's heimdall_version) when build info is unavailable.
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "heimdall-mcp wave2-phase1a"
+	}
+	version := info.Main.Version
+	if version == "" || version == "(devel)" {
+		version = "wave2-phase1a"
+	}
+	var rev string
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" && len(s.Value) >= 7 {
+			rev = s.Value[:7]
+			break
+		}
+	}
+	if rev != "" {
+		return fmt.Sprintf("heimdall-mcp %s (%s)", version, rev)
+	}
+	return fmt.Sprintf("heimdall-mcp %s", version)
+}
 
 // envToMap converts os.Environ-style KEY=VALUE slices to a map.
 // Shared by every CLI handler that accepts the §5.4 env parameter.
@@ -32,12 +60,16 @@ func envToMap(environ []string) map[string]string {
 // RunCLI dispatches the CLI subcommand.
 func RunCLI(cfg config.Config, args []string) {
 	cmd := args[0]
-	// Parse --out flag from anywhere in args
+	// Parse --out and --model flags from anywhere in args
 	outPath := ""
+	modelFlag := ""
 	var cleanArgs []string
 	for i := 1; i < len(args); i++ {
 		if (args[i] == "--out" || args[i] == "-o") && i+1 < len(args) {
 			outPath = args[i+1]
+			i++
+		} else if args[i] == "--model" && i+1 < len(args) {
+			modelFlag = args[i+1]
 			i++
 		} else {
 			cleanArgs = append(cleanArgs, args[i])
@@ -47,10 +79,10 @@ func RunCLI(cfg config.Config, args []string) {
 	switch cmd {
 	case "index":
 		if len(cleanArgs) < 1 {
-			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp index <path> [--out /path/to/output/dir]\n")
+			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp index <path> [--out /path/to/output/dir] [--model <name>]\n")
 			os.Exit(1)
 		}
-		cliIndex(cfg, cleanArgs[0], outPath)
+		cliIndex(cfg, cleanArgs[0], outPath, modelFlag)
 	case "status":
 		// Status handler parses its own flags (including --out/-o and --format).
 		os.Exit(CLIStatus(os.Stdin, os.Stdout, os.Stderr, envToMap(os.Environ()), args[1:], StatusDeps{}))
@@ -88,11 +120,14 @@ func RunCLI(cfg config.Config, args []string) {
 		os.Exit(CLIInstallHooks(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), args[1:]))
 	case "uninstall-hooks":
 		os.Exit(CLIUninstallHooks(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), args[1:]))
+	case "version", "--version", "-V":
+		fmt.Println(buildVersion())
 	case "help", "--help", "-h":
 		fmt.Println("heimdall-mcp — local semantic code search + memory")
 		fmt.Println()
 		fmt.Println("CLI usage:")
-		fmt.Println("  heimdall-mcp index <path> [--out <dir>]          Index a directory")
+		fmt.Println("  heimdall-mcp index <path> [--out <dir>] [--model <name>]")
+		fmt.Println("                                                   Index a directory")
 		fmt.Println("  heimdall-mcp status [--out <dir>] [--format]     Show index stats")
 		fmt.Println("  heimdall-mcp search <query> [--out <dir>]        Search indexed files")
 		fmt.Println("  heimdall-mcp recall --query <text> [--format]    Recall memories")
@@ -108,6 +143,7 @@ func RunCLI(cfg config.Config, args []string) {
 		fmt.Println("  heimdall-mcp hooks tail [flags]            Tail the hook log with filters")
 		fmt.Println("  heimdall-mcp hooks cache-clear [flags]     Drop hook_cache contents")
 		fmt.Println("  heimdall-mcp hooks cache-stats [flags]     Show hook_cache stats")
+		fmt.Println("  heimdall-mcp version                       Print the binary version")
 		fmt.Println()
 		fmt.Println("Options:")
 		fmt.Println("  --out, -o <dir>  Where to store the database (default: <path>/.heimdall_db/)")
@@ -121,7 +157,7 @@ func RunCLI(cfg config.Config, args []string) {
 	}
 }
 
-func cliIndex(cfg config.Config, path string, dbPath string) {
+func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid path: %v\n", err)
@@ -158,10 +194,10 @@ func cliIndex(cfg config.Config, path string, dbPath string) {
 		os.Exit(1)
 	}
 	formatDiscoveryResults(discovered)
-
-	// Let user select which models to index with
 	fmt.Println()
-	selectedModels, err := promptModelSelection(discovered, cfg.Model)
+
+	// Pick models: explicit --model wins, then auto-pick from config, else prompt.
+	selectedModels, err := resolveIndexModels(discovered, modelFlag, cfg.Model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n%v\n", err)
 		os.Exit(1)

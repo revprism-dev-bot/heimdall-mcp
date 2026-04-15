@@ -125,6 +125,8 @@ func HooksTail(stdin io.Reader, stdout, stderr io.Writer, env map[string]string,
 
 func parseTailFlags(args []string) (tailFlags, error) {
 	f := tailFlags{}
+	// Normalize `--flag=value` into `--flag`, `value` so both forms work.
+	args = splitEqualsFlags(args)
 	i := 0
 	needs := func(flag string) (string, error) {
 		i++
@@ -180,6 +182,23 @@ func parseTailFlags(args []string) (tailFlags, error) {
 		}
 	}
 	return f, nil
+}
+
+// splitEqualsFlags rewrites `--flag=value` tokens into separate `--flag` and
+// `value` tokens so a single switch on exact flag names can match both forms.
+// Non-flag tokens and bare `--flag` tokens pass through untouched.
+func splitEqualsFlags(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if len(a) > 2 && strings.HasPrefix(a, "--") {
+			if idx := strings.IndexByte(a, '='); idx > 0 {
+				out = append(out, a[:idx], a[idx+1:])
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // parseTailDuration accepts Go durations plus shorthand "7d" = 168h.
