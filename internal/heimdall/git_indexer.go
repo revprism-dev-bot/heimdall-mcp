@@ -40,33 +40,60 @@ func IndexGitCommits(ctx context.Context, repoPath string, depth int, embedder E
 		return &GitIndexResult{}, nil
 	}
 
-	var records []VectorRecord
-	for _, c := range commits {
-		content := c.Subject
+	// Build the text-per-commit list once so we can feed it to either the
+	// batch path or the per-commit fallback without rebuilding strings.
+	contents := make([]string, len(commits))
+	for i, c := range commits {
+		contents[i] = c.Subject
 		if c.Body != "" {
-			content += "\n\n" + c.Body
+			contents[i] += "\n\n" + c.Body
 		}
+	}
 
-		vec, err := embedder.Embed(ctx, content)
-		if err != nil {
-			// Skip commits that fail to embed rather than aborting entirely
+	vectors := make([][]float32, len(commits))
+	if batchEmb, ok := embedder.(BatchEmbedder); ok {
+		vecs, embedErr := batchEmb.EmbedBatch(ctx, contents)
+		if embedErr != nil {
+			// Fall through to the per-commit path so a transient batch
+			// failure does not abandon the whole run.
+			for i, content := range contents {
+				vec, err := embedder.Embed(ctx, content)
+				if err != nil {
+					continue
+				}
+				vectors[i] = vec
+			}
+		} else {
+			copy(vectors, vecs)
+		}
+	} else {
+		for i, content := range contents {
+			vec, err := embedder.Embed(ctx, content)
+			if err != nil {
+				continue
+			}
+			vectors[i] = vec
+		}
+	}
+
+	var records []VectorRecord
+	for i, c := range commits {
+		if vectors[i] == nil {
 			continue
 		}
-
 		shortHash := c.Hash
 		if len(shortHash) > 12 {
 			shortHash = shortHash[:12]
 		}
-
 		records = append(records, VectorRecord{
 			ID:            fmt.Sprintf("commit:%s", shortHash),
 			FilePath:      "git:commit",
 			StartLine:     0,
 			EndLine:       0,
-			Content:       content,
+			Content:       contents[i],
 			Kind:          "commit",
 			Identifier:    shortHash,
-			Embedding:     vec,
+			Embedding:     vectors[i],
 			ModTime:       c.Timestamp,
 			ContentHash:   "",
 			SourceType:    "commit",

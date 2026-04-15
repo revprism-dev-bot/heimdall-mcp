@@ -111,7 +111,7 @@ func TestSearchFiltered_BySourceType(t *testing.T) {
 	}
 
 	// Filter by ticket
-	results := store.SearchFiltered([]float32{1.0, 0.0}, 10, "ticket", nil)
+	results := store.SearchFiltered([]float32{1.0, 0.0}, 10, "ticket", "", nil)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 ticket result, got %d", len(results))
 	}
@@ -120,13 +120,13 @@ func TestSearchFiltered_BySourceType(t *testing.T) {
 	}
 
 	// Filter by code
-	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "code", nil)
+	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "code", "", nil)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 code result, got %d", len(results))
 	}
 
 	// No filter returns all
-	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "", nil)
+	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "", nil)
 	if len(results) != 3 {
 		t.Fatalf("expected 3 results with no filter, got %d", len(results))
 	}
@@ -150,13 +150,13 @@ func TestSearchFiltered_ByMetadata(t *testing.T) {
 	}
 
 	// Filter by status=open
-	results := store.SearchFiltered([]float32{1.0}, 10, "", map[string]any{"status": "open"})
+	results := store.SearchFiltered([]float32{1.0}, 10, "", "", map[string]any{"status": "open"})
 	if len(results) != 2 {
 		t.Fatalf("expected 2 open results, got %d", len(results))
 	}
 
 	// Filter by status=open AND priority=high
-	results = store.SearchFiltered([]float32{1.0}, 10, "", map[string]any{"status": "open", "priority": "high"})
+	results = store.SearchFiltered([]float32{1.0}, 10, "", "", map[string]any{"status": "open", "priority": "high"})
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -182,7 +182,7 @@ func TestSearchFiltered_Combined(t *testing.T) {
 	}
 
 	// Filter by source_type=ticket AND status=open
-	results := store.SearchFiltered([]float32{1.0}, 10, "ticket", map[string]any{"status": "open"})
+	results := store.SearchFiltered([]float32{1.0}, 10, "ticket", "", map[string]any{"status": "open"})
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -455,7 +455,7 @@ func TestSearchFiltered_ReturnsLastAccessed(t *testing.T) {
 	}
 
 	// Initially last_accessed should be 0
-	results := store.SearchFiltered([]float32{1.0}, 1, "", nil)
+	results := store.SearchFiltered([]float32{1.0}, 1, "", "", nil)
 	if len(results) != 1 {
 		t.Fatal("expected 1 result")
 	}
@@ -467,7 +467,7 @@ func TestSearchFiltered_ReturnsLastAccessed(t *testing.T) {
 	if err := store.UpdateLastAccessed([]string{"r1"}); err != nil {
 		t.Fatal(err)
 	}
-	results = store.SearchFiltered([]float32{1.0}, 1, "", nil)
+	results = store.SearchFiltered([]float32{1.0}, 1, "", "", nil)
 	if len(results) != 1 {
 		t.Fatal("expected 1 result")
 	}
@@ -547,7 +547,7 @@ func TestSearchFiltered_FreshnessDecay(t *testing.T) {
 		t.Fatal("insert b:", err)
 	}
 
-	results := store.SearchFiltered([]float32{1.0, 0.0}, 2, "", nil)
+	results := store.SearchFiltered([]float32{1.0, 0.0}, 2, "", "", nil)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -588,7 +588,7 @@ func TestSearchFiltered_NeverAccessedNotPenalized(t *testing.T) {
 		t.Fatal("insert old:", err)
 	}
 
-	results := store.SearchFiltered([]float32{1.0, 0.0}, 2, "", nil)
+	results := store.SearchFiltered([]float32{1.0, 0.0}, 2, "", "", nil)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -648,5 +648,162 @@ func TestLastAccessedMigration(t *testing.T) {
 	store.DB().QueryRow(`SELECT last_accessed FROM entries WHERE id = ?`, "m1").Scan(&la)
 	if la != 0 {
 		t.Errorf("default last_accessed = %d, want 0", la)
+	}
+}
+
+func TestSubProjectMigration(t *testing.T) {
+	dir := tempStoreDir(t)
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Insert a record with SubProject set
+	rec := VectorRecord{
+		ID:         "sp1",
+		FilePath:   "service-a/main.go",
+		Content:    "package main",
+		Embedding:  []float32{1.0, 0.0},
+		ModTime:    100,
+		SubProject: "service-a",
+	}
+	if err := store.Upsert([]VectorRecord{rec}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify sub_project is stored
+	var sp string
+	store.DB().QueryRow(`SELECT sub_project FROM entries WHERE id = ?`, "sp1").Scan(&sp)
+	if sp != "service-a" {
+		t.Errorf("sub_project = %q, want %q", sp, "service-a")
+	}
+}
+
+func TestSubProjectMigration_DefaultEmpty(t *testing.T) {
+	dir := tempStoreDir(t)
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Insert a record without SubProject — should default to empty
+	rec := VectorRecord{
+		ID:        "sp2",
+		FilePath:  "main.go",
+		Content:   "package main",
+		Embedding: []float32{1.0},
+		ModTime:   100,
+	}
+	if err := store.Upsert([]VectorRecord{rec}); err != nil {
+		t.Fatal(err)
+	}
+
+	var sp string
+	store.DB().QueryRow(`SELECT sub_project FROM entries WHERE id = ?`, "sp2").Scan(&sp)
+	if sp != "" {
+		t.Errorf("default sub_project = %q, want empty", sp)
+	}
+}
+
+func TestSearchFiltered_BySubProject(t *testing.T) {
+	dir := tempStoreDir(t)
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	records := []VectorRecord{
+		{ID: "a1", FilePath: "service-a/main.go", Content: "service a", Embedding: []float32{1.0, 0.0}, ModTime: 100, SubProject: "service-a"},
+		{ID: "a2", FilePath: "service-a/handler.go", Content: "handler a", Embedding: []float32{0.9, 0.1}, ModTime: 100, SubProject: "service-a"},
+		{ID: "b1", FilePath: "service-b/main.go", Content: "service b", Embedding: []float32{0.8, 0.2}, ModTime: 100, SubProject: "service-b"},
+		{ID: "r1", FilePath: "main.go", Content: "root", Embedding: []float32{0.7, 0.3}, ModTime: 100, SubProject: ""},
+	}
+	if err := store.Upsert(records); err != nil {
+		t.Fatal(err)
+	}
+
+	// Filter by service-a
+	results := store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "service-a", nil)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results for service-a, got %d", len(results))
+	}
+	for _, r := range results {
+		if r.Record.SubProject != "service-a" {
+			t.Errorf("expected SubProject 'service-a', got %q", r.Record.SubProject)
+		}
+	}
+
+	// Filter by service-b
+	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "service-b", nil)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result for service-b, got %d", len(results))
+	}
+	if results[0].Record.ID != "b1" {
+		t.Errorf("expected b1, got %s", results[0].Record.ID)
+	}
+
+	// No sub_project filter returns all
+	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "", nil)
+	if len(results) != 4 {
+		t.Fatalf("expected 4 results with no sub_project filter, got %d", len(results))
+	}
+}
+
+func TestSearchFiltered_SubProjectAndSourceType(t *testing.T) {
+	dir := tempStoreDir(t)
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	records := []VectorRecord{
+		{ID: "c1", FilePath: "service-a/main.go", Content: "code", Embedding: []float32{1.0}, ModTime: 100, SourceType: "code", SubProject: "service-a"},
+		{ID: "t1", FilePath: "JIRA-1", Content: "ticket", Embedding: []float32{0.9}, ModTime: 100, SourceType: "ticket", SubProject: "service-a"},
+		{ID: "c2", FilePath: "service-b/main.go", Content: "code b", Embedding: []float32{0.8}, ModTime: 100, SourceType: "code", SubProject: "service-b"},
+	}
+	if err := store.Upsert(records); err != nil {
+		t.Fatal(err)
+	}
+
+	// Filter by both sub_project and source_type
+	results := store.SearchFiltered([]float32{1.0}, 10, "code", "service-a", nil)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result for code+service-a, got %d", len(results))
+	}
+	if results[0].Record.ID != "c1" {
+		t.Errorf("expected c1, got %s", results[0].Record.ID)
+	}
+}
+
+func TestSearchFiltered_SubProjectReturnedInResults(t *testing.T) {
+	dir := tempStoreDir(t)
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec := VectorRecord{
+		ID:         "sp_ret",
+		FilePath:   "svc/handler.go",
+		Content:    "handler code",
+		Embedding:  []float32{1.0},
+		ModTime:    100,
+		SubProject: "svc",
+	}
+	if err := store.Upsert([]VectorRecord{rec}); err != nil {
+		t.Fatal(err)
+	}
+
+	results := store.Search([]float32{1.0}, 1)
+	if len(results) != 1 {
+		t.Fatal("expected 1 result")
+	}
+	if results[0].Record.SubProject != "svc" {
+		t.Errorf("SubProject = %q, want %q", results[0].Record.SubProject, "svc")
 	}
 }

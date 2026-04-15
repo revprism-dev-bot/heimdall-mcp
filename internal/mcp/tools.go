@@ -31,16 +31,16 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
 
-	// Resolve DB directory (read-only, model-specific)
-	dbDir := s.resolveModelDBDirForRead(input.Project)
+	// Auto-resolve: find any available index whose model is pulled in Ollama
+	dbDir, resolvedModel := s.resolveAnyModelDB(input.Project)
 	if dbDir == "" {
-		// Check if base dir has other model DBs and suggest them
+		// No usable index — check if any indexes exist at all
 		baseDir := s.resolveDBDir(input.Project)
 		available := heimdall.ListAvailableModels(baseDir)
 		if len(available) > 0 {
-			return ErrResult(fmt.Sprintf("No index for model %q. Available models: %v. Change model with heimdall_configure or re-index.", s.Cfg.Model, available))
+			return ErrResult(fmt.Sprintf("Indexes exist for %v but none of those models are pulled in Ollama. Run: ollama pull <model>", available))
 		}
-		// 4.1: Auto-index on first search
+		// No index at all — auto-index
 		return s.autoIndexOnSearch()
 	}
 
@@ -50,13 +50,10 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	}
 	defer store.Close()
 
-	// Check for model mismatch — warn if index was built with a different model
-	modelWarning := checkModelMismatch(store, s.Cfg.Model)
-
-	embedder := heimdall.NewOllamaEmbedder(client, s.Cfg.Model)
+	embedder := heimdall.NewOllamaEmbedder(client, resolvedModel)
 
 	// If filters are present, use filtered search path
-	if input.SourceType != "" || len(input.MetadataFilter) > 0 {
+	if input.SourceType != "" || input.SubProject != "" || len(input.MetadataFilter) > 0 {
 		return s.toolSearchFiltered(ctx, input, store, embedder)
 	}
 
@@ -109,11 +106,7 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	// 4.3: Stale index check — trigger background re-index if stale
 	staleNote := s.checkAndTriggerReindex(store, dbDir)
 
-	// Build notes from warnings
 	var notes []string
-	if modelWarning != "" {
-		notes = append(notes, modelWarning)
-	}
 	if staleNote != "" {
 		notes = append(notes, staleNote)
 	}
@@ -142,7 +135,7 @@ func (s *Server) toolSearchFiltered(ctx context.Context, input searchInput, stor
 		json.Unmarshal(input.MetadataFilter, &metaFilter)
 	}
 
-	searchResults := store.SearchFiltered(queryVec, input.Limit, input.SourceType, metaFilter)
+	searchResults := store.SearchFiltered(queryVec, input.Limit, input.SourceType, input.SubProject, metaFilter)
 
 	if len(searchResults) == 0 {
 		return TextResult("No relevant results found.")
@@ -338,6 +331,19 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 							log.Printf("git commit indexing failed: %v", gitErr)
 						} else {
 							log.Printf("git commit indexing: %d commits, %d chunks", gitResult.CommitsIndexed, gitResult.ChunksCreated)
+						}
+					}
+
+					// Also index git commits from immediate sub-repos discovered
+					// by the same helper the indexer uses, so both paths stay in
+					// sync on what counts as a sub-repo.
+					for subName := range heimdall.DiscoverSubRepos(absPath) {
+						subPath := filepath.Join(absPath, subName)
+						gitResult, gitErr := heimdall.IndexGitCommits(ctx, subPath, 200, embedder, store)
+						if gitErr != nil {
+							log.Printf("git commit indexing for %s failed: %v", subName, gitErr)
+						} else if gitResult.CommitsIndexed > 0 {
+							log.Printf("git commit indexing for %s: %d commits, %d chunks", subName, gitResult.CommitsIndexed, gitResult.ChunksCreated)
 						}
 					}
 				}
@@ -592,16 +598,3 @@ func (s *Server) toolStatus() MCPToolResult {
 	return TextResult(string(out))
 }
 
-// checkModelMismatch returns a warning string if the configured model
-// differs from the model that was used to build the index.
-// Returns empty string if no mismatch or if the index has no model metadata.
-func checkModelMismatch(store *heimdall.VectorStore, currentModel string) string {
-	indexModel := store.GetMetadata("embedding_model")
-	if indexModel == "" {
-		return "" // pre-metadata index, can't check
-	}
-	if indexModel != currentModel {
-		return fmt.Sprintf("MODEL MISMATCH: index was built with %q but current model is %q. Search results will be unreliable. Re-index with heimdall_index to fix.", indexModel, currentModel)
-	}
-	return ""
-}

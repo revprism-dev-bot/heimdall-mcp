@@ -246,3 +246,139 @@ func TestIndexAll_DoesNotSkip(t *testing.T) {
 		t.Errorf("full re-index: FilesSkipped = %d, want 0", result2.FilesSkipped)
 	}
 }
+
+func TestIndexAll_SkipsSubRepoDirectories(t *testing.T) {
+	// Create a parent project with a sub-repo (directory containing .git/)
+	root := t.TempDir()
+
+	// Parent files
+	os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main() {}"), 0644)
+	os.WriteFile(filepath.Join(root, "util.go"), []byte("package main\nfunc util() {}"), 0644)
+
+	// Sub-repo with its own .git/ directory
+	subRepo := filepath.Join(root, "sub-service")
+	os.MkdirAll(filepath.Join(subRepo, ".git"), 0755)
+	os.WriteFile(filepath.Join(subRepo, "app.go"), []byte("package sub\nfunc app() {}"), 0644)
+	os.WriteFile(filepath.Join(subRepo, "handler.go"), []byte("package sub\nfunc handler() {}"), 0644)
+
+	// Another sub-repo
+	subRepo2 := filepath.Join(root, "sub-infra")
+	os.MkdirAll(filepath.Join(subRepo2, ".git"), 0755)
+	os.WriteFile(filepath.Join(subRepo2, "infra.go"), []byte("package infra\nfunc deploy() {}"), 0644)
+
+	// Regular subdirectory (no .git/) should still be indexed
+	os.MkdirAll(filepath.Join(root, "pkg"), 0755)
+	os.WriteFile(filepath.Join(root, "pkg", "lib.go"), []byte("package pkg\nfunc lib() {}"), 0644)
+
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	indexer := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+
+	ctx := context.Background()
+	result, err := indexer.IndexAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should only index parent files + pkg/lib.go (3 files total), NOT sub-repo files
+	if result.FilesScanned != 3 {
+		t.Errorf("FilesScanned = %d, want 3 (main.go, util.go, pkg/lib.go)", result.FilesScanned)
+	}
+	if result.FilesIndexed != 3 {
+		t.Errorf("FilesIndexed = %d, want 3", result.FilesIndexed)
+	}
+
+	// Verify sub-repo files are not in store
+	if store.HasFile("sub-service/app.go") {
+		t.Error("sub-repo file sub-service/app.go should not be indexed")
+	}
+	if store.HasFile("sub-infra/infra.go") {
+		t.Error("sub-repo file sub-infra/infra.go should not be indexed")
+	}
+
+	// Verify parent files ARE in store
+	if !store.HasFile("main.go") {
+		t.Error("parent file main.go should be indexed")
+	}
+	if !store.HasFile("pkg/lib.go") {
+		t.Error("regular subdir file pkg/lib.go should be indexed")
+	}
+}
+
+func TestIndexAll_SubProjectTagging(t *testing.T) {
+	// Sub-project tagging only applies when sub-repo files are indexed
+	// (e.g. when using IncludePaths that include a sub-repo, or when
+	// indexing a sub-repo directly as root). Since we skip sub-repos
+	// during parent indexing, the SubProject field is primarily set via
+	// the subRepoDirs detection. Let's test discoverSubRepoDirs and
+	// subProjectForFile directly.
+
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "service-a", ".git"), 0755)
+	os.MkdirAll(filepath.Join(root, "service-b", ".git"), 0755)
+	os.MkdirAll(filepath.Join(root, "lib"), 0755) // not a sub-repo
+
+	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	indexer := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+	_ = indexer
+
+	subRepoDirs := DiscoverSubRepos(root)
+
+	if !subRepoDirs["service-a"] {
+		t.Error("expected service-a in subRepoDirs")
+	}
+	if !subRepoDirs["service-b"] {
+		t.Error("expected service-b in subRepoDirs")
+	}
+	if subRepoDirs["lib"] {
+		t.Error("lib should NOT be in subRepoDirs (no .git/)")
+	}
+
+	// Test subProjectForFile
+	tests := []struct {
+		relPath string
+		want    string
+	}{
+		{"service-a/main.go", "service-a"},
+		{"service-b/handler.go", "service-b"},
+		{"lib/util.go", ""},
+		{"main.go", ""},
+		{"service-a/nested/deep.go", "service-a"},
+	}
+	for _, tt := range tests {
+		got := subProjectForFile(tt.relPath, subRepoDirs)
+		if got != tt.want {
+			t.Errorf("subProjectForFile(%q) = %q, want %q", tt.relPath, got, tt.want)
+		}
+	}
+}
+
+func TestDiscoverSubRepoDirs_Empty(t *testing.T) {
+	root := t.TempDir()
+	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	indexer := NewIndexer(root, embedder, store, ChunkerOpts{})
+	_ = indexer
+
+	subRepoDirs := DiscoverSubRepos(root)
+	if len(subRepoDirs) != 0 {
+		t.Errorf("expected empty subRepoDirs, got %v", subRepoDirs)
+	}
+}

@@ -59,6 +59,7 @@ type searchInput struct {
 	Limit          int             `json:"limit"`
 	Project        string          `json:"project"`         // optional: project name or path
 	SourceType     string          `json:"source_type"`     // optional: filter by source type
+	SubProject     string          `json:"sub_project"`     // optional: filter by sub-project (sub-repo directory name)
 	MetadataFilter json.RawMessage `json:"metadata_filter"` // optional: filter by metadata key-value pairs
 }
 

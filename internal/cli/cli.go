@@ -207,13 +207,18 @@ func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.Oll
 		if now.Sub(lastPrint) > 500*time.Millisecond || p.Current == p.Total {
 			elapsed := now.Sub(startTime).Round(time.Second)
 			eta := ""
-			if p.BytesDone > 0 && p.BytesTotal > 0 {
-				// ETA based on bytes processed — accounts for file size differences
-				bytesPerSec := float64(p.BytesDone) / now.Sub(startTime).Seconds()
-				if bytesPerSec > 0 {
-					remainingBytes := p.BytesTotal - p.BytesDone
-					remainingSecs := float64(remainingBytes) / bytesPerSec
-					eta = fmt.Sprintf(" | ETA: %s", (time.Duration(remainingSecs) * time.Second).Round(time.Second))
+			if p.ChunksSoFar > 0 && p.Current > 0 && p.Total > 0 {
+				// ETA based on chunks processed — accounts for embedding time
+				elapsedSecs := now.Sub(startTime).Seconds()
+				if elapsedSecs > 0 {
+					chunksPerSec := float64(p.ChunksSoFar) / elapsedSecs
+					if chunksPerSec > 0 {
+						remainingFiles := p.Total - p.Current
+						avgChunksPerFile := float64(p.ChunksSoFar) / float64(p.Current)
+						remainingChunks := float64(remainingFiles) * avgChunksPerFile
+						remainingSecs := remainingChunks / chunksPerSec
+						eta = fmt.Sprintf(" | ETA: %s", (time.Duration(remainingSecs) * time.Second).Round(time.Second))
+					}
 				}
 			}
 			pct := ""
@@ -316,18 +321,21 @@ func cliSearch(cfg config.Config, query string, dbPath string) {
 		cwd, _ := os.Getwd()
 		searchBaseDir = filepath.Join(cwd, ".heimdall_db")
 	}
-	searchDbDir := heimdall.ModelDBDir(searchBaseDir, cfg.Model)
-	if _, err := os.Stat(searchDbDir); err != nil {
-		// No model-specific DB — check for other models
+
+	// Auto-resolve: find any index whose model is pulled in Ollama
+	searchDbDir, resolvedModel := resolveAnyLocalModelDB(cfg, searchBaseDir)
+	if searchDbDir == "" {
 		available := heimdall.ListAvailableModels(searchBaseDir)
 		if len(available) > 0 {
-			fmt.Fprintf(os.Stderr, "No index for model %q. Available models: %v\n", cfg.Model, available)
-			fmt.Fprintf(os.Stderr, "Use: heimdall-mcp config set model <name>\n")
+			fmt.Fprintf(os.Stderr, "Indexes exist for %v but none of those models are pulled in Ollama.\n", available)
+			fmt.Fprintf(os.Stderr, "Run: ollama pull <model>\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "No index found. Run: heimdall-mcp index <path>\n")
 		}
 		os.Exit(1)
 	}
+	fmt.Printf("Using model: %s\n", resolvedModel)
+
 	store, err := heimdall.OpenStore(searchDbDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Store error: %v\n", err)
@@ -335,7 +343,7 @@ func cliSearch(cfg config.Config, query string, dbPath string) {
 	}
 	defer store.Close()
 
-	embedder := heimdall.NewOllamaEmbedder(client, cfg.Model)
+	embedder := heimdall.NewOllamaEmbedder(client, resolvedModel)
 	retriever := heimdall.NewRetriever(embedder, store, 5, cfg.MaxContextTokens)
 
 	blocks, err := retriever.Retrieve(ctx, query)
@@ -690,6 +698,12 @@ func cliModels(cfg config.Config) {
 		fmt.Printf(" %s%-35s %s\n", marker, m.Name, status)
 	}
 	fmt.Println()
-	fmt.Println("To use a model: heimdall-mcp config set model <name>")
 	fmt.Println("To pull a model: ollama pull <name>")
+}
+
+// resolveAnyLocalModelDB finds any usable model index in a base dir.
+// Thin CLI-side wrapper over heimdall.ResolveUsableModelDB.
+func resolveAnyLocalModelDB(cfg config.Config, baseDir string) (string, string) {
+	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	return heimdall.ResolveUsableModelDB(context.Background(), client, baseDir, cfg.Model)
 }
