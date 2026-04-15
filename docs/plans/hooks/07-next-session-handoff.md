@@ -9,14 +9,23 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> We just merged Wave 2 phase 1a of the Claude Code hooks integration for
-> heimdall-mcp. Main is 21 commits ahead of origin/main locally (not pushed).
-> The full roadmap, locked decisions, implementation plan, and review gate
-> history are in `docs/plans/hooks/`. The immediate task is **dogfooding**:
-> index this repo, install the hooks, verify with doctor, then restart
-> Claude Code to see `SessionStart` and `PostToolUse(Edit|Write)` actually
-> fire. Before touching code, read `docs/plans/hooks/07-next-session-handoff.md`
-> — it has the exact command sequence, known caveats, and recovery paths.
+> Wave 2 phase 1a of the Claude Code hooks integration for heimdall-mcp is
+> merged to `origin/main` (PR #5, merge commit `67e8335`), and four follow-up
+> bugs caught by the first real dogfood run are also merged (PR #7, merge
+> commit `15d1723`). The full roadmap, locked decisions, implementation plan,
+> and review gate history are in `docs/plans/hooks/`.
+>
+> **Dogfood steps 0–7 are done.** The repo is indexed (1758 chunks on
+> `nomic-embed-text`), hooks are installed to `.claude/settings.json`,
+> `hooks doctor` reports **11/11 green**, and the doctor's dry-fire of
+> `hook session-start` successfully retrieved 5 bullets from the real index.
+> The **only** pending step is **step 8 — user restarts Claude Code** to
+> verify `SessionStart` actually fires via the real Claude Code hook
+> pipeline (not just dry-fired by doctor). Until that restart succeeds we do
+> not know whether the `.claude/settings.json` schema guess is right.
+>
+> Before touching code, read this file — it has the exact command sequence,
+> known caveats, recovery paths, and the four follow-up fixes from PR #7.
 > Do not start Wave 2 phase 1b (the UserPromptSubmit hot path) until
 > phase 1a has soaked for at least a day.
 
@@ -100,6 +109,37 @@ cases and a `ResolveUsableModelDB` table-driven test.
   Performance 97, Tests 96, Design 98. 110 tests in `internal/cli`, all
   green under `-race`.
 
+### Wave 2 phase 1a dogfood follow-ups — merged as PR #7 (merge commit `15d1723`)
+
+Four bugs surfaced on the first real dogfood run that blocked or soft-failed
+the runbook below. All fixed in a single follow-up commit (`367d225`) that
+landed on `main` after the phase 1a body.
+
+- **`heimdall-mcp index` hung on `/dev/tty`** when ≥2 embedding models were
+  pulled. `huh.NewMultiSelect` opens `/dev/tty` directly — no non-interactive
+  bypass, and `config.model` was only used as a pre-highlight. Meant CI, cron,
+  and the post-edit actor's reindex path all had no way through. **Fix:**
+  new `--model <name>` flag and `resolveIndexModels` helper. Resolution
+  order: explicit flag → `config.model` auto-pick → single-embeddable
+  auto-pick → interactive `huh` prompt. Tolerates `:latest` tag variance.
+- **`hooks doctor` reported `[XX] heimdall-mcp --version exit status 1`** on
+  a clean install. Doctor check #5 shells out to `<bin> --version` but the
+  CLI had no version handler at all. **Fix:** added `version` / `--version`
+  / `-V` backed by `runtime/debug.ReadBuildInfo()`. Works with `go build`
+  and `go install` without `-ldflags` injection. Falls back to
+  `"wave2-phase1a"` when build info is unavailable.
+- **`hooks tail --since=1h` rejected the `=` form.** Parser only matched
+  `--since 1h` (space-separated). **Fix:** `splitEqualsFlags` normalization
+  pass at the top of `parseTailFlags` rewrites `--flag=value` into two
+  tokens uniformly so both forms work on every flag.
+- **`.claude/worktrees` missing from default `excludePatterns`.** First
+  dogfood index took 18m28s because it re-embedded three stale Apr-11
+  agent worktrees. **Fix:** added `.claude/worktrees` (narrowly — not all
+  of `.claude/`, so user `commands/`, `agents/`, `skills/` remain indexable).
+- **Tests:** 10 new unit tests (`discover_test.go` ×8, `version_test.go` ×2)
+  plus an assertion in `TestDefaultConfig_NewFields` that the new exclude is
+  present. Full suite green under `-race`.
+
 ---
 
 ## Locked decisions (OQ-1..OQ-5) — do not relitigate
@@ -127,9 +167,62 @@ From `docs/plans/hooks/06-decisions.md`:
 
 ---
 
-## Dogfood sequence (run in this order)
+## Next steps (in order)
+
+1. **User closes and reopens Claude Code in this repo** (dogfood step 8).
+   On reopen, watch the first turn for a `## Heimdall context` markdown
+   block injected via `SessionStart`. Three cases:
+   - **Works:** phase 1a is verified end-to-end. Proceed to step 2 below.
+   - **Silent failure (no block, no error):** `.claude/settings.json`
+     schema is wrong and Claude Code is ignoring the hook. Recovery:
+     `./heimdall-mcp uninstall-hooks --scope=project`, then inspect a
+     working Claude Code `settings.json` (e.g. from
+     `~/.config/claude-code/` or another repo with hooks working), learn
+     the real shape, and patch the `phase1aHooks` template in
+     `internal/cli/install.go`. Add a regression test. Reinstall. Retry.
+   - **Loud failure (Claude Code throws on startup):** same recovery.
+     `uninstall-hooks` is symmetric — it removes just the heimdall
+     entries and leaves any other user-authored hooks untouched.
+2. **Edit any file** (e.g. `echo x >> TODO.md && git restore TODO.md` —
+   make a no-op edit through Claude Code's `Edit` tool, not terminal).
+   `PostToolUse(Edit|Write)` should fire and enqueue the file for
+   background reindex. Verify:
+   ```bash
+   ./heimdall-mcp hooks tail --event=post-edit --since=5m
+   ```
+   Expect one or more `event=post-edit` lines, ideally
+   `msg=actor_spawned` followed by `event=post-edit stage=ok`. If the
+   actor's reindex hits the `/dev/tty` path despite PR #7's fix (it
+   shouldn't — config auto-pick is in), it will hang silently; watch
+   `reindex.deadletter.jsonl` under `.heimdall_db/hooks/` for repeated
+   retries at N=10.
+3. **Soak for ≥1 day.** Phase 1b gate criteria (see
+   `00-consolidated-plan.md §7`) require phase 1a stable for at least
+   a week, but at minimum sleep on it overnight before cutting phase 1b.
+4. **Start Wave 2 phase 1b** — see the "What to do after dogfood
+   succeeds" section below for scope (T4 `--format=hook-md` +
+   `--budget-ms` breaking change, T6 `hook user-prompt` hot path,
+   T21 benchmark).
+
+---
+
+## Dogfood sequence (run in this order — status shown per step)
 
 All commands assume CWD is `/home/noname/Code/heimdall-mcp`.
+
+| # | Step | Status | Notes |
+|---|---|---|---|
+| 0 | `go build ./... && go vet ./... && go test ./... -race` | ✅ | Green under race |
+| 1 | `heimdall-mcp status` | ✅ | Ollama up, no prior index |
+| 2 | `heimdall-mcp index .` | ✅ | 234 files, 139 indexed, 1758 chunks, 18m28s (pre-`.claude/worktrees` exclude) |
+| 3 | `heimdall-mcp status --format=json` | ✅ | `embedding_dim=768`, `lastIndexed` set |
+| 4 | `heimdall-mcp install-hooks --scope=project --dry-run` | ✅ | Diff showed both hooks + dual markers |
+| 5 | `heimdall-mcp install-hooks --scope=project` | ✅ | Wrote `.claude/settings.json`, no backup (no prior file) |
+| 6 | `heimdall-mcp hooks doctor` | ✅ | **11/11 green** after PR #7's `--version` fix |
+| 7 | `heimdall-mcp hooks tail --since=1h` | ✅ | Confirmed dry-fire `bullets=5 chunks=1758 stage=ok` |
+| 8 | Restart Claude Code → verify `SessionStart` fires | ⏳ | **Only pending step — requires human** |
+
+Raw command sequence for reference / re-running after a reindex:
 
 ```bash
 # 0. Confirm clean build
@@ -208,19 +301,29 @@ heimdall-mcp hooks tail --event=post-edit --since=5m
    design (OQ-5 golden rule: no fuzzy match on hook path). If doctor
    check #9 is red, either re-index or switch the configured model.
 
-5. **The current worktree `wave1-stream-a-cli` is stale** from the prior
-   session and can't be pruned while the prior session still holds it.
-   After closing the prior session, run:
-   `git -C /home/noname/Code/heimdall-mcp worktree remove .claude/worktrees/wave1-stream-a-cli --force`
-   (or `git worktree prune` after deleting any remaining branches).
+5. **Three stale `.claude/worktrees/agent-*` worktrees from 2026-04-11**
+   still on disk, pointing at the pre-Wave-1 commit `1e94085`. They are
+   now **excluded from `heimdall-mcp index` by default** via PR #7's
+   `excludePatterns` addition, so they don't inflate reindex time. They
+   still show up in `git worktree list` though — prune them at leisure
+   with `git worktree remove --force .claude/worktrees/agent-a68e0b3c`
+   (and the other two). Not blocking anything.
 
-6. **Main is 21 commits ahead of `origin/main` locally, not pushed.** Per
-   global CLAUDE.md rules, push only when you're ready and only through a
-   feature branch + PR, never directly to main. The branches were already
-   merged locally; re-creating feature branches for a remote push is
-   awkward. Pragmatic option: push `main` to a new remote branch
-   (`git push origin main:feat/hooks-integration-waves-0-2`) and open a
-   PR from there.
+6. **Main is up to date with `origin/main`.** Wave 1 + Wave 2 phase 1a
+   shipped via **PR #5** (merge commit `67e8335`, merged 2026-04-15
+   23:04Z). The four dogfood follow-up fixes shipped via **PR #7**
+   (merge commit `15d1723`, merged 2026-04-15 23:07Z). PR #6 was a
+   stacked-PR collateral casualty — auto-closed when its base
+   (`feat/hooks-integration-waves-0-2`) was deleted on the #5 merge.
+   Same commit was resubmitted and merged as #7.
+
+7. **Unit tests in `internal/cli` write to the real
+   `$XDG_STATE_HOME/heimdall/hooks.log`** instead of `t.TempDir()`.
+   Dogfood's `hooks tail` showed test artifacts (timestamps with
+   `pid=999999` and fake `context deadline exceeded` errors) polluting
+   user state. Worth a follow-up PR — scoped out of PR #7 because it
+   touches many test files. Symptom on your end: `hooks tail` will
+   show occasional lines that don't match anything you actually did.
 
 ---
 
@@ -326,19 +429,36 @@ docs/plans/hooks/
 
 ---
 
-## Final git state at session end
+## Final git state at session end (2026-04-15, post-dogfood)
 
 ```
-$ git log --oneline -5
+$ git log --oneline -6
+15d1723 Merge pull request #7 from revprism-dev-bot/fix/index-noninteractive-model-flag
+367d225 fix(cli): phase 1a dogfood follow-ups — --model flag, version, =form flags
+67e8335 Merge pull request #5 from revprism-dev-bot/feat/hooks-integration-waves-0-2
+5ce482b docs(hooks): add 07-next-session-handoff — dogfood runbook
 8027105 docs: mark Wave 2 phase 1a merged in TODO.md
 fbcb4dc Merge feat/wave2-stream-f-install-uninstall-doctor (Wave 2 T14/T15/T16)
-12cc751 Merge feat/wave2-stream-e-post-edit (Wave 2 T7 hook post-edit + detached actor)
-c7f7f6c Merge feat/wave2-stream-d-session-start (Wave 2 T5 hook session-start)
-2d9663a feat(cli): install-hooks, uninstall-hooks, hooks doctor (T14+T15+T16+T19)
 
 $ git status --short
-# nothing on main itself; only untracked noise under .claude/ and .idea/
+# nothing tracked on main; only untracked noise under .claude/ and .idea/
+# plus .claude/settings.json from the dogfood install (not gitignored yet —
+# worth a follow-up)
 ```
 
-Main is clean. 21 commits ahead of `origin/main`. Worktree `wave1-stream-a-cli`
-still listed in `git worktree list` — ignore, prune manually.
+Main is clean and **in sync with `origin/main`** at `15d1723`. Three stale
+`agent-*` worktrees still listed in `git worktree list` from 2026-04-11 —
+harmless, now excluded from indexing, prune manually at leisure.
+
+**Open known-unknowns (ordered by urgency):**
+
+1. Does `SessionStart` actually fire when Claude Code reopens the repo?
+   (Blocks phase 1b.)
+2. Does `PostToolUse(Edit|Write)` actually fire on a real Claude Code
+   `Edit` tool call, and does the detached `fork+setsid` actor reach
+   `stage=ok` or hit deadletter? (Blocks confidence in the post-edit
+   path for phase 1b as well.)
+3. Is `.claude/settings.json` worth gitignoring in this repo, given that
+   it now contains a machine-local install? (Cosmetic.)
+4. Do the unit-test hook-log artifacts indicate any deeper test
+   hygiene bugs beyond the obvious temp-dir fix? (Follow-up PR scope.)
