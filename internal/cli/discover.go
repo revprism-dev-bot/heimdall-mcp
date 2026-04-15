@@ -50,6 +50,68 @@ func discoverEmbeddingModels(cfg config.Config) ([]discoveredModel, error) {
 	return results, nil
 }
 
+// resolveIndexModels picks the models to index with, preferring explicit/configured
+// values over the interactive prompt so `heimdall-mcp index` can run in CI,
+// background hooks, and other non-TTY contexts.
+//
+// Resolution order:
+//  1. modelFlag (from --model) — must match a discovered embedding-capable model, else error.
+//  2. configModel — auto-pick silently if it matches a discovered embedding-capable model.
+//  3. If exactly one embeddable model is discovered, auto-pick it.
+//  4. Otherwise fall back to promptModelSelection (requires TTY).
+func resolveIndexModels(discovered []discoveredModel, modelFlag, configModel string) ([]string, error) {
+	if modelFlag != "" {
+		m, ok := findEmbeddableModel(discovered, modelFlag)
+		if !ok {
+			return nil, fmt.Errorf("--model %q not found among embedding-capable Ollama models.\n\nAvailable embedding models:\n%s", modelFlag, listEmbeddable(discovered))
+		}
+		fmt.Printf("Using model: %s\n\n", m)
+		return []string{m}, nil
+	}
+
+	if configModel != "" {
+		if m, ok := findEmbeddableModel(discovered, configModel); ok {
+			fmt.Printf("Using configured model: %s\n\n", m)
+			return []string{m}, nil
+		}
+		// Config names a model that isn't pulled / isn't embeddable — fall through
+		// to discovery-driven selection rather than hard-failing, so the interactive
+		// user still gets a chance to pick.
+	}
+
+	return promptModelSelection(discovered, configModel)
+}
+
+// findEmbeddableModel matches `name` against the discovered list, tolerating
+// the `:latest` tag variance (Ollama reports `foo:latest`, users type `foo`).
+// Returns the canonical discovered name on hit.
+func findEmbeddableModel(discovered []discoveredModel, name string) (string, bool) {
+	for _, d := range discovered {
+		if !d.CanEmbed {
+			continue
+		}
+		if d.Name == name || stripTag(d.Name) == name || d.Name == name+":latest" {
+			return d.Name, true
+		}
+	}
+	return "", false
+}
+
+// listEmbeddable renders a bulleted list of embedding-capable model names for
+// error output.
+func listEmbeddable(discovered []discoveredModel) string {
+	var b strings.Builder
+	for _, d := range discovered {
+		if d.CanEmbed {
+			fmt.Fprintf(&b, "  %s\n", d.Name)
+		}
+	}
+	if b.Len() == 0 {
+		return "  (none — run `ollama pull nomic-embed-text`)\n"
+	}
+	return b.String()
+}
+
 // promptModelSelection shows an interactive multi-select for embedding models.
 // Returns the selected model names. If only one embedding model exists, auto-selects it.
 func promptModelSelection(models []discoveredModel, currentModel string) ([]string, error) {

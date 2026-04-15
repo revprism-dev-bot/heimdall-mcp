@@ -34,7 +34,7 @@ func DefaultConfig() Config {
 		Model:                "nomic-embed-text",
 		ContextDepth:         1,
 		MaxContextTokens:     4096,
-		ExcludePatterns:      []string{".git", "node_modules", "vendor", ".heimdall_db", "__pycache__", ".idea"},
+		ExcludePatterns:      []string{".git", "node_modules", "vendor", ".heimdall_db", "__pycache__", ".idea", ".claude/worktrees"},
 		GitEnabled:           true,
 		GitDepth:             200,
 		GitIncludeDiffs:      false,
