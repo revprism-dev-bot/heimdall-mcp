@@ -1,0 +1,831 @@
+// install.go — implements T14 `install-hooks` and T15 `uninstall-hooks`.
+//
+// Both commands read/write Claude Code's `settings.json` using the stdlib
+// `encoding/json` parser (per OQ-4). They MUST be neighborly: never clobber
+// non-heimdall hooks, always write a timestamped backup before mutating, and
+// never surprise the user in `--dry-run` mode.
+//
+// Marker detection is the union of two patterns (OQ-1 belt-and-braces):
+//   1. the entry object has `"source": "heimdall"`
+//   2. any `hooks[].command` string in the entry contains `--source=heimdall`
+//
+// Either is sufficient; either must be honored by uninstall and doctor.
+package cli
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/caio-silva/heimdall-mcp/internal/config"
+)
+
+// heimdallHookVersion is the integer version stamped onto every hook entry
+// heimdall installs. Bump this when the command-string shape changes so that
+// upgrades detect drift and reinstall.
+const heimdallHookVersion = 1
+
+// heimdallBinaryVersion is the string recorded in the `x-heimdall` metadata
+// bag on installed hook entries. Distinct from heimdallHookVersion because the
+// binary can churn without changing the hook shape. Wave 2 Phase 1a ships
+// with this hard-coded; a later wave can plumb it from build flags.
+const heimdallBinaryVersion = "wave2-phase1a"
+
+// phase1aHook describes one Claude Code hook entry heimdall owns. The list
+// below is the canonical Phase 1a install set; `--only` filters over it by
+// event name.
+type phase1aHook struct {
+	event   string // Claude Code hook event (e.g. "SessionStart")
+	matcher string // empty if the event has no matcher
+	command string // full command string including --source=heimdall
+}
+
+// phase1aHooks is the canonical install set. Keep in sync with the Stream D
+// and Stream E contracts: the command strings here are baked verbatim into
+// `settings.json`, so changes must be coordinated across streams.
+var phase1aHooks = []phase1aHook{
+	{
+		event:   "SessionStart",
+		matcher: "",
+		command: "heimdall-mcp hook session-start --source=heimdall --version=1",
+	},
+	{
+		event:   "PostToolUse",
+		matcher: "Edit|Write",
+		command: "heimdall-mcp hook post-edit --source=heimdall --version=1",
+	},
+}
+
+// installFlags captures the parsed flags for install-hooks.
+type installFlags struct {
+	scope    string // "user" | "project" | "" (auto-detect)
+	dryRun   bool
+	merge    bool
+	force    bool
+	only     []string // subset of phase1aHooks event names; empty = all
+	hasOnly  bool
+}
+
+// uninstallFlags captures the parsed flags for uninstall-hooks.
+type uninstallFlags struct {
+	scope  string
+	dryRun bool
+}
+
+// CLIInstallHooks implements `heimdall-mcp install-hooks` per §5.4 testable
+// handler shape. Never calls os.Exit; returns 0 on success, 1 on runtime
+// error, 2 on usage error.
+func CLIInstallHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
+	_ = cfg
+	_ = stdin
+	flags, err := parseInstallFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "install-hooks: %v\n", err)
+		return 2
+	}
+
+	scope, settingsPath, err := resolveScope(flags.scope, env)
+	if err != nil {
+		fmt.Fprintf(stderr, "install-hooks: %v\n", err)
+		return 1
+	}
+
+	current, originalBytes, err := readSettings(settingsPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "install-hooks: %v\n", err)
+		return 1
+	}
+
+	desired := pickHooks(phase1aHooks, flags.only)
+	if len(desired) == 0 {
+		fmt.Fprintln(stderr, "install-hooks: --only matched no known hooks")
+		return 2
+	}
+
+	updated, report, err := applyInstall(current, desired, flags)
+	if err != nil {
+		fmt.Fprintf(stderr, "install-hooks: %v\n", err)
+		return 1
+	}
+
+	// If applyInstall determined that there is nothing to do (same-version
+	// entries already present and no forced overwrite), report and exit 0.
+	if report.noop {
+		fmt.Fprintln(stdout, "Already installed (same version). Nothing to do.")
+		return 0
+	}
+
+	// Serialize the updated settings so we can render a diff and/or write.
+	newBytes, err := marshalSettings(updated)
+	if err != nil {
+		fmt.Fprintf(stderr, "install-hooks: marshal failed: %v\n", err)
+		return 1
+	}
+
+	if flags.dryRun {
+		fmt.Fprintf(stdout, "scope=%s\nsettings=%s\n\n", scope, settingsPath)
+		writeDiff(stdout, originalBytes, newBytes)
+		if len(report.replaced) > 0 {
+			fmt.Fprintf(stdout, "\nWould replace %d conflicting entries.\n", len(report.replaced))
+		}
+		if report.upgraded {
+			fmt.Fprintln(stdout, "Would upgrade heimdall hooks to current version.")
+		}
+		return 0
+	}
+
+	// Non-dry-run: take a backup first, then atomically write.
+	backup, err := writeBackup(settingsPath, originalBytes)
+	if err != nil {
+		fmt.Fprintf(stderr, "install-hooks: backup failed: %v\n", err)
+		return 1
+	}
+	if backup != "" {
+		fmt.Fprintf(stdout, "Backup: %s\n", backup)
+	}
+	if err := atomicWrite(settingsPath, newBytes); err != nil {
+		fmt.Fprintf(stderr, "install-hooks: write failed: %v\n", err)
+		return 1
+	}
+	if report.upgraded {
+		fmt.Fprintln(stdout, "Upgraded heimdall hooks to current version.")
+	}
+	if len(report.replaced) > 0 {
+		fmt.Fprintf(stdout, "Replaced %d conflicting entries.\n", len(report.replaced))
+	}
+	fmt.Fprintf(stdout, "Installed %d hooks (scope=%s, file=%s).\n", len(desired), scope, settingsPath)
+	fmt.Fprintln(stdout, "Run 'heimdall-mcp hooks doctor' to verify.")
+	return 0
+}
+
+// CLIUninstallHooks implements `heimdall-mcp uninstall-hooks` per §5.4.
+func CLIUninstallHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
+	_ = cfg
+	_ = stdin
+	flags, err := parseUninstallFlags(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "uninstall-hooks: %v\n", err)
+		return 2
+	}
+
+	scope, settingsPath, err := resolveScope(flags.scope, env)
+	if err != nil {
+		fmt.Fprintf(stderr, "uninstall-hooks: %v\n", err)
+		return 1
+	}
+
+	current, originalBytes, err := readSettings(settingsPath)
+	if err != nil {
+		// If settings.json simply doesn't exist, uninstall is a no-op. Same
+		// for an effectively-empty file. Idempotent by design.
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(stdout, "No heimdall hooks found, nothing to do.")
+			return 0
+		}
+		fmt.Fprintf(stderr, "uninstall-hooks: %v\n", err)
+		return 1
+	}
+
+	updated, removed := applyUninstall(current)
+	if removed == 0 {
+		fmt.Fprintln(stdout, "No heimdall hooks found, nothing to do.")
+		return 0
+	}
+
+	newBytes, err := marshalSettings(updated)
+	if err != nil {
+		fmt.Fprintf(stderr, "uninstall-hooks: marshal failed: %v\n", err)
+		return 1
+	}
+
+	if flags.dryRun {
+		fmt.Fprintf(stdout, "scope=%s\nsettings=%s\n\n", scope, settingsPath)
+		writeDiff(stdout, originalBytes, newBytes)
+		fmt.Fprintf(stdout, "\nWould remove %d heimdall hook entries.\n", removed)
+		return 0
+	}
+
+	backup, err := writeBackup(settingsPath, originalBytes)
+	if err != nil {
+		fmt.Fprintf(stderr, "uninstall-hooks: backup failed: %v\n", err)
+		return 1
+	}
+	if backup != "" {
+		fmt.Fprintf(stdout, "Backup: %s\n", backup)
+	}
+	if err := atomicWrite(settingsPath, newBytes); err != nil {
+		fmt.Fprintf(stderr, "uninstall-hooks: write failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "Removed %d heimdall hook entries (scope=%s, file=%s).\n", removed, scope, settingsPath)
+	return 0
+}
+
+// ----- flag parsing -----
+
+func parseInstallFlags(args []string) (installFlags, error) {
+	f := installFlags{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--dry-run":
+			f.dryRun = true
+		case a == "--merge":
+			f.merge = true
+		case a == "--force":
+			f.force = true
+		case a == "--scope":
+			if i+1 >= len(args) {
+				return f, errors.New("--scope requires a value")
+			}
+			i++
+			f.scope = args[i]
+		case strings.HasPrefix(a, "--scope="):
+			f.scope = strings.TrimPrefix(a, "--scope=")
+		case a == "--only":
+			if i+1 >= len(args) {
+				return f, errors.New("--only requires a value")
+			}
+			i++
+			f.only = splitCSV(args[i])
+			f.hasOnly = true
+		case strings.HasPrefix(a, "--only="):
+			f.only = splitCSV(strings.TrimPrefix(a, "--only="))
+			f.hasOnly = true
+		case a == "-h" || a == "--help":
+			return f, errors.New("usage: install-hooks [--scope=user|project] [--dry-run] [--merge] [--force] [--only=<events>]")
+		default:
+			return f, fmt.Errorf("unknown flag %q", a)
+		}
+	}
+	if f.scope != "" && f.scope != "user" && f.scope != "project" {
+		return f, fmt.Errorf("invalid --scope %q (want user|project)", f.scope)
+	}
+	if f.merge && f.force {
+		return f, errors.New("--merge and --force are mutually exclusive")
+	}
+	return f, nil
+}
+
+func parseUninstallFlags(args []string) (uninstallFlags, error) {
+	f := uninstallFlags{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--dry-run":
+			f.dryRun = true
+		case a == "--scope":
+			if i+1 >= len(args) {
+				return f, errors.New("--scope requires a value")
+			}
+			i++
+			f.scope = args[i]
+		case strings.HasPrefix(a, "--scope="):
+			f.scope = strings.TrimPrefix(a, "--scope=")
+		case a == "-h" || a == "--help":
+			return f, errors.New("usage: uninstall-hooks [--scope=user|project] [--dry-run]")
+		default:
+			return f, fmt.Errorf("unknown flag %q", a)
+		}
+	}
+	if f.scope != "" && f.scope != "user" && f.scope != "project" {
+		return f, fmt.Errorf("invalid --scope %q (want user|project)", f.scope)
+	}
+	return f, nil
+}
+
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// pickHooks filters phase1aHooks by --only event names.
+func pickHooks(all []phase1aHook, only []string) []phase1aHook {
+	if len(only) == 0 {
+		return append([]phase1aHook(nil), all...)
+	}
+	set := make(map[string]bool, len(only))
+	for _, name := range only {
+		set[name] = true
+	}
+	out := make([]phase1aHook, 0, len(only))
+	for _, h := range all {
+		if set[h.event] {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// ----- scope resolution -----
+
+// resolveScope picks the settings.json path for the given scope. Auto-detect
+// rule: if CWD (or any ancestor) contains `.heimdall_db/`, treat it as a
+// project scope and write to `<project>/.claude/settings.json`. Otherwise
+// fall back to `$HOME/.claude/settings.json` (user scope).
+//
+// Test env hook: the `HEIMDALL_TEST_HOME` env var (if set) overrides
+// `$HOME` for scope resolution; this lets unit tests hermetically control
+// the user-scope path without touching the real `~/.claude`.
+func resolveScope(explicit string, env map[string]string) (scope string, path string, err error) {
+	chosen := explicit
+	if chosen == "" {
+		if root := findProjectRoot(env); root != "" {
+			chosen = "project"
+			return chosen, filepath.Join(root, ".claude", "settings.json"), nil
+		}
+		chosen = "user"
+	}
+	switch chosen {
+	case "project":
+		root := findProjectRoot(env)
+		if root == "" {
+			return "", "", errors.New("--scope=project requested but no .heimdall_db/ found in CWD or ancestors")
+		}
+		return "project", filepath.Join(root, ".claude", "settings.json"), nil
+	case "user":
+		home := env["HEIMDALL_TEST_HOME"]
+		if home == "" {
+			home = env["HOME"]
+		}
+		if home == "" {
+			var herr error
+			home, herr = os.UserHomeDir()
+			if herr != nil || home == "" {
+				return "", "", errors.New("could not resolve $HOME for user scope")
+			}
+		}
+		return "user", filepath.Join(home, ".claude", "settings.json"), nil
+	}
+	return "", "", fmt.Errorf("invalid scope %q", chosen)
+}
+
+// findProjectRoot walks upward from the effective CWD looking for a
+// `.heimdall_db/` directory. `HEIMDALL_TEST_CWD` in the env map overrides the
+// real CWD so that tests can pin a fixture path.
+func findProjectRoot(env map[string]string) string {
+	cwd := env["HEIMDALL_TEST_CWD"]
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	if cwd == "" {
+		return ""
+	}
+	dir := cwd
+	for i := 0; i < 32; i++ { // bounded — never walk forever
+		if _, err := os.Stat(filepath.Join(dir, ".heimdall_db")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+	return ""
+}
+
+// ----- settings.json I/O -----
+
+// readSettings loads and parses the settings file. On missing file it returns
+// an empty map and a nil byte slice (the caller treats that as "new file").
+// On parse error it returns a wrapped error — install must refuse rather than
+// clobber unparseable JSON.
+func readSettings(path string) (map[string]any, []byte, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return map[string]any{}, nil, nil
+		}
+		return nil, nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return map[string]any{}, raw, nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, raw, fmt.Errorf("%s is not valid JSON — fix or delete and retry: %w", path, err)
+	}
+	if m == nil {
+		m = map[string]any{}
+	}
+	return m, raw, nil
+}
+
+// marshalSettings serializes a settings map with stable, indented output.
+// Top-level key ordering is alphabetic (OQ-4 accepts this as a tradeoff for
+// stdlib simplicity).
+func marshalSettings(m map[string]any) ([]byte, error) {
+	// encoding/json already sorts map keys alphabetically, so MarshalIndent
+	// gives deterministic output out of the box.
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	b = append(b, '\n')
+	return b, nil
+}
+
+// atomicWrite writes data to a temp file in the same directory then renames
+// over the target. Parent dirs are created with 0o755.
+func atomicWrite(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".heimdall-settings-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup on any error after this point.
+	defer func() {
+		if _, statErr := os.Stat(tmpName); statErr == nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeBackup copies the original file bytes to a sibling
+// `settings.json.heimdall-backup-<UTC>` path and returns the backup path.
+// If originalBytes is nil (no prior file), returns ("", nil) with no error.
+func writeBackup(path string, originalBytes []byte) (string, error) {
+	if originalBytes == nil {
+		return "", nil
+	}
+	ts := time.Now().UTC().Format("2006-01-02T15-04-05Z")
+	backup := path + ".heimdall-backup-" + ts
+	if err := os.WriteFile(backup, originalBytes, 0o600); err != nil {
+		return "", err
+	}
+	return backup, nil
+}
+
+// writeDiff renders a simple unified-ish diff between old and new bytes onto
+// w. This is not a full `diff -u` implementation — it walks the line lists
+// and prints `- ` / `+ ` prefixes for lines that differ, with a context
+// marker between hunks. Sufficient for --dry-run visibility.
+func writeDiff(w io.Writer, oldBytes, newBytes []byte) {
+	oldLines := splitLines(string(oldBytes))
+	newLines := splitLines(string(newBytes))
+	i, j := 0, 0
+	for i < len(oldLines) || j < len(newLines) {
+		switch {
+		case i >= len(oldLines):
+			fmt.Fprintf(w, "+ %s\n", newLines[j])
+			j++
+		case j >= len(newLines):
+			fmt.Fprintf(w, "- %s\n", oldLines[i])
+			i++
+		case oldLines[i] == newLines[j]:
+			fmt.Fprintf(w, "  %s\n", oldLines[i])
+			i++
+			j++
+		default:
+			fmt.Fprintf(w, "- %s\n", oldLines[i])
+			fmt.Fprintf(w, "+ %s\n", newLines[j])
+			i++
+			j++
+		}
+	}
+}
+
+func splitLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	out := strings.Split(s, "\n")
+	// Drop trailing empty line from trailing newline, which is noise in diffs.
+	if len(out) > 0 && out[len(out)-1] == "" {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+// ----- install core -----
+
+// installReport records what applyInstall did so the top-level handler can
+// render a human summary afterwards.
+type installReport struct {
+	noop     bool
+	upgraded bool
+	replaced []string // event:matcher strings that were replaced under --force
+}
+
+// applyInstall mutates a parsed settings map in place (copying as needed),
+// ensuring the desired heimdall hooks are present and non-heimdall hooks are
+// respected. Returns the updated map plus a report.
+func applyInstall(settings map[string]any, desired []phase1aHook, flags installFlags) (map[string]any, installReport, error) {
+	report := installReport{}
+	out := cloneSettings(settings)
+
+	hooksAny, ok := out["hooks"]
+	if !ok || hooksAny == nil {
+		hooksAny = map[string]any{}
+	}
+	hooksMap, ok := hooksAny.(map[string]any)
+	if !ok {
+		return nil, report, fmt.Errorf(`"hooks" must be an object`)
+	}
+
+	// Group desired hooks by event so we can append into the right bucket.
+	byEvent := map[string][]phase1aHook{}
+	for _, h := range desired {
+		byEvent[h.event] = append(byEvent[h.event], h)
+	}
+
+	sameVersionCount := 0
+	totalDesired := len(desired)
+
+	eventKeys := make([]string, 0, len(byEvent))
+	for k := range byEvent {
+		eventKeys = append(eventKeys, k)
+	}
+	sort.Strings(eventKeys)
+
+	for _, event := range eventKeys {
+		hooks := byEvent[event]
+		existingAny, has := hooksMap[event]
+		var existingList []any
+		if has && existingAny != nil {
+			list, ok := existingAny.([]any)
+			if !ok {
+				return nil, report, fmt.Errorf(`"hooks.%s" must be an array`, event)
+			}
+			existingList = list
+		}
+
+		for _, h := range hooks {
+			newEntry := buildHookEntry(h)
+
+			// Classify existing entries at this event:
+			//   matchIdx: index of an existing heimdall entry with the same
+			//             matcher (if any) — triggers version compare.
+			//   conflictIdx: indexes of non-heimdall entries with the same
+			//             matcher (ignored if matcher differs).
+			matchIdx := -1
+			var conflictIdx []int
+			for idx, raw := range existingList {
+				obj, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if !sameMatcher(obj, h.matcher) {
+					continue
+				}
+				if isHeimdallEntry(obj) {
+					matchIdx = idx
+				} else {
+					conflictIdx = append(conflictIdx, idx)
+				}
+			}
+
+			switch {
+			case matchIdx >= 0:
+				// Existing heimdall entry. Compare version; upgrade if needed.
+				oldObj := existingList[matchIdx].(map[string]any)
+				if entryVersion(oldObj) == heimdallHookVersion && commandMatches(oldObj, h.command) {
+					sameVersionCount++
+					continue
+				}
+				existingList[matchIdx] = newEntry
+				report.upgraded = true
+			case len(conflictIdx) > 0:
+				// Non-heimdall entry on the same event+matcher. Refuse unless
+				// --merge (append alongside) or --force (replace).
+				if flags.force {
+					// Replace the first conflict with our entry, drop the rest.
+					// Iterate in reverse so we can remove safely.
+					sort.Sort(sort.Reverse(sort.IntSlice(conflictIdx)))
+					for n, idx := range conflictIdx {
+						if n == len(conflictIdx)-1 {
+							existingList[idx] = newEntry
+						} else {
+							existingList = append(existingList[:idx], existingList[idx+1:]...)
+						}
+						report.replaced = append(report.replaced, fmt.Sprintf("%s:%s", event, h.matcher))
+					}
+				} else if flags.merge {
+					existingList = append(existingList, newEntry)
+				} else {
+					return nil, report, fmt.Errorf(
+						"conflict on event %q (matcher=%q): existing hook from unknown source. Re-run with --merge to install alongside, or --force to replace",
+						event, h.matcher,
+					)
+				}
+			default:
+				// No conflict at all — append cleanly.
+				existingList = append(existingList, newEntry)
+			}
+		}
+
+		hooksMap[event] = existingList
+	}
+
+	if sameVersionCount == totalDesired && !report.upgraded && len(report.replaced) == 0 {
+		report.noop = true
+	}
+
+	out["hooks"] = hooksMap
+	return out, report, nil
+}
+
+// buildHookEntry renders a phase1aHook into the nested object shape Claude
+// Code's settings.json uses.
+func buildHookEntry(h phase1aHook) map[string]any {
+	meta := map[string]any{
+		"installed_at":     time.Now().UTC().Format(time.RFC3339),
+		"heimdall_version": heimdallBinaryVersion,
+	}
+	entry := map[string]any{
+		"source":     "heimdall",
+		"version":    heimdallHookVersion,
+		"x-heimdall": meta,
+		"hooks": []any{
+			map[string]any{
+				"type":    "command",
+				"command": h.command,
+			},
+		},
+	}
+	if h.matcher != "" {
+		entry["matcher"] = h.matcher
+	}
+	return entry
+}
+
+// isHeimdallEntry returns true if the given hook entry was written by us
+// (either marker pattern per OQ-1).
+func isHeimdallEntry(obj map[string]any) bool {
+	if src, _ := obj["source"].(string); src == "heimdall" {
+		return true
+	}
+	// Check any hooks[].command for --source=heimdall.
+	raw, ok := obj["hooks"].([]any)
+	if !ok {
+		return false
+	}
+	for _, h := range raw {
+		hmap, ok := h.(map[string]any)
+		if !ok {
+			continue
+		}
+		cmd, _ := hmap["command"].(string)
+		if strings.Contains(cmd, "--source=heimdall") {
+			return true
+		}
+	}
+	return false
+}
+
+// sameMatcher compares an existing entry's "matcher" field to the desired
+// matcher string. An empty desired matcher matches an absent or empty field.
+func sameMatcher(obj map[string]any, desired string) bool {
+	got, _ := obj["matcher"].(string)
+	return got == desired
+}
+
+// entryVersion reads the integer "version" field off an entry, defaulting to
+// 0 if missing or of the wrong type.
+func entryVersion(obj map[string]any) int {
+	switch v := obj["version"].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	}
+	return 0
+}
+
+// commandMatches returns true if any hooks[].command on the entry equals the
+// desired command string. Used to detect command-string drift even when the
+// integer version has not been bumped.
+func commandMatches(obj map[string]any, desired string) bool {
+	raw, ok := obj["hooks"].([]any)
+	if !ok {
+		return false
+	}
+	for _, h := range raw {
+		hmap, ok := h.(map[string]any)
+		if !ok {
+			continue
+		}
+		if cmd, _ := hmap["command"].(string); cmd == desired {
+			return true
+		}
+	}
+	return false
+}
+
+// cloneSettings performs a deep-enough copy of a parsed settings map so that
+// applyInstall can mutate without aliasing the caller's input.
+func cloneSettings(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = cloneValue(v)
+	}
+	return out
+}
+
+func cloneValue(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		return cloneSettings(x)
+	case []any:
+		out := make([]any, len(x))
+		for i, item := range x {
+			out[i] = cloneValue(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// ----- uninstall core -----
+
+// applyUninstall returns the settings map with every heimdall hook entry
+// removed, plus a count of entries that were removed.
+func applyUninstall(settings map[string]any) (map[string]any, int) {
+	out := cloneSettings(settings)
+	hooksAny, ok := out["hooks"]
+	if !ok || hooksAny == nil {
+		return out, 0
+	}
+	hooksMap, ok := hooksAny.(map[string]any)
+	if !ok {
+		return out, 0
+	}
+
+	removed := 0
+	// Iterate over a snapshot of keys so we can delete during traversal.
+	events := make([]string, 0, len(hooksMap))
+	for k := range hooksMap {
+		events = append(events, k)
+	}
+	for _, event := range events {
+		list, ok := hooksMap[event].([]any)
+		if !ok {
+			continue
+		}
+		kept := make([]any, 0, len(list))
+		for _, raw := range list {
+			obj, ok := raw.(map[string]any)
+			if !ok {
+				kept = append(kept, raw)
+				continue
+			}
+			if isHeimdallEntry(obj) {
+				removed++
+				continue
+			}
+			kept = append(kept, raw)
+		}
+		if len(kept) == 0 {
+			delete(hooksMap, event)
+		} else {
+			hooksMap[event] = kept
+		}
+	}
+	if len(hooksMap) == 0 {
+		delete(out, "hooks")
+	} else {
+		out["hooks"] = hooksMap
+	}
+	return out, removed
+}
+
+// Compile-time sanity: both entry points match the HookHandler-ish shape we
+// use for dispatch. We can't reuse HookHandler verbatim because these two
+// also take cfg, but the internal shape is identical for test harness code.
+var _ = CLIInstallHooks
+var _ = CLIUninstallHooks
