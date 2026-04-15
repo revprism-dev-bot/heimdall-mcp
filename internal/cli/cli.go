@@ -14,6 +14,21 @@ import (
 	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
 
+// envToMap converts os.Environ-style KEY=VALUE slices to a map.
+// Shared by every CLI handler that accepts the §5.4 env parameter.
+func envToMap(environ []string) map[string]string {
+	m := make(map[string]string, len(environ))
+	for _, e := range environ {
+		for i := 0; i < len(e); i++ {
+			if e[i] == '=' {
+				m[e[:i]] = e[i+1:]
+				break
+			}
+		}
+	}
+	return m
+}
+
 // RunCLI dispatches the CLI subcommand.
 func RunCLI(cfg config.Config, args []string) {
 	cmd := args[0]
@@ -37,7 +52,12 @@ func RunCLI(cfg config.Config, args []string) {
 		}
 		cliIndex(cfg, cleanArgs[0], outPath)
 	case "status":
-		cliStatus(cfg, outPath)
+		// Status handler parses its own flags (including --out/-o and --format).
+		os.Exit(CLIStatus(os.Stdin, os.Stdout, os.Stderr, envToMap(os.Environ()), args[1:], StatusDeps{}))
+	case "recall":
+		os.Exit(CLIRecall(os.Stdin, os.Stdout, os.Stderr, envToMap(os.Environ()), args[1:], RecallDeps{}))
+	case "ingest-session":
+		os.Exit(CLIIngestSession(os.Stdin, os.Stdout, os.Stderr, envToMap(os.Environ()), args[1:], IngestDeps{}))
 	case "search":
 		if len(cleanArgs) < 1 {
 			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp search <query> [--out /path/to/db/dir]\n")
@@ -62,10 +82,12 @@ func RunCLI(cfg config.Config, args []string) {
 		fmt.Println("heimdall-mcp — local semantic code search + memory")
 		fmt.Println()
 		fmt.Println("CLI usage:")
-		fmt.Println("  heimdall-mcp index <path> [--out <dir>]    Index a directory")
-		fmt.Println("  heimdall-mcp status [--out <dir>]          Show index stats")
-		fmt.Println("  heimdall-mcp search <query> [--out <dir>]  Search indexed files")
-		fmt.Println("  heimdall-mcp projects                      List registered projects")
+		fmt.Println("  heimdall-mcp index <path> [--out <dir>]          Index a directory")
+		fmt.Println("  heimdall-mcp status [--out <dir>] [--format]     Show index stats")
+		fmt.Println("  heimdall-mcp search <query> [--out <dir>]        Search indexed files")
+		fmt.Println("  heimdall-mcp recall --query <text> [--format]    Recall memories")
+		fmt.Println("  heimdall-mcp ingest-session --summary-stdin      Ingest a session summary")
+		fmt.Println("  heimdall-mcp projects                            List registered projects")
 		fmt.Println("  heimdall-mcp config get [key]              Get config (full or key)")
 		fmt.Println("  heimdall-mcp config set <key> <value>      Set a config key")
 		fmt.Println("  heimdall-mcp paths list                    List indexed paths")
@@ -237,82 +259,6 @@ func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.Oll
 			fmt.Printf("\r  [%s] %d/%d files%s (%d chunks)%s — %s\033[K",
 				elapsed, p.Current, p.Total, pct, p.ChunksSoFar, eta, p.FilePath)
 			lastPrint = now
-		}
-	}
-}
-
-func cliStatus(cfg config.Config, dbPath string) {
-	ctx := context.Background()
-	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
-
-	fmt.Printf("Ollama: %s\n", cfg.OllamaEndpoint)
-	fmt.Printf("Model:  %s\n", cfg.Model)
-	if err := client.Ping(ctx); err != nil {
-		fmt.Println("  Status: offline")
-	} else {
-		fmt.Println("  Status: running")
-		models, err := client.ListModels(ctx)
-		if err == nil {
-			hasModel := false
-			for _, m := range models {
-				if m.Name == cfg.Model || (len(m.Name) > len(cfg.Model) && m.Name[:len(cfg.Model)] == cfg.Model) {
-					hasModel = true
-					break
-				}
-			}
-			if hasModel {
-				fmt.Printf("  Model: %s (available)\n", cfg.Model)
-			} else {
-				fmt.Printf("  Model: %s (not pulled)\n", cfg.Model)
-			}
-		}
-	}
-
-	baseDir := dbPath
-	if baseDir == "" {
-		cwd, _ := os.Getwd()
-		baseDir = filepath.Join(cwd, ".heimdall_db")
-	}
-
-	// Show all available model DBs
-	available := heimdall.ListAvailableModels(baseDir)
-	if len(available) > 0 {
-		fmt.Printf("\nAvailable models: %v\n", available)
-	}
-
-	// Show stats for the current model's DB
-	modelDir := heimdall.ModelDBDir(baseDir, cfg.Model)
-	if _, err := os.Stat(modelDir); err == nil {
-		store, err := heimdall.OpenStore(modelDir)
-		if err == nil {
-			defer store.Close()
-			stats := store.Stats()
-			fmt.Printf("\nIndex (%s): %s\n", cfg.Model, modelDir)
-			fmt.Printf("  Files: %d\n", stats.TotalFiles)
-			fmt.Printf("  Chunks: %d\n", stats.TotalRecords)
-			if stats.LastModified > 0 {
-				fmt.Printf("  Last indexed: %s\n", time.Unix(stats.LastModified, 0).Format("2006-01-02 15:04:05"))
-			}
-		}
-	} else {
-		fmt.Printf("\nNo index found for model %q at %s\n", cfg.Model, modelDir)
-		if len(available) > 0 {
-			fmt.Printf("  Available models: %v\n", available)
-		}
-	}
-
-	// Show registered projects
-	reg := registry.LoadRegistry()
-	projects := reg.All()
-	if len(projects) > 0 {
-		fmt.Printf("\nRegistered projects:\n")
-		cwd, _ := os.Getwd()
-		for _, p := range projects {
-			marker := " "
-			if registry.IsSubpath(cwd, p.Path) {
-				marker = "*"
-			}
-			fmt.Printf("  %s %-20s %s\n", marker, p.Name, p.Path)
 		}
 	}
 }

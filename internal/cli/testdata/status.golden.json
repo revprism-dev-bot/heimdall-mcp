@@ -1,0 +1,10 @@
+{
+  "endpoint": "http://127.0.0.1:0",
+  "model": "nomic-embed-text",
+  "ollamaRunning": false,
+  "indexedFiles": 0,
+  "totalChunks": 0,
+  "lastIndexed": "no index",
+  "baseDir": "{{BASE_DIR}}",
+  "modelDBDir": "{{MODEL_DB_DIR}}"
+}
