@@ -78,6 +78,9 @@ func RunCLI(cfg config.Config, args []string) {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "hook":
+		env := envMap()
+		os.Exit(DispatchHook(cfg, os.Stdin, os.Stdout, os.Stderr, env, cleanArgs))
 	case "help", "--help", "-h":
 		fmt.Println("heimdall-mcp — local semantic code search + memory")
 		fmt.Println()
