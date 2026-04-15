@@ -84,6 +84,10 @@ func RunCLI(cfg config.Config, args []string) {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "install-hooks":
+		os.Exit(CLIInstallHooks(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), args[1:]))
+	case "uninstall-hooks":
+		os.Exit(CLIUninstallHooks(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), args[1:]))
 	case "help", "--help", "-h":
 		fmt.Println("heimdall-mcp — local semantic code search + memory")
 		fmt.Println()

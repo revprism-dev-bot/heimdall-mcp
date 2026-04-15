@@ -25,7 +25,7 @@ type HookHandler func(stdin io.Reader, stdout, stderr io.Writer, env map[string]
 // exit code to surface to the shell. Called by RunCLI via a tiny wrapper.
 func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "Usage: heimdall-mcp hooks <tail|cache-clear|cache-stats>")
+		fmt.Fprintln(stderr, "Usage: heimdall-mcp hooks <tail|cache-clear|cache-stats|doctor>")
 		return 2
 	}
 	sub := args[0]
@@ -37,12 +37,15 @@ func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer,
 		return HooksCacheClear(cfg, stdin, stdout, stderr, env, rest)
 	case "cache-stats":
 		return HooksCacheStats(cfg, stdin, stdout, stderr, env, rest)
+	case "doctor":
+		return HooksDoctor(cfg, stdin, stdout, stderr, env, rest)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "heimdall-mcp hooks — operate on the Claude Code hooks subsystem")
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, "  hooks tail [flags]           Tail the hook log file with filters")
 		fmt.Fprintln(stdout, "  hooks cache-clear [--project <path>] [--all-models]")
 		fmt.Fprintln(stdout, "  hooks cache-stats [--project <path>] [--format text|json] [--all-models]")
+		fmt.Fprintln(stdout, "  hooks doctor [--scope=user|project]   Diagnose hooks installation")
 		return 0
 	default:
 		fmt.Fprintf(stderr, "Unknown hooks subcommand: %s\n", sub)
