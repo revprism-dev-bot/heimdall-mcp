@@ -296,10 +296,17 @@ func resolveCacheProject(flagProject string) string {
 
 // HooksCacheClear implements `heimdall-mcp hooks cache-clear`.
 //
-// Depends on Stream B's T10 hook_cache table and a `HookCacheClear()` method
-// on the VectorStore. Until T10 lands in main, this handler returns a
-// TODO-coded exit (still exit 0 with a stub JSON payload) so smoke tests
-// compile and run.
+// Stream B confirmed the final signatures (commit a565a16 on
+// feat/wave1-stream-b-retrieval-infra, file internal/heimdall/hook_cache.go):
+//
+//	func (s *VectorStore) HookCacheClear() error
+//	func (s *VectorStore) HookCacheStats() (count, totalBytes, hitCount int64, err error)
+//
+// Because Stream B's hook_cache.go is not yet on main when this branch was
+// cut, calling these methods would not compile here. Task #10 (Wave 1
+// close-out) is the merge-time swap-in — the wiring below is the exact
+// shape the swap-in needs, with the two real calls replacing the stub
+// payload. Nothing else on this handler needs to change.
 func HooksCacheClear(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
 	flags, err := parseCacheFlags(args, false)
 	if err != nil {
@@ -315,11 +322,23 @@ func HooksCacheClear(cfg config.Config, stdin io.Reader, stdout, stderr io.Write
 		return 0
 	}
 
-	// TODO(wave1-stream-b-T10): replace this stub with a real loop over
-	// model subdirs calling store.HookCacheClear(). The shape is expected
-	// to be `func (s *VectorStore) HookCacheClear() (int, error)`. Until
-	// T10 lands, we cannot safely open the store for hook_cache ops, so
-	// we emit zero and a reason. The caller JSON contract is frozen.
+	// TODO(task-10-merge-swap-in): replace this stub block. Stream B clarified
+	// that HookCacheClear returns `error` only — to report `cleared=N` in the
+	// CLI output, call HookCacheStats first for the pre-clear `count`, then
+	// HookCacheClear, then emit `cleared: count` from the snapshot.
+	//
+	// Concrete wiring (requires flags.allModels loop across
+	// heimdall.ListAvailableModels + heimdall.ModelDBDir + heimdall.OpenStore):
+	//
+	//	store, err := heimdall.OpenStore(modelDir)
+	//	if err != nil { return 1 }
+	//	defer store.Close()
+	//	count, _, _, _ := store.HookCacheStats()
+	//	if err := store.HookCacheClear(); err != nil {
+	//	    fmt.Fprintln(stderr, "hooks cache-clear: store error")
+	//	    return 1
+	//	}
+	//	writeJSON(stdout, map[string]any{"cleared": count})
 	_ = flags.allModels
 	writeJSON(stdout, map[string]any{
 		"cleared": 0,
@@ -330,8 +349,9 @@ func HooksCacheClear(cfg config.Config, stdin io.Reader, stdout, stderr io.Write
 
 // HooksCacheStats implements `heimdall-mcp hooks cache-stats`.
 //
-// Same Stream B dependency as cache-clear. Stub emits a zeroed stats object
-// so tests can assert the JSON schema shape today.
+// Same Stream B dependency as cache-clear. The payload keys below
+// (`entries`, `bytes`, `hit_count`) match Stream B's three-scalar return
+// shape from HookCacheStats one-to-one — swap-in is a straight assignment.
 func HooksCacheStats(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
 	flags, err := parseCacheFlags(args, true)
 	if err != nil {
@@ -348,10 +368,15 @@ func HooksCacheStats(cfg config.Config, stdin io.Reader, stdout, stderr io.Write
 	if _, err := os.Stat(baseDir); err != nil {
 		payload["reason"] = "no_db"
 	} else {
-		// TODO(wave1-stream-b-T10): wire this to VectorStore.HookCacheStats()
-		// once the signature is in main. Expected shape: `(entries, bytes,
-		// hitCount int64, err error)` or a struct — we'll flatten into the
-		// JSON shape above at wire time.
+		// TODO(task-10-merge-swap-in): replace this stub. Stream B confirmed:
+		//
+		//	count, totalBytes, hitCount, err := store.HookCacheStats()
+		//	if err != nil { return 1 }
+		//	payload["entries"]   = count
+		//	payload["bytes"]     = totalBytes
+		//	payload["hit_count"] = hitCount
+		//
+		// (Loop across model subdirs if flags.allModels — aggregate sums.)
 		payload["reason"] = "hook_cache_not_yet_available"
 	}
 
