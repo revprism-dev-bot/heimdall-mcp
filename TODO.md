@@ -3,13 +3,48 @@
 Tracking all outstanding work across the "steal ideas from OpenViking" roadmap.
 Tackled progressively — see status per item.
 
-## 1. Claude Code Hooks Integration (**IN PLANNING**)
+## 1. Claude Code Hooks Integration (**WAVE 1 MERGED** — Wave 2 next)
 
 **Goal:** make Claude actually use heimdall on every turn via Claude Code hooks,
 not via hopeful tool exposure. Highest-leverage item by a wide margin.
 
-Scope for this pass: **planning only**. 5 planners in parallel, then consolidation.
-Implementation blocked on approved plan.
+**Wave 1 shipped** (merges `cdf890b`, `4a3c643`, `55ab7c3`, `8189180`):
+- [x] T1 `heimdall-mcp recall` CLI + shared-core extraction
+- [x] T2 `heimdall-mcp ingest-session` CLI + length-prefixed buffer parser
+- [x] T3 `status --format=json`
+- [x] T9 `VerifyHookIndex` + three sentinel errors, refuses fuzzy fallback
+- [x] T10 `hook_cache` SQLite table + `store_metadata.index_version` bump + two-phase RLock/Lock for `HookCacheGet`
+- [x] T11 Ollama `keep_alive: "10m"` on hook path only
+- [x] T12 Tier B suppression store
+- [x] T13 `hooks.log` file, rotation, redaction (POSIX + Windows)
+- [x] T17 `heimdall-mcp hooks tail` with filter flags
+- [x] T18 `heimdall-mcp hooks cache-clear` / `cache-stats` wired to real store methods
+- [x] T22 `HooksDisabled` fast-path (env + marker file, <1µs warm)
+- [x] Review gate: weighted 94.5/100, merged by judgment at structural ceiling
+
+**Wave 2 (pending) — hook commands + install/test/gate:**
+- [ ] T4 `--format=hook-md` on `search` + `--budget-ms` (breaking: adds ctx to `SearchFiltered`)
+- [ ] T5 `hook session-start` command
+- [ ] T6 `hook user-prompt` command (hot path; 250ms p95 budget)
+- [ ] T7 `hook post-edit` command (fork+setsid debouncer)
+- [ ] T8 `hook stop` command (session buffer → ingest-session handoff)
+- [ ] T14 `install-hooks` (blocked on 5 OQs: unknown-field tolerance, opt-in/opt-out, binary name, JSON round-trip, exit-code taxonomy)
+- [ ] T15 `uninstall-hooks`
+- [ ] T16 `hooks doctor`
+- [ ] T19 Layer 1 unit tests for every hook command
+- [ ] T20 Layer 2 integration tests (`os/exec` + fake Ollama)
+- [ ] T21 `BenchmarkUserPromptHook` regression baseline
+- [ ] T23 Layer 3 opt-in e2e harness (`-tags e2e`, `HEIMDALL_E2E_CLAUDE=1`)
+- [ ] T24 Windows path redaction (deferred until Windows adoption — security review flagged)
+- [ ] Deferred perf optimizations: PERF-002 `bumpIndexVersionTx` single-query, PERF-003 O(cap) eviction → incremental row-count tracking
+- [ ] Wave 2 test gaps: `hook-md` golden files, `SearchFiltered` budget-timeout live test (once ctx param lands)
+
+**Open questions blocking phase 1a of Wave 2** (from consolidated plan §8):
+1. Claude Code unknown-field tolerance on hook entries
+2. Opt-in vs opt-out install
+3. Binary name (`heimdall-mcp` vs `heimdall`)
+4. `settings.json` JSON round-trip fidelity
+5. Exit-code taxonomy vs always-0 for retrieval hooks
 
 Hook surface to design:
 
