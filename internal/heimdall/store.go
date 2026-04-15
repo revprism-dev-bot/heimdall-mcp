@@ -100,6 +100,23 @@ func OpenStore(dbDir string) (*VectorStore, error) {
 	// Metadata table for store-level properties (model, dimensions, etc.)
 	db.Exec(`CREATE TABLE IF NOT EXISTS store_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
 
+	// hook_cache: BLOB-valued short-TTL cache keyed by normalized prompt +
+	// index version + filter scope. Co-located with the per-model store so
+	// every row is implicitly scoped to one embedding space. See
+	// docs/plans/hooks §5.3 for the rationale.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS hook_cache (
+			key        TEXT PRIMARY KEY,
+			stdout     BLOB NOT NULL,
+			created_at INTEGER NOT NULL,
+			hit_count  INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE INDEX IF NOT EXISTS idx_hook_cache_created ON hook_cache(created_at);
+	`); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	return &VectorStore{db: db}, nil
 }
 
@@ -254,6 +271,9 @@ func (s *VectorStore) Upsert(records []VectorRecord) error {
 		}
 	}
 
+	if err := bumpIndexVersionTx(tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -262,8 +282,19 @@ func (s *VectorStore) RemoveByFile(filePath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.Exec(`DELETE FROM entries WHERE file_path = ?`, filePath)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM entries WHERE file_path = ?`, filePath); err != nil {
+		return err
+	}
+	if err := bumpIndexVersionTx(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Save is a no-op for SQLite (auto-persists). Kept for API compatibility.

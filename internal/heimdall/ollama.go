@@ -27,10 +27,22 @@ func NewOllamaClient(endpoint string) *OllamaClient {
 	}
 }
 
+// HookKeepAlive is the model residency hint sent on every embed request
+// issued from the hook path. Keeps the model hot between fast-fire hook
+// invocations so cold starts don't dominate the 250 ms p95 budget.
+// See docs/plans/hooks §5.6 for the rationale.
+const HookKeepAlive = "10m"
+
 // EmbedRequest is the POST body for /api/embed.
+//
+// KeepAlive maps to Ollama's optional `keep_alive` field; when non-empty it
+// overrides Ollama's default model-residency TTL. The interactive MCP path
+// leaves this empty so it doesn't force GPU memory to stay resident between
+// calls; the hook path sets it via the EmbedForHook wrapper below.
 type EmbedRequest struct {
-	Model string `json:"model"`
-	Input string `json:"input"`
+	Model     string `json:"model"`
+	Input     string `json:"input"`
+	KeepAlive string `json:"keep_alive,omitempty"`
 }
 
 // EmbedResponse is the response from /api/embed.
@@ -38,9 +50,25 @@ type EmbedResponse struct {
 	Embeddings [][]float32 `json:"embeddings"`
 }
 
-// Embed generates an embedding vector for the given text.
+// Embed generates an embedding vector for the given text. The interactive
+// path — no keep_alive, so Ollama applies its default residency.
 func (c *OllamaClient) Embed(ctx context.Context, model, text string) ([]float32, error) {
-	body, _ := json.Marshal(EmbedRequest{Model: model, Input: text})
+	return c.embed(ctx, EmbedRequest{Model: model, Input: text})
+}
+
+// EmbedForHook is the hook-path embed entry point. It sets keep_alive: "10m"
+// so the model stays resident between fast-fire hook invocations. Keeping
+// this separate from Embed preserves the clean request shape for the
+// interactive MCP server, which shouldn't pay the keep-alive cost on every
+// call — see docs/plans/hooks §5.6.
+func (c *OllamaClient) EmbedForHook(ctx context.Context, model, text string) ([]float32, error) {
+	return c.embed(ctx, EmbedRequest{Model: model, Input: text, KeepAlive: HookKeepAlive})
+}
+
+// embed is the shared HTTP plumbing. Kept private so Embed and EmbedForHook
+// are the only public shapes and their intent is obvious at each call site.
+func (c *OllamaClient) embed(ctx context.Context, payload EmbedRequest) ([]float32, error) {
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, "POST", c.endpoint+"/api/embed", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
