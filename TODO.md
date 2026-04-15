@@ -3,7 +3,7 @@
 Tracking all outstanding work across the "steal ideas from OpenViking" roadmap.
 Tackled progressively — see status per item.
 
-## 1. Claude Code Hooks Integration (**WAVE 2 PHASE 1a MERGED** — dogfood next)
+## 1. Claude Code Hooks Integration (**WAVE 2 PHASE 1a VERIFIED END-TO-END** — soaking)
 
 **Goal:** make Claude actually use heimdall on every turn via Claude Code hooks,
 not via hopeful tool exposure. Highest-leverage item by a wide margin.
@@ -31,13 +31,16 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] OQ-1..OQ-5 locked in `docs/plans/hooks/06-decisions.md`
 - [x] Review gate: weighted 97.8/100 (Quality 98, Security 99, Performance 97, Tests 96, Design 98). 110 tests in internal/cli, all green under `-race`.
 
-**Dogfood next (session restart required):**
-- [ ] Run `heimdall-mcp index .` against this repo to create the first real index
-- [ ] Run `heimdall-mcp install-hooks --scope=project --dry-run` to preview the settings.json changes
-- [ ] Run `heimdall-mcp install-hooks --scope=project` (without --dry-run)
-- [ ] Run `heimdall-mcp hooks doctor` — expect all-green except possibly Ollama availability
-- [ ] Close and reopen Claude Code → `SessionStart` hook should inject project context into the first turn
-- [ ] Edit a file → `PostToolUse(Edit|Write)` should trigger background reindex; check `heimdall-mcp hooks tail` for confirmation
+**Dogfood ✅ complete (2026-04-16):**
+- [x] Run `heimdall-mcp index .` against this repo — 1758 chunks, `nomic-embed-text`
+- [x] Run `heimdall-mcp install-hooks --scope=project --dry-run`
+- [x] Run `heimdall-mcp install-hooks --scope=project`
+- [x] Run `heimdall-mcp hooks doctor` — 11/11 green
+- [x] Reopen Claude Code → `SessionStart` hook fires — `bullets=5 chunks=1758 model=nomic-embed-text stage=ok`
+- [x] Edit a file → `PostToolUse(Edit|Write)` → detached actor → `files=1 msg=reindex_ok`, no deadletter (first embed ~67 s cold Ollama)
+
+**Phase 1a soak (blocks phase 1b):**
+- [ ] Soak ≥ 1 day, ideally ≥ 1 week, before cutting phase 1b. Clock started 2026-04-16 00:19 local.
 
 **Wave 2 phase 1b (pending, hot path):**
 - [ ] T4 `--format=hook-md` on `search` + `--budget-ms` (breaking: adds ctx to `SearchFiltered`; removes the Wave 1 `TestSearchFiltered_BudgetTimeout` skip stub)

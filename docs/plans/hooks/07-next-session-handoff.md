@@ -15,19 +15,25 @@ point at this file.
 > commit `15d1723`). The full roadmap, locked decisions, implementation plan,
 > and review gate history are in `docs/plans/hooks/`.
 >
-> **Dogfood steps 0–7 are done.** The repo is indexed (1758 chunks on
-> `nomic-embed-text`), hooks are installed to `.claude/settings.json`,
-> `hooks doctor` reports **11/11 green**, and the doctor's dry-fire of
-> `hook session-start` successfully retrieved 5 bullets from the real index.
-> The **only** pending step is **step 8 — user restarts Claude Code** to
-> verify `SessionStart` actually fires via the real Claude Code hook
-> pipeline (not just dry-fired by doctor). Until that restart succeeds we do
-> not know whether the `.claude/settings.json` schema guess is right.
+> **Dogfood steps 0–8 are done, AND the post-edit path is verified too.**
+> The repo is indexed (1758 chunks on `nomic-embed-text`), hooks are
+> installed to `.claude/settings.json`, `hooks doctor` reports **11/11
+> green**, and on 2026-04-16 a fresh Claude Code session reopened the repo
+> and the `## Heimdall context` block arrived via the real hook pipeline
+> (`event=session-start bullets=5 chunks=1758 model=nomic-embed-text stage=ok`).
+> A real `Edit` tool call through Claude Code then fired `PostToolUse`,
+> spawned the detached `fork+setsid` actor, and the actor reached
+> `event=post-edit-actor files=1 msg=reindex_ok` with no deadletter and
+> clean state-file cleanup. First embed was slow (~67 s cold on
+> `nomic-embed-text`) because Ollama had to load the model — subsequent
+> edits should be fast. **Phase 1a is verified end-to-end; the
+> `.claude/settings.json` schema guess was correct.**
 >
 > Before touching code, read this file — it has the exact command sequence,
 > known caveats, recovery paths, and the four follow-up fixes from PR #7.
 > Do not start Wave 2 phase 1b (the UserPromptSubmit hot path) until
-> phase 1a has soaked for at least a day.
+> phase 1a has soaked for at least a day. Soak clock started
+> **2026-04-16 00:19 local** (first verified post-edit reindex).
 
 ---
 
@@ -169,36 +175,33 @@ From `docs/plans/hooks/06-decisions.md`:
 
 ## Next steps (in order)
 
-1. **User closes and reopens Claude Code in this repo** (dogfood step 8).
-   On reopen, watch the first turn for a `## Heimdall context` markdown
-   block injected via `SessionStart`. Three cases:
-   - **Works:** phase 1a is verified end-to-end. Proceed to step 2 below.
-   - **Silent failure (no block, no error):** `.claude/settings.json`
-     schema is wrong and Claude Code is ignoring the hook. Recovery:
-     `./heimdall-mcp uninstall-hooks --scope=project`, then inspect a
-     working Claude Code `settings.json` (e.g. from
-     `~/.config/claude-code/` or another repo with hooks working), learn
-     the real shape, and patch the `phase1aHooks` template in
-     `internal/cli/install.go`. Add a regression test. Reinstall. Retry.
-   - **Loud failure (Claude Code throws on startup):** same recovery.
-     `uninstall-hooks` is symmetric — it removes just the heimdall
-     entries and leaves any other user-authored hooks untouched.
-2. **Edit any file** (e.g. `echo x >> TODO.md && git restore TODO.md` —
-   make a no-op edit through Claude Code's `Edit` tool, not terminal).
-   `PostToolUse(Edit|Write)` should fire and enqueue the file for
-   background reindex. Verify:
-   ```bash
-   ./heimdall-mcp hooks tail --event=post-edit --since=5m
-   ```
-   Expect one or more `event=post-edit` lines, ideally
-   `msg=actor_spawned` followed by `event=post-edit stage=ok`. If the
-   actor's reindex hits the `/dev/tty` path despite PR #7's fix (it
-   shouldn't — config auto-pick is in), it will hang silently; watch
-   `reindex.deadletter.jsonl` under `.heimdall_db/hooks/` for repeated
-   retries at N=10.
-3. **Soak for ≥1 day.** Phase 1b gate criteria (see
-   `00-consolidated-plan.md §7`) require phase 1a stable for at least
-   a week, but at minimum sleep on it overnight before cutting phase 1b.
+1. ~~**User closes and reopens Claude Code in this repo** (dogfood step 8).~~
+   **✅ VERIFIED 2026-04-16.** On session reopen, the `## Heimdall context`
+   block arrived in the first turn's system-reminder. Hook log:
+   `2026-04-15T23:15:27Z INFO event=session-start bullets=5 chunks=1758 model=nomic-embed-text stage=ok`.
+   The `.claude/settings.json` schema guess was correct — no patch needed
+   to `phase1aHooks` in `internal/cli/install.go`.
+
+2. ~~**Edit any file** via Claude Code's `Edit` tool.~~
+   **✅ VERIFIED 2026-04-16.** A trivial `Edit` on `TODO.md` fired
+   `PostToolUse(Edit)`. Foreground log:
+   `2026-04-15T23:18:09Z INFO event=post-edit msg=actor_spawned`.
+   The detached `fork+setsid` actor (PID 2930097, state `SNsl`, session
+   leader confirmed) reached
+   `2026-04-15T23:19:16Z INFO event=post-edit-actor files=1 msg=reindex_ok`
+   after ~67 s. That long first-embed was an Ollama cold-load of
+   `nomic-embed-text`, not a hang — `/proc/<pid>/net` confirmed the socket
+   to `127.0.0.1:11434` was ESTAB the whole time. `reindex.deadletter.jsonl`
+   stayed empty, `reindex.inflight.pid` was cleaned up, and
+   `reindex.last_run` was stamped. **fork+setsid works in the wild**; the
+   `HEIMDALL_POST_EDIT_SYNC=1` fallback hinted at in §"What to do after
+   dogfood succeeds" is not needed.
+
+3. **Soak ≥1 day.** Phase 1b gate criteria (see
+   `00-consolidated-plan.md §7`) require phase 1a stable for at least a
+   week, but at minimum sleep on it overnight before cutting phase 1b.
+   Soak clock started **2026-04-16 00:19 local**.
+
 4. **Start Wave 2 phase 1b** — see the "What to do after dogfood
    succeeds" section below for scope (T4 `--format=hook-md` +
    `--budget-ms` breaking change, T6 `hook user-prompt` hot path,
@@ -220,7 +223,8 @@ All commands assume CWD is `/home/noname/Code/heimdall-mcp`.
 | 5 | `heimdall-mcp install-hooks --scope=project` | ✅ | Wrote `.claude/settings.json`, no backup (no prior file) |
 | 6 | `heimdall-mcp hooks doctor` | ✅ | **11/11 green** after PR #7's `--version` fix |
 | 7 | `heimdall-mcp hooks tail --since=1h` | ✅ | Confirmed dry-fire `bullets=5 chunks=1758 stage=ok` |
-| 8 | Restart Claude Code → verify `SessionStart` fires | ⏳ | **Only pending step — requires human** |
+| 8 | Restart Claude Code → verify `SessionStart` fires | ✅ | 2026-04-16: `bullets=5 chunks=1758 model=nomic-embed-text stage=ok` from real hook pipeline |
+| 9 | Real `Edit` tool call → verify `PostToolUse` + actor reaches `reindex_ok` | ✅ | 2026-04-16: `actor_spawned` → `files=1 msg=reindex_ok` in ~67 s (first embed cold), no deadletter |
 
 Raw command sequence for reference / re-running after a reindex:
 
@@ -452,13 +456,21 @@ harmless, now excluded from indexing, prune manually at leisure.
 
 **Open known-unknowns (ordered by urgency):**
 
-1. Does `SessionStart` actually fire when Claude Code reopens the repo?
-   (Blocks phase 1b.)
-2. Does `PostToolUse(Edit|Write)` actually fire on a real Claude Code
+1. ~~Does `SessionStart` actually fire when Claude Code reopens the repo?~~
+   **✅ ANSWERED 2026-04-16: yes.**
+2. ~~Does `PostToolUse(Edit|Write)` actually fire on a real Claude Code
    `Edit` tool call, and does the detached `fork+setsid` actor reach
-   `stage=ok` or hit deadletter? (Blocks confidence in the post-edit
-   path for phase 1b as well.)
+   `stage=ok` or hit deadletter?~~ **✅ ANSWERED 2026-04-16: yes,
+   `files=1 msg=reindex_ok`, no deadletter.** First-embed cold-load cost
+   was ~67 s — worth characterizing in the T21 benchmark on a warm
+   Ollama so phase 1b's 250 ms p95 budget isn't held hostage to cold
+   model reloads.
 3. Is `.claude/settings.json` worth gitignoring in this repo, given that
-   it now contains a machine-local install? (Cosmetic.)
+   it now contains a machine-local install? (Cosmetic.) — **still open.**
 4. Do the unit-test hook-log artifacts indicate any deeper test
    hygiene bugs beyond the obvious temp-dir fix? (Follow-up PR scope.)
+   — **still open.**
+5. Does the cold-Ollama first-embed latency (~67 s observed here) mean
+   the post-edit actor should pre-warm Ollama on install, or should the
+   hook log surface it so users don't mistake it for a hang? — **new
+   from the 2026-04-16 verification run.**
