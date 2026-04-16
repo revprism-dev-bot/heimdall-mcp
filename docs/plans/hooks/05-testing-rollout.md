@@ -33,9 +33,21 @@ Harness shape — mirror `internal/heimdall/ollama_test.go`:
 
 ### Layer 2 — Hermetic integration tests
 
-Location: `internal/cli/hook_integration_test.go` (or `internal/hooks/` if `cli-surface` puts hooks in their own package).
+**Status: shipped (T20).** Location: `internal/cli/integration_test.go`, build-tag
+`integration`. Run with `make test-integration` or
+`go test -tags=integration ./... -count=1`. Default `make test` /
+`go test ./...` does NOT include them.
 
-Exercises the full process boundary: `os/exec` the built `heimdall-mcp`, pipe stdin, read stdout. Catches what unit tests can't — flag parsing, stdin buffering, exit codes, `main()`. `TestMain` builds the binary once via `go build` into `t.TempDir()`. Each invocation wired to a `httptest` fake Ollama (URL via env var). Seed a real SQLite DB via `heimdall.OpenStore` + a handful of chunks.
+Exercises the full process boundary: `os/exec` the built `heimdall-mcp`, pipe stdin, read stdout. Catches what unit tests can't — flag parsing, stdin buffering, exit codes, `main()`. The binary is built lazily on first test call into a package-scoped `os.MkdirTemp` dir and shared across cases. Each invocation wired to a `httptest` fake Ollama that stubs `/api/tags` + `/api/embed` with a fixed-dimension vector. Seed a real SQLite DB via `heimdall.OpenStore` + one record so `VerifyHookIndex` passes.
+
+Concrete cases shipped:
+
+- `TestIntegration_HookSessionStart_EndToEnd` — fire `hook session-start`, assert stdout has `## Heimdall context` + model marker, hooks.log has `stage=ok`.
+- `TestIntegration_HookUserPrompt_CacheHit` — fire twice with identical prompt; second fire must hit cache (stdout identical, `/api/embed` request count unchanged, hooks.log `stage=cache_hit`).
+- `TestIntegration_HookPostEdit_ActorReindexes` — fire `hook post-edit`, poll hooks.log for `actor_spawned` + `reindex_ok` from the detached actor (real fork+setsid exercised here).
+- `TestIntegration_HookStop_ThenSessionEnd` — fire Stop twice, then SessionEnd; assert buffer file created with ≥2 lines, then removed, and `event=session-end` appears in hooks.log.
+
+Hermetic env: every test pins `HEIMDALL_MCP_CONFIG`, `HEIMDALL_HOOK_LOG`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, and `HOME` so nothing leaks to user state.
 
 Assertions (each maps 1:1 to plan 01 §`test-rollout` — these *are* the phase-1 acceptance criteria):
 
@@ -52,6 +64,11 @@ Assertions (each maps 1:1 to plan 01 §`test-rollout` — these *are* the phase-
 
 ### Layer 3 — Real `claude` end-to-end (best-effort, not a CI gate)
 
+**Status: harness shipped (T23).** Location: `internal/cli/e2e_test.go`,
+build-tag `e2e`. Opt-in via `HEIMDALL_E2E_CLAUDE=1` AND `claude` on PATH —
+otherwise `t.Skip`s cleanly. Run with `make test-e2e` or
+`HEIMDALL_E2E_CLAUDE=1 go test -tags=e2e ./... -count=1`.
+
 `claude --help` gives us four levers that make a real-claude harness possible:
 
 - `--settings <file-or-json>` — throwaway `settings.json` that references our hooks. Key unlock.
@@ -59,14 +76,16 @@ Assertions (each maps 1:1 to plan 01 §`test-rollout` — these *are* the phase-
 - `--output-format=stream-json --include-hook-events` — emits every hook lifecycle event. This is what lets us assert "the hook fired."
 - `--bare` / `--tools ""` — isolate from unrelated machinery.
 
-Proposed harness (`test/e2e/hooks_claude_test.go`, build-tag `e2e`, skipped by default):
+Current harness (`internal/cli/e2e_test.go`, `TestE2E_ClaudeSessionStartHookFires`):
 
-1. `t.TempDir()` → write minimal `settings.json` pointing at the freshly-built `heimdall-mcp` binary.
-2. Seed a tiny project, run `heimdall-mcp index .`.
-3. Exec `claude --settings <file> --print --output-format=stream-json --include-hook-events --tools "" "say hi"`.
-4. Parse stream-json, look for hook-event records, assert each expected hook fired with exit 0.
+1. Build `heimdall-mcp` from source into a temp dir.
+2. Create a temp project with one trivial Go file.
+3. Seed the vector store (`heimdall.OpenStore` + one `Upsert`) so `VerifyHookIndex` passes — skips a real `heimdall-mcp index` run and its Ollama dependency.
+4. Install hooks via `heimdall-mcp install-hooks --scope=project` against the temp project (hermetic env pins `HEIMDALL_MCP_CONFIG`, `XDG_*`, `HOME`).
+5. Exec `claude --settings <path-to-temp-settings.json> -p "hi"` in the temp project with `PATH` pointing at our built binary.
+6. Grep the output for the `## Heimdall context` banner as proof the SessionStart hook fired.
 
-Caveats: requires `claude` on PATH (skip cleanly otherwise); requires Ollama or the same `httptest` fake with URL injected via env; burns real model tokens unless stubbed — gate behind `-tags e2e` AND `HEIMDALL_E2E_CLAUDE=1`, never default CI. The stream-json hook-event schema is not documented in `--help`; needs confirmation via source or sample run (open question below). If unstable, layer 3 becomes a manual runbook and layers 1+2 remain the correctness gate — they already cover every assertion from plan 01 §`test-rollout`.
+Caveats: requires `claude` on PATH (skip cleanly otherwise); requires Ollama or a stubbed endpoint; burns real model tokens unless the user has a local setup; gated behind `-tags e2e` AND `HEIMDALL_E2E_CLAUDE=1`, never default CI. On auth/network failures the test treats the run as "environment issue" and `t.Skip`s with the captured output — the harness is explicitly "best effort, not a CI gate." If claude auth flows or flag shapes drift, layer 3 degrades to a manual runbook and layers 1+2 remain the correctness gate — they already cover every assertion from plan 01 §`test-rollout`.
 
 ### Failure-mode coverage
 
