@@ -4,6 +4,91 @@ Local semantic code search + persistent memory for Claude Code, powered by [Olla
 
 No cloud APIs. No API keys. Everything runs on your machine.
 
+## How it works
+
+Heimdall surfaces context automatically on every relevant Claude Code event via six hooks, backed by a local SQLite vector store and Ollama for embeddings. Claude doesn't have to remember to call MCP tools — the context arrives in the prompt itself.
+
+```mermaid
+flowchart LR
+    User(["User"])
+    CC["Claude Code session"]
+    subgraph Hooks["Heimdall hooks (6 events)"]
+        SS["SessionStart\ninject recall + skills"]
+        UP["UserPromptSubmit\n(hot path, 250ms)\nsearch + cache"]
+        PTU["PreToolUse\nBash guardrail\n(19-rule classifier)"]
+        PT["PostToolUse\nEdit/Write\nqueue reindex"]
+        StopEvt["Stop\nbuffer assistant turn"]
+        SEnd["SessionEnd\ningest summary"]
+    end
+    subgraph Core["Heimdall core"]
+        MCP["MCP tools\nsearch / expand / ls /\nrecall / remember / skills"]
+        Actor["post-edit actor\nfork+setsid, debounced"]
+        DB[("SQLite\nvector store\n+ hook_cache\n+ memories")]
+    end
+    Ollama["Ollama\nnomic-embed-text"]
+
+    User -->|prompt| CC
+    CC -->|on open| SS
+    CC -->|each prompt| UP
+    CC -->|before Bash| PTU
+    CC -->|after Edit/Write| PT
+    CC -->|per assistant turn| StopEvt
+    CC -->|on close| SEnd
+    SS -->|inject context| CC
+    UP -->|inject context| CC
+    PTU -->|allow/warn/block| CC
+    PT --> Actor
+    Actor --> DB
+    Actor --> Ollama
+    StopEvt --> DB
+    SEnd --> DB
+    SS --> DB
+    UP --> DB
+    CC -.->|optional MCP calls| MCP
+    MCP <--> DB
+    DB <--> Ollama
+```
+
+**Per-turn lifecycle** (from user prompt to Claude's response):
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant CC as Claude Code
+    participant H as Heimdall hook
+    participant DB as SQLite + Ollama
+
+    U->>CC: prompt
+    CC->>H: UserPromptSubmit
+    Note over H: 250 ms budget
+    H->>DB: cache lookup
+    alt cache hit
+        H-->>CC: cached ## Heimdall context
+    else cache miss
+        H->>DB: embed + search + recall skills
+        H-->>CC: fresh ## Heimdall context
+    end
+    CC->>CC: Claude reasons
+    opt Bash tool call
+        CC->>H: PreToolUse(Bash)
+        H->>H: classify (19 rules)
+        H-->>CC: allow (exit 0) / block (exit 2)
+    end
+    opt Edit/Write tool call
+        CC->>H: PostToolUse
+        H->>H: spawn detached actor
+        H-->>CC: return immediately
+        H->>DB: reindex in background
+    end
+    CC-->>U: response
+```
+
+**Key properties:**
+- **Retrieval hooks always exit 0** — a slow or broken hook never blocks Claude Code.
+- **Tier B suppression** — if Ollama goes down, the hook emits one "unavailable" note then stays silent for 5 minutes per (project, failure) pair.
+- **Tiered retrieval** — `detail=summary|snippet|full` on `heimdall_search` reduces output tokens by ~62% at typical expansion rates. Drill down with `heimdall_expand(chunk_id)`.
+- **Destructive-op guardrails** — `PreToolUse(Bash)` classifies commands against 19 static rules (`rm -rf /`, `git push --force` on protected branches, `DROP DATABASE`, etc.). Default is shadow mode: logs verdicts, never blocks. Toggle via `HEIMDALL_GUARDRAILS=shadow|warn|block|off`.
+
 ## Prerequisites
 
 - [Go 1.25+](https://go.dev/dl/)
@@ -72,9 +157,47 @@ Heimdall maintains a persistent memory store across sessions:
 → heimdall_ingest_session auto-extracts and deduplicates memories
 ```
 
-Memory types: `preference`, `decision`, `fact`, `context`. Memories can be scoped to projects and tagged for filtering.
+Memory types: `preference`, `decision`, `fact`, `context`, `skill`. Memories can be scoped to projects and tagged for filtering.
 
 The memory database lives at `~/.config/heimdall-mcp/memories.db`.
+
+## Hooks integration
+
+Heimdall ships a one-shot `install-hooks` command that wires six hook events into Claude Code's `.claude/settings.json`. Once installed, Heimdall context arrives in Claude's prompt automatically on every relevant event — the model never has to remember to call a search tool. See the diagram under "How it works" for the full data flow.
+
+```bash
+# Install hooks for this project (+ pre-warm Ollama)
+heimdall-mcp install-hooks --scope=project
+
+# Preview without writing
+heimdall-mcp install-hooks --scope=project --dry-run
+
+# Diagnose
+heimdall-mcp hooks doctor            # 13-check health table
+heimdall-mcp hooks tail --since=1h   # filter by --event, --project, --level
+heimdall-mcp hooks explain-command "rm -rf /"  # dry-run the guardrail classifier
+
+# Uninstall (reverts to backup)
+heimdall-mcp uninstall-hooks --scope=project
+```
+
+**Hooks are opt-in.** They never block Claude Code from starting. Retrieval hooks always exit 0; only `PreToolUse` in `block` mode can return exit 2, and only on a genuinely destructive Bash command.
+
+Toggle guardrails with `HEIMDALL_GUARDRAILS=shadow|warn|block|off` (default: `shadow` — logs verdicts, never blocks). Disable all hooks with `HEIMDALL_HOOKS=0` or drop a `.heimdall/hooks.disabled` marker in your project.
+
+## Skills
+
+Heimdall indexes [Claude Code skills](https://docs.anthropic.com/claude/claude-code/skills) as a searchable memory type so top-N relevant skills surface in the `SessionStart` and `UserPromptSubmit` hooks:
+
+```bash
+# Import ~/.claude/skills/*/SKILL.md into Heimdall
+heimdall-mcp skills import
+
+# Preview
+heimdall-mcp skills import --dry-run --format=json
+```
+
+The MCP `heimdall_remember --type=skill` accepts `write_file=true` to write a new skill back to `~/.claude/skills/<slug>/SKILL.md` — two-way sync, opt-in per call.
 
 ## Content Lifecycle
 
