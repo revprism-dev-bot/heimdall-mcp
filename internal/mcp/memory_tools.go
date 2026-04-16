@@ -65,9 +65,16 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 	if input.Type != "" {
 		mt := heimdall.MemoryType(input.Type)
 		if !heimdall.ValidMemoryTypes[mt] {
-			return ErrResult(fmt.Sprintf("invalid memory type %q: must be one of preference, decision, fact, context", input.Type))
+			return ErrResult(fmt.Sprintf("invalid memory type %q: must be one of preference, decision, fact, context, skill", input.Type))
 		}
 		memType = mt
+	}
+
+	// WriteFile is opt-in and only meaningful for type=skill. Reject
+	// loud-misuse early so callers see the constraint instead of silently
+	// having the flag ignored.
+	if input.WriteFile && memType != heimdall.MemoryTypeSkill {
+		return ErrResult("write_file=true is only valid when type=\"skill\"")
 	}
 
 	if s.MemoryStore == nil {
@@ -96,11 +103,13 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 		if err := s.MemoryStore.UpsertMemory(*existing); err != nil {
 			return ErrResult("memory update error: " + err.Error())
 		}
-		out, _ := json.MarshalIndent(map[string]any{
+		payload := map[string]any{
 			"status":  "updated",
 			"id":      existing.ID,
 			"message": "Existing memory updated (exact match).",
-		}, "", "  ")
+		}
+		attachSkillFileWrite(payload, input, memType)
+		out, _ := json.MarshalIndent(payload, "", "  ")
 		return TextResult(string(out))
 	}
 
@@ -143,12 +152,14 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 		if err := s.MemoryStore.UpsertMemory(*similar); err != nil {
 			return ErrResult("memory update error: " + err.Error())
 		}
-		out, _ := json.MarshalIndent(map[string]any{
+		payload := map[string]any{
 			"status":     "updated",
 			"id":         similar.ID,
 			"similarity": fmt.Sprintf("%.2f", sim),
 			"message":    "Similar memory updated (semantic match).",
-		}, "", "  ")
+		}
+		attachSkillFileWrite(payload, input, memType)
+		out, _ := json.MarshalIndent(payload, "", "  ")
 		return TextResult(string(out))
 	}
 
@@ -172,13 +183,72 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 		return ErrResult("memory store error: " + err.Error())
 	}
 
-	out, _ := json.MarshalIndent(map[string]any{
+	payload := map[string]any{
 		"status":  "created",
 		"id":      id,
 		"type":    string(memType),
 		"message": "Memory stored successfully.",
-	}, "", "  ")
+	}
+	attachSkillFileWrite(payload, input, memType)
+	out, _ := json.MarshalIndent(payload, "", "  ")
 	return TextResult(string(out))
+}
+
+// attachSkillFileWrite, when input.WriteFile is true and Type=="skill",
+// writes a SKILL.md to the configured Claude Code skills directory and
+// records the result under the "skill_file" key in payload. Errors are
+// captured under "skill_file_error" — they do NOT fail the memory store
+// operation, which is the load-bearing side-effect for callers.
+//
+// This is the ONLY place the MCP server touches ~/.claude/skills/.
+// The write is opt-in per call (default false), and overwrite refuses
+// silently unless write_file_overwrite is also true.
+func attachSkillFileWrite(payload map[string]any, input rememberInput, memType heimdall.MemoryType) {
+	if !input.WriteFile || memType != heimdall.MemoryTypeSkill {
+		return
+	}
+	skillsDir := heimdall.ResolveClaudeSkillsDir("", nil)
+	if skillsDir == "" {
+		payload["skill_file_error"] = "could not resolve skills directory; set HEIMDALL_CLAUDE_SKILLS_DIR or HOME"
+		return
+	}
+	name := input.SkillName
+	if name == "" {
+		name = firstLine(input.Content)
+	}
+	desc := input.SkillDescription
+	if desc == "" {
+		desc = firstLine(input.Content)
+	}
+	body := input.Content
+	path, err := heimdall.WriteSkillFile(heimdall.SkillWriteOpts{
+		Dir:         skillsDir,
+		Name:        name,
+		Description: desc,
+		Body:        body,
+		Overwrite:   input.WriteFileOverwrite,
+	})
+	if err != nil {
+		payload["skill_file_error"] = err.Error()
+		if path != "" {
+			payload["skill_file"] = path
+		}
+		return
+	}
+	payload["skill_file"] = path
+}
+
+// firstLine returns the first non-empty trimmed line of s, or "" if none.
+// Used as a defensive fallback for the skill-file frontmatter when the
+// caller doesn't pass an explicit skill_name / skill_description.
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(line)
+		if t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 func (s *Server) toolRecall(args json.RawMessage) MCPToolResult {

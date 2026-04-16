@@ -522,11 +522,13 @@ func TestDoctorChecks_GreenWhenAllOK(t *testing.T) {
 		dryFire:      func(cmd string) error { return nil },
 		hookLogPath:  filepath.Join(home, "hooks.log"),
 		projectRoot:  "", // no project — produces a yellow warn, still exit 0
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	cfg := config.Config{Model: "bge-m3"}
 	checks := runDoctorChecks(cfg, env, deps)
-	if len(checks) != 11 {
-		t.Fatalf("expected 11 checks, got %d", len(checks))
+	if len(checks) != 12 {
+		t.Fatalf("expected 12 checks, got %d", len(checks))
 	}
 	for _, c := range checks {
 		if c.status == statusFail {
@@ -546,6 +548,8 @@ func TestDoctorChecks_FailsOnMissingSettings(t *testing.T) {
 		listModels:   func(ctx context.Context, ep string) ([]string, error) { return []string{"bge-m3"}, nil },
 		dryFire:      func(cmd string) error { return nil },
 		hookLogPath:  filepath.Join(home, "hooks.log"),
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	checks := runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
 	first := checks[0]
@@ -567,6 +571,8 @@ func TestDoctorChecks_FailsOnInvalidJSON(t *testing.T) {
 		listModels:   func(ctx context.Context, ep string) ([]string, error) { return []string{"bge-m3"}, nil },
 		dryFire:      func(cmd string) error { return nil },
 		hookLogPath:  filepath.Join(home, "hooks.log"),
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	checks := runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
 	if checks[1].status != statusFail {
@@ -587,6 +593,8 @@ func TestDoctorChecks_BinaryMissingFails(t *testing.T) {
 		listModels:   func(ctx context.Context, ep string) ([]string, error) { return []string{"bge-m3"}, nil },
 		dryFire:      func(cmd string) error { return nil },
 		hookLogPath:  filepath.Join(home, "hooks.log"),
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	checks := runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
 	// check #4 (index 3) is "heimdall-mcp on PATH"
@@ -608,6 +616,8 @@ func TestDoctorChecks_OllamaDownIsWarnNotFail(t *testing.T) {
 		listModels:   func(ctx context.Context, ep string) ([]string, error) { return nil, errors.New("nope") },
 		dryFire:      func(cmd string) error { return nil },
 		hookLogPath:  filepath.Join(home, "hooks.log"),
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	checks := runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
 	// check #6 (index 5)
@@ -652,6 +662,8 @@ func TestDoctorChecks_DryFireFailsRed(t *testing.T) {
 		listModels:   func(ctx context.Context, ep string) ([]string, error) { return []string{"bge-m3"}, nil },
 		dryFire:      func(cmd string) error { return errors.New("non-zero exit 1") },
 		hookLogPath:  filepath.Join(home, "hooks.log"),
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	checks := runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
 	// check #10 (index 9)
@@ -690,6 +702,8 @@ func TestDoctorChecks_SkipsInternalPostEditActor(t *testing.T) {
 		listModels:   func(ctx context.Context, ep string) ([]string, error) { return []string{"bge-m3"}, nil },
 		dryFire:      func(cmd string) error { called++; return nil },
 		hookLogPath:  filepath.Join(home, "hooks.log"),
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
 	if called != 0 {

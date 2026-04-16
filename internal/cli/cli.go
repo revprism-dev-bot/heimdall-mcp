@@ -146,6 +146,8 @@ func RunCLI(cfg config.Config, args []string) {
 		os.Exit(CLIInstallHooks(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), args[1:]))
 	case "uninstall-hooks":
 		os.Exit(CLIUninstallHooks(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), args[1:]))
+	case "skills":
+		os.Exit(CLISkills(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), cleanArgs, SkillsDeps{}))
 	case "version", "--version", "-V":
 		fmt.Println(buildVersion())
 	case "help", "--help", "-h":
@@ -165,6 +167,7 @@ func RunCLI(cfg config.Config, args []string) {
 		fmt.Println("  heimdall-mcp paths add <path>              Add a path to index")
 		fmt.Println("  heimdall-mcp paths remove <path>           Remove a path")
 		fmt.Println("  heimdall-mcp models                        List available embedding models")
+		fmt.Println("  heimdall-mcp skills import [flags]         Import ~/.claude/skills/ into memory")
 		fmt.Println("  heimdall-mcp hook session-start [flags]    Claude Code SessionStart retrieval hook")
 		fmt.Println("  heimdall-mcp hooks tail [flags]            Tail the hook log with filters")
 		fmt.Println("  heimdall-mcp hooks cache-clear [flags]     Drop hook_cache contents")

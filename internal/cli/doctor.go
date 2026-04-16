@@ -1,6 +1,6 @@
 // doctor.go — implements T16 `heimdall-mcp hooks doctor`.
 //
-// Eleven checks are run in a fixed order and rendered as a small ASCII table.
+// Twelve checks are run in a fixed order and rendered as a small ASCII table.
 // Each check returns a status (pass/warn/fail) plus a short message. Any
 // `fail` row makes the overall command exit 1; `warn`-only or all-pass rows
 // exit 0. ASCII markers are used unconditionally — `NO_COLOR` is honored by
@@ -77,6 +77,12 @@ type doctorDeps struct {
 	hookLogPath string
 	// nowOnDisk is the canned event-JSON payload used by dryFire.
 	dryFireStdin []byte
+	// skillsDir overrides ResolveClaudeSkillsDir for the skills-sync check.
+	// Empty string means "use the env-resolved default".
+	skillsDir string
+	// memoryDBPath overrides config.ResolveMemoryDBPath for the
+	// skills-sync check so tests don't touch the user's real memory DB.
+	memoryDBPath string
 }
 
 // HooksDoctor implements the §5.4 handler shape. Wired into DispatchHooks
@@ -151,7 +157,7 @@ func renderDoctorTable(w io.Writer, checks []doctorCheck) {
 // deps, and HTTP calls via deps. Tests inject doctorDeps to bypass exec/net.
 func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) []doctorCheck {
 	deps = fillDoctorDeps(cfg, deps)
-	checks := make([]doctorCheck, 0, 11)
+	checks := make([]doctorCheck, 0, 12)
 
 	// 1 — settings.json exists at the chosen scope?
 	settingsBytes, settingsErr := os.ReadFile(deps.settingsPath)
@@ -393,6 +399,63 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 		checks = append(checks, doctorCheck{
 			name: "hook log writable", status: statusPass, message: logPath,
 		})
+	}
+
+	// 12 — Claude Code skills sync rollup (informational; warn on drift).
+	// Compares the count of SKILL.md files under the configured skills dir
+	// against the count of memory rows whose ID matches the disk-skill prefix.
+	// Drift means either: a skill file exists that has not been imported, or
+	// a synced row's source file has been deleted. Either way, the user
+	// should run `heimdall-mcp skills import` to reconcile.
+	skillsDir := deps.skillsDir
+	if skillsDir == "" {
+		skillsDir = heimdall.ResolveClaudeSkillsDir("", env)
+	}
+	memDBPath := deps.memoryDBPath
+	if memDBPath == "" {
+		memDBPath = config.ResolveMemoryDBPath()
+	}
+	if skillsDir == "" {
+		checks = append(checks, doctorCheck{
+			name: "skills sync", status: statusWarn,
+			message: "skills dir unresolved (set HEIMDALL_CLAUDE_SKILLS_DIR or HOME)",
+		})
+	} else {
+		diskN, diskErr := heimdall.CountDiskSkillFiles(skillsDir)
+		if diskErr != nil {
+			checks = append(checks, doctorCheck{
+				name: "skills sync", status: statusWarn,
+				message: fmt.Sprintf("count error: %v", diskErr),
+			})
+		} else {
+			memStore, openErr := heimdall.OpenMemoryStore(memDBPath)
+			if openErr != nil {
+				checks = append(checks, doctorCheck{
+					name: "skills sync", status: statusWarn,
+					message: fmt.Sprintf("memory store unavailable: %v", openErr),
+				})
+			} else {
+				syncedN, _ := heimdall.CountSyncedSkillMemories(memStore)
+				memStore.Close()
+				switch {
+				case diskN == 0:
+					checks = append(checks, doctorCheck{
+						name: "skills sync", status: statusPass,
+						message: "0 disk skills (nothing to sync)",
+					})
+				case diskN == syncedN:
+					checks = append(checks, doctorCheck{
+						name: "skills sync", status: statusPass,
+						message: fmt.Sprintf("%d/%d in sync", syncedN, diskN),
+					})
+				default:
+					checks = append(checks, doctorCheck{
+						name: "skills sync", status: statusWarn,
+						message: fmt.Sprintf("%d/%d synced — run 'heimdall-mcp skills import'", syncedN, diskN),
+					})
+				}
+			}
+		}
 	}
 
 	return checks

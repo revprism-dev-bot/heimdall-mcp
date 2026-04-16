@@ -290,7 +290,7 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 		},
 		{
 			Name:        "heimdall_remember",
-			Description: "Store a memory for persistent recall across sessions. Memories are embedded and stored in a local SQLite database. WARNING: Do not store API keys, passwords, tokens, or other secrets — memories are stored in plaintext and returned in recall results.",
+			Description: "Store a memory for persistent recall across sessions. Memories are embedded and stored in a local SQLite database. WARNING: Do not store API keys, passwords, tokens, or other secrets — memories are stored in plaintext and returned in recall results. For type=skill, set write_file=true to also materialize a SKILL.md under ~/.claude/skills/<slug>/ so the memory becomes a Claude Code static skill.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -312,6 +312,24 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 					"project": map[string]any{
 						"type":        "string",
 						"description": "Scope memory to a specific project (optional)",
+					},
+					"skill_name": map[string]any{
+						"type":        "string",
+						"description": "Skill name for the SKILL.md frontmatter `name:` field. Used to derive the on-disk slug. Only relevant when type=skill and write_file=true.",
+					},
+					"skill_description": map[string]any{
+						"type":        "string",
+						"description": "Skill description for the SKILL.md frontmatter `description:` field. Only relevant when type=skill and write_file=true.",
+					},
+					"write_file": map[string]any{
+						"type":        "boolean",
+						"description": "If true AND type=skill, ALSO write a SKILL.md to ~/.claude/skills/<slug>/SKILL.md so the memory becomes an always-loaded Claude Code skill. Default: false (memory only).",
+						"default":     false,
+					},
+					"write_file_overwrite": map[string]any{
+						"type":        "boolean",
+						"description": "If true, replace any existing SKILL.md at the destination. Default: false (refuse to overwrite).",
+						"default":     false,
 					},
 				},
 				"required": []string{"content"},

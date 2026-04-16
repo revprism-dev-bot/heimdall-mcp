@@ -172,9 +172,27 @@ type RelatedItem struct {
 type rememberInput struct {
 	Content     string   `json:"content"`
 	Tags        []string `json:"tags"`
-	Type        string   `json:"type"`         // "preference", "decision", "fact", "context"
+	Type        string   `json:"type"`         // "preference", "decision", "fact", "context", "skill"
 	Project     string   `json:"project"`
 	ContextPath string   `json:"context_path"` // optional slash-separated subpath within the project; auto-derived from CWD when empty
+	// SkillName is the human-readable skill name. Used (when WriteFile
+	// is true and Type=="skill") to derive the disk slug and the
+	// SKILL.md frontmatter `name:` field. If empty, falls back to the
+	// first line of Content with whitespace trimmed.
+	SkillName string `json:"skill_name"`
+	// SkillDescription is written into the frontmatter `description:`
+	// field on outbound writes. Optional.
+	SkillDescription string `json:"skill_description"`
+	// WriteFile, when true and Type=="skill", additionally writes a
+	// SKILL.md to <skills-dir>/<slug>/SKILL.md so the memory becomes an
+	// always-loaded Claude Code skill. Default OFF — opt-in per call.
+	// The skills dir resolves from $HEIMDALL_CLAUDE_SKILLS_DIR or
+	// ~/.claude/skills.
+	WriteFile bool `json:"write_file"`
+	// WriteFileOverwrite, when true, replaces an existing SKILL.md at
+	// the destination. Default false → tool returns an error noting the
+	// file already exists. Has no effect unless WriteFile is also true.
+	WriteFileOverwrite bool `json:"write_file_overwrite"`
 }
 
 type recallInput struct {

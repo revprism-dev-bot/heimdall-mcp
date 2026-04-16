@@ -358,6 +358,26 @@ func (s *MemoryStore) MemoryCount() int {
 	return count
 }
 
+// SearchMemoriesByIDPrefix counts memories whose ID starts with prefix.
+// Used by the skills sync doctor check to compare disk SKILL.md files
+// against synced memory rows. Returns 0 on any DB error.
+//
+// SAFETY: prefix is parameterized via ?, never interpolated into the SQL.
+func (s *MemoryStore) SearchMemoriesByIDPrefix(prefix string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if prefix == "" {
+		return 0
+	}
+	var count int
+	row := s.db.QueryRow(`SELECT COUNT(*) FROM memories WHERE id LIKE ?`, prefix+"%")
+	if err := row.Scan(&count); err != nil {
+		return 0
+	}
+	return count
+}
+
 // scanMemory scans a single memory row from a *sql.Rows.
 // Expects the trailing column order:
 //
