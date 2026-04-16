@@ -63,6 +63,7 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 
 **Wave 2 phase 3 (pending, guardrails):**
 - [ ] `PreToolUse(Bash(rm *|git push --force*))` as `agent`-type hook — needs a destructive-op judgment primitive heimdall does not have today
+- [ ] Phase 3 guardrails — design doc: docs/plans/hooks/08-destructive-op-primitive.md
 
 **Carried over / not yet in scope:**
 - [x] T20 Layer 2 integration tests (`os/exec` + fake Ollama) — `internal/cli/integration_test.go`, build-tag `integration`, 4 tests (session-start, user-prompt cache-hit, post-edit actor, stop→session-end). Run via `make test-integration`.
