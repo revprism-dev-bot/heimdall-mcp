@@ -68,6 +68,16 @@ var phase1aHooks = []phase1aHook{
 		matcher: "",
 		command: "heimdall-mcp hook user-prompt --source=heimdall --version=1",
 	},
+	{
+		event:   "Stop",
+		matcher: "",
+		command: "heimdall-mcp hook stop --source=heimdall --version=1",
+	},
+	{
+		event:   "SessionEnd",
+		matcher: "",
+		command: "heimdall-mcp hook session-end --source=heimdall --version=1",
+	},
 }
 
 // installFlags captures the parsed flags for install-hooks.
@@ -830,6 +840,51 @@ func applyUninstall(settings map[string]any) (map[string]any, int) {
 		out["hooks"] = hooksMap
 	}
 	return out, removed
+}
+
+// hooksDetected checks whether at least one heimdall hook entry exists in a
+// Claude Code settings.json. It looks at both user-scope (~/.claude/settings.json)
+// and project-scope (<project>/.claude/settings.json) paths. Returns true if
+// any heimdall entry is found in either scope.
+//
+// The env map follows the same conventions as resolveScope (HEIMDALL_TEST_HOME,
+// HEIMDALL_TEST_CWD, HOME) so callers from tests can pin paths.
+func hooksDetected(env map[string]string) bool {
+	// Check both user and project scopes. Either having heimdall hooks counts.
+	for _, scope := range []string{"user", "project"} {
+		_, path, err := resolveScope(scope, env)
+		if err != nil {
+			continue
+		}
+		settings, _, err := readSettings(path)
+		if err != nil {
+			continue
+		}
+		hooksAny, ok := settings["hooks"]
+		if !ok || hooksAny == nil {
+			continue
+		}
+		hooksMap, ok := hooksAny.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, eventAny := range hooksMap {
+			list, ok := eventAny.([]any)
+			if !ok {
+				continue
+			}
+			for _, raw := range list {
+				obj, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if isHeimdallEntry(obj) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // Compile-time sanity: both entry points match the HookHandler-ish shape we

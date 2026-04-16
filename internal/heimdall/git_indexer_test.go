@@ -136,7 +136,7 @@ func TestIndexGitCommits_Integration(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{
+	embedder := &StubEmbedder{
 		Vectors:   make(map[string][]float32),
 		Dimension: 3,
 	}
@@ -234,7 +234,7 @@ func TestIndexGitCommits_ZeroDepth(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
 
 	// depth=0 should default to 200
 	result, err := IndexGitCommits(context.Background(), repoDir, 0, embedder, store)
@@ -255,7 +255,7 @@ func TestIndexGitCommits_NotAGitRepo(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
 
 	_, err = IndexGitCommits(context.Background(), tmpDir, 10, embedder, store)
 	if err == nil {

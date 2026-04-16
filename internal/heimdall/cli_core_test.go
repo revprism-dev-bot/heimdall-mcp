@@ -45,7 +45,7 @@ func TestRunRecall_HappyPath(t *testing.T) {
 	seedMemory(t, store, "mem:a", "use TDD", []float32{1, 0, 0}, []string{"testing"}, "")
 	seedMemory(t, store, "mem:b", "use Go", []float32{0, 1, 0}, nil, "")
 
-	mock := &MockEmbedder{
+	mock := &StubEmbedder{
 		Vectors:   map[string][]float32{"prefers testing": {1, 0, 0}},
 		Dimension: 3,
 	}
@@ -69,7 +69,7 @@ func TestRunRecall_HappyPath(t *testing.T) {
 
 func TestRunRecall_EmptyStore(t *testing.T) {
 	store := newTestMemoryStore(t)
-	mock := &MockEmbedder{Dimension: 3}
+	mock := &StubEmbedder{Dimension: 3}
 	hits, err := RunRecall(context.Background(), RecallParams{
 		Query: "anything",
 		Limit: 5,
@@ -84,7 +84,7 @@ func TestRunRecall_EmptyStore(t *testing.T) {
 
 func TestRunRecall_MissingQuery(t *testing.T) {
 	store := newTestMemoryStore(t)
-	mock := &MockEmbedder{Dimension: 3}
+	mock := &StubEmbedder{Dimension: 3}
 	if _, err := RunRecall(context.Background(), RecallParams{Query: "  "}, mock, store); err == nil {
 		t.Fatal("expected error for empty query")
 	}
@@ -92,7 +92,7 @@ func TestRunRecall_MissingQuery(t *testing.T) {
 
 func TestRunRecall_LimitClamped(t *testing.T) {
 	store := newTestMemoryStore(t)
-	mock := &MockEmbedder{Dimension: 3}
+	mock := &StubEmbedder{Dimension: 3}
 	// Should not panic; limit negative clamps to default.
 	if _, err := RunRecall(context.Background(), RecallParams{Query: "q", Limit: -1}, mock, store); err != nil {
 		t.Errorf("unexpected error on negative limit: %v", err)
@@ -108,7 +108,7 @@ func TestRunRecall_ProjectFilter(t *testing.T) {
 	seedMemory(t, store, "mem:a", "alpha", []float32{1, 0, 0}, nil, "p1")
 	seedMemory(t, store, "mem:b", "beta", []float32{1, 0, 0}, nil, "p2")
 
-	mock := &MockEmbedder{Vectors: map[string][]float32{"q": {1, 0, 0}}, Dimension: 3}
+	mock := &StubEmbedder{Vectors: map[string][]float32{"q": {1, 0, 0}}, Dimension: 3}
 	hits, err := RunRecall(context.Background(), RecallParams{
 		Query: "q", Limit: 5, Project: "p1",
 	}, mock, store)
@@ -188,7 +188,7 @@ func TestReadLengthPrefixedBuffer_ZeroLengthRecordsSkipped(t *testing.T) {
 
 func TestIngestSessionSummary_Empty(t *testing.T) {
 	store := newTestMemoryStore(t)
-	mock := &MockEmbedder{Dimension: 3}
+	mock := &StubEmbedder{Dimension: 3}
 	if _, err := IngestSessionSummary(context.Background(), "  ", "", mock, store); err == nil {
 		t.Fatal("expected error for empty summary")
 	}

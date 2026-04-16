@@ -8,6 +8,7 @@ const (
 	MemoryTypeDecision   MemoryType = "decision"
 	MemoryTypeFact       MemoryType = "fact"
 	MemoryTypeContext    MemoryType = "context"
+	MemoryTypeSkill      MemoryType = "skill"
 )
 
 // ValidMemoryTypes for validation.
@@ -16,6 +17,7 @@ var ValidMemoryTypes = map[MemoryType]bool{
 	MemoryTypeDecision:   true,
 	MemoryTypeFact:       true,
 	MemoryTypeContext:    true,
+	MemoryTypeSkill:      true,
 }
 
 // MemorySource indicates how a memory was created.

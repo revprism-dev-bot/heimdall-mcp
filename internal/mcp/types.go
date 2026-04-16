@@ -61,6 +61,18 @@ type searchInput struct {
 	SourceType     string          `json:"source_type"`     // optional: filter by source type
 	SubProject     string          `json:"sub_project"`     // optional: filter by sub-project (sub-repo directory name)
 	MetadataFilter json.RawMessage `json:"metadata_filter"` // optional: filter by metadata key-value pairs
+	Detail         string          `json:"detail"`          // "summary", "snippet", "full" (default: "full")
+	Scope          string          `json:"scope"`           // path prefix filter for context_path hierarchy
+}
+
+type expandInput struct {
+	ChunkID string `json:"chunk_id"`
+	Project string `json:"project"` // optional
+}
+
+type lsInput struct {
+	Path    string `json:"path"`    // context path to list (empty = root)
+	Project string `json:"project"` // optional
 }
 
 type indexInput struct {
@@ -95,6 +107,8 @@ type SearchResultEnriched struct {
 	Source         string  `json:"source"`         // "code", "external", "memory"
 	ChunkID        string  `json:"chunkId"`
 	EmbeddingModel string  `json:"embeddingModel"`
+	Summary        string  `json:"summary,omitempty"`
+	ContextPath    string  `json:"contextPath,omitempty"`
 }
 
 // --- Explain result types ---

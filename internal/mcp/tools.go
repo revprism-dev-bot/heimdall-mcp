@@ -13,6 +13,13 @@ import (
 	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
 
+// sanitizeStoreError logs the full error server-side and returns a generic
+// message to the client to avoid leaking internal paths.
+func sanitizeStoreError(action string, err error) MCPToolResult {
+	log.Printf("heimdall: %s error: %v", action, err)
+	return ErrResult(action + " error — check server logs for details")
+}
+
 func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	var input searchInput
 	if err := json.Unmarshal(args, &input); err != nil {
@@ -46,14 +53,18 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
-		return ErrResult("store error: " + err.Error())
+		return sanitizeStoreError("store", err)
 	}
 	defer store.Close()
 
 	embedder := heimdall.NewOllamaEmbedder(client, resolvedModel)
 
+	if len(input.SubProject) > 255 {
+		return ErrResult("sub_project too long (max 255 chars)")
+	}
+
 	// If filters are present, use filtered search path
-	if input.SourceType != "" || input.SubProject != "" || len(input.MetadataFilter) > 0 {
+	if input.SourceType != "" || input.SubProject != "" || len(input.MetadataFilter) > 0 || input.Detail != "" || input.Scope != "" {
 		return s.toolSearchFiltered(ctx, input, store, embedder)
 	}
 
@@ -135,7 +146,14 @@ func (s *Server) toolSearchFiltered(ctx context.Context, input searchInput, stor
 		json.Unmarshal(input.MetadataFilter, &metaFilter)
 	}
 
-	searchResults := store.SearchFiltered(ctx, queryVec, input.Limit, input.SourceType, input.SubProject, metaFilter)
+	var searchOpts []heimdall.SearchOption
+	if input.Scope != "" {
+		searchOpts = append(searchOpts, heimdall.WithScope(input.Scope))
+	}
+	if input.Detail != "" {
+		searchOpts = append(searchOpts, heimdall.WithDetail(input.Detail))
+	}
+	searchResults := store.SearchFiltered(ctx, queryVec, input.Limit, input.SourceType, input.SubProject, metaFilter, searchOpts...)
 
 	if len(searchResults) == 0 {
 		return TextResult("No relevant results found.")
@@ -172,6 +190,8 @@ func (s *Server) toolSearchFiltered(ctx context.Context, input searchInput, stor
 			Source:         classifySource(r.Record.Kind),
 			ChunkID:        r.Record.ID,
 			EmbeddingModel: s.Cfg.Model,
+			Summary:        r.Record.Summary,
+			ContextPath:    r.Record.ContextPath,
 		})
 	}
 
@@ -595,6 +615,80 @@ func (s *Server) toolStatus() MCPToolResult {
 	s.Index.Mu.Unlock()
 
 	out, _ := json.MarshalIndent(status, "", "  ")
+	return TextResult(string(out))
+}
+
+func (s *Server) toolExpand(args json.RawMessage) MCPToolResult {
+	var input expandInput
+	if err := json.Unmarshal(args, &input); err != nil {
+		return ErrResult("invalid arguments: " + err.Error())
+	}
+	if input.ChunkID == "" {
+		return ErrResult("chunk_id is required")
+	}
+
+	dbDir, _ := s.resolveAnyModelDB(input.Project)
+	if dbDir == "" {
+		return ErrResult("no index found")
+	}
+
+	store, err := heimdall.OpenStore(dbDir)
+	if err != nil {
+		return ErrResult("store error")
+	}
+	defer store.Close()
+
+	rec, err := store.ExpandByID(input.ChunkID)
+	if err != nil {
+		return ErrResult("chunk not found: " + input.ChunkID)
+	}
+
+	result := map[string]any{
+		"chunkId":     rec.ID,
+		"file":        rec.FilePath,
+		"startLine":   rec.StartLine,
+		"endLine":     rec.EndLine,
+		"content":     rec.Content,
+		"kind":        rec.Kind,
+		"identifier":  rec.Identifier,
+		"sourceType":  rec.SourceType,
+		"summary":     rec.Summary,
+		"contextPath": rec.ContextPath,
+	}
+	if rec.Metadata != "" && rec.Metadata != "{}" {
+		result["metadata"] = json.RawMessage(rec.Metadata)
+	}
+	if rec.Relationships != "" && rec.Relationships != "[]" {
+		result["relationships"] = json.RawMessage(rec.Relationships)
+	}
+
+	out, _ := json.MarshalIndent(result, "", "  ")
+	return TextResult(string(out))
+}
+
+func (s *Server) toolLs(args json.RawMessage) MCPToolResult {
+	var input lsInput
+	if err := json.Unmarshal(args, &input); err != nil {
+		return ErrResult("invalid arguments: " + err.Error())
+	}
+
+	dbDir, _ := s.resolveAnyModelDB(input.Project)
+	if dbDir == "" {
+		return ErrResult("no index found")
+	}
+
+	store, err := heimdall.OpenStore(dbDir)
+	if err != nil {
+		return ErrResult("store error")
+	}
+	defer store.Close()
+
+	entries := store.ListByContextPath(input.Path)
+	if len(entries) == 0 {
+		return TextResult("No entries at this path.")
+	}
+
+	out, _ := json.MarshalIndent(entries, "", "  ")
 	return TextResult(string(out))
 }
 

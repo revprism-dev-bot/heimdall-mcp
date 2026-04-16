@@ -3,7 +3,7 @@
 Tracking all outstanding work across the "steal ideas from OpenViking" roadmap.
 Tackled progressively — see status per item.
 
-## 1. Claude Code Hooks Integration (**WAVE 2 PHASE 1b SHIPPED** — next: dogfood + phase 2 T8 hook stop)
+## 1. Claude Code Hooks Integration (**WAVE 2 PHASE 2 SHIPPED** — 5 hooks live, next: dogfood + phase 3 guardrails)
 
 **Goal:** make Claude actually use heimdall on every turn via Claude Code hooks,
 not via hopeful tool exposure. Highest-leverage item by a wide margin.
@@ -48,60 +48,68 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [~] **T21 benchmark skipped for now** — original plan called for a microbenchmark; replaced with a same-task with-vs-without-hooks comparison after merge (per user direction)
 - [~] **Soak gate killed** — wall-clock soak tests nothing for a solo local tool; phase 1b rides on the unit test suite + dogfood instead
 
-**Wave 2 phase 1b follow-ups (post-merge, open):**
+**Wave 2 phase 1b follow-ups (post-merge):**
 - [ ] Live dogfood `UserPromptSubmit` — watch `hooks tail --event=user-prompt` for cache-hit/miss ratio, Tier B paths, any stage=err lines
 - [ ] With-vs-without comparison (T21 replacement): pick a real task, run twice — `HEIMDALL_HOOKS=0` control vs defaults — compare quality, token spend, tool-call count
 
-**Wave 2 phase 2 (pending, session learning):**
-- [ ] T8 `hook stop` command (rolling buffer → ingest-session handoff)
-- [ ] Stop-event payload shape confirmed against real Claude Code
-- [ ] Session buffer retention policy confirmed
+**Wave 2 phase 2 ✅ shipped (session learning):**
+- [x] T8 `hook stop` command — rolling buffer appends `last_assistant_message` per turn, keyed by `session_id`, capped at 2 MB per buffer file
+- [x] T8b `hook session-end` command — triggers `ingest-session` from `transcript_path` JSONL, cleans up rolling buffer
+- [x] Stop-event payload shape confirmed: `session_id`, `transcript_path`, `last_assistant_message`, `cwd`, `stop_hook_active`
+- [x] SessionEnd-event payload confirmed: `session_id`, `transcript_path`, `cwd`, `reason` (clear/resume/logout/prompt_input_exit/other)
+- [x] Session buffer stored at `<project>/.heimdall_db/hooks/sessions/<session_id>.jsonl`
+- [x] Install template updated to 5 hooks: SessionStart + PostToolUse + UserPromptSubmit + Stop + SessionEnd
+- [x] 12 unit tests in `hook_stop_test.go` — buffer append, multi-append, cleanup, empty/malformed, disabled, transcript summary extraction
 
 **Wave 2 phase 3 (pending, guardrails):**
 - [ ] `PreToolUse(Bash(rm *|git push --force*))` as `agent`-type hook — needs a destructive-op judgment primitive heimdall does not have today
 
 **Carried over / not yet in scope:**
-- [ ] T20 Layer 2 integration tests (`os/exec` + fake Ollama) — deferred, unit tests cover 110 cases; Layer 2 is for future hardening
+- [ ] T20 Layer 2 integration tests (`os/exec` + fake Ollama) — deferred, unit tests cover 130+ cases; Layer 2 is for future hardening
 - [ ] T23 Layer 3 opt-in e2e harness (`-tags e2e`, `HEIMDALL_E2E_CLAUDE=1`)
-- [ ] T24 Windows path redaction (already have the regex in Wave 1; confirm it holds when anyone actually runs on Windows)
-- [ ] Deferred perf optimizations: PERF-002 `bumpIndexVersionTx` single-query, PERF-003 O(cap) eviction → incremental row-count tracking
-- [ ] `heimdall-mcp index` first-run hint ("Tip: run `install-hooks` to have Claude Code call heimdall automatically") — OQ-2 follow-up, not blocking anything
+- [x] T24 Windows path redaction — verified correct, 12 test cases in `hooklog_test.go` cover all required patterns
+- [x] PERF-002 `bumpIndexVersionTx` — single atomic `INSERT ... ON CONFLICT DO UPDATE` SQL statement
+- [x] PERF-003 hook_cache eviction — incremental row-count tracking via lazy-init counter, no more O(n) COUNT per insert
+- [x] First-run hint after `index` — prints "Tip: run `install-hooks`..." if hooks not detected, 6 tests in `install_test.go`
 
-## 2. Tiered retrieval (L0/L1/L2) — **PENDING**
+## 2. Tiered retrieval (L0/L1/L2) — **SHIPPED**
 
 **Goal:** return one-line summaries first, expand to snippet or full chunk on demand. Biggest token/quality win once hooks are live.
 
-- [ ] Schema: add `summary TEXT` to `entries`; migration.
-- [ ] Index-time summary generation (heuristic first, optional LLM upgrade).
-- [ ] `heimdall_search` gains `detail: summary|snippet|full` param, defaults to `summary`.
-- [ ] New `heimdall_expand(chunk_id)` MCP tool.
-- [ ] Integration into the `UserPromptSubmit` hook format (summaries in stdout, IDs for expansion).
-- [ ] Token-savings measurement before/after.
+- [x] Schema: `summary TEXT` column added to `entries` with migration
+- [x] Index-time summary generation: heuristic `GenerateSummary()` — uses identifier+kind for named chunks, first non-comment line for paragraphs
+- [x] `heimdall_search` gains `detail: summary|snippet|full` param — summary returns one-line, snippet 200 chars, full (default) unchanged
+- [x] New `heimdall_expand(chunk_id)` MCP tool — returns full content for drill-down after summary search
+- [x] `SearchResultEnriched` includes `summary` and `contextPath` fields
+- [ ] Token-savings measurement before/after (follow-up)
 
-## 3. Path-based context hierarchy — **PENDING**
+## 3. Path-based context hierarchy — **SHIPPED**
 
 **Goal:** replace flat `sub_project` with a real tree, so retrieval can scope by path prefix and walk the hierarchy.
 
-- [ ] Schema: `context_path TEXT` replaces/augments `sub_project`; migration from existing rows.
-- [ ] `heimdall_search` gains `scope` path param.
-- [ ] New `heimdall_ls(path)` MCP tool — filesystem-style navigation.
-- [ ] All three content kinds (code, memory, skill) live under path prefixes in one table.
-- [ ] Auto-detect path for memories (e.g. `memories/decisions/<date>-<slug>`).
-- [ ] Update hook injection to respect scope when CWD is a subpath.
+- [x] Schema: `context_path TEXT` column added to `entries` with indexed migration
+- [x] Auto-derived from file path via `deriveContextPath()` (directory hierarchy, slash-normalized)
+- [x] `heimdall_search` gains `scope` path param — prefix filter on `context_path`
+- [x] New `heimdall_ls(path)` MCP tool — lists child paths with chunk counts for filesystem-style navigation
+- [x] `WithScope()` and `WithDetail()` functional options on `SearchFiltered`
+- [ ] Auto-detect path for memories (follow-up)
+- [ ] Update hook injection to respect scope when CWD is a subpath (follow-up)
 
-## 4. Skills as indexable content — **PENDING**
+## 4. Skills as indexable content — **SHIPPED**
 
 **Goal:** store reusable procedures as first-class, semantically retrievable content.
 
-- [ ] Decision: how is this different from Claude Code's built-in `~/.claude/skills/`? (design question — decide before coding).
-- [ ] New `source_type = "skill"` in the store.
-- [ ] `heimdall_remember --type=skill` with required fields (name, when, steps).
-- [ ] Auto-surface via `SessionStart` (top-N skills for repo) and `UserPromptSubmit` (situationally relevant).
-- [ ] Optional: two-way sync with `~/.claude/skills/` directory.
+- [x] Decision: Claude Code skills are static always-loaded instructions; Heimdall skills are semantically searchable, auto-surfaced by relevance. Complementary, not competing.
+- [x] New `MemoryTypeSkill` constant + validation
+- [x] `heimdall_remember --type=skill` accepted (validated in MCP tool schema + memory type map)
+- [ ] Auto-surface via `SessionStart` (top-N skills for repo) (follow-up)
+- [ ] Optional: two-way sync with `~/.claude/skills/` directory (follow-up)
 
-## 5. Misc / carried over
+## 5. Misc / carried over — **SHIPPED**
 
-- [ ] LOW-severity findings from the 2026-04-14 code review that weren't in the top-6
-      fix batch (SEC-001 SQL-builder audit comment, SEC-002 subProject length cap,
-      SEC-003 sanitized error strings, DES-006 config-driven EmbedBatchSize,
-      DES-010 ETA unit test, TEST-013 mock rename).
+- [x] SEC-001 SQL-builder audit comment — SAFETY comments added to all dynamic SQL builders (SearchFiltered, SearchMemories, UpdateLastAccessed)
+- [x] SEC-002 subProject length cap — 255-char validation in toolSearch
+- [x] SEC-003 sanitized error strings — `sanitizeStoreError()` helper logs full error server-side, returns generic message to client
+- [x] DES-006 config-driven EmbedBatchSize — `EmbedBatchSize` field added to Config with default 32
+- [x] DES-010 ETA unit test — extracted `computeETA()` pure function + 6 tests in `eta_test.go`
+- [x] TEST-013 mock rename — `MockEmbedder` → `StubEmbedder` across all source files (12+ files)

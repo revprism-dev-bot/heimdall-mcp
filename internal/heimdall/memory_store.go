@@ -90,7 +90,8 @@ func (s *MemoryStore) SearchMemories(query []float32, topK int, filters MemoryFi
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Push indexed filters to SQL WHERE to reduce scan set
+	// SAFETY: All filter values are passed as parameterized arguments (?),
+	// never interpolated into the SQL string.
 	sqlQuery := `SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash FROM memories`
 	var conditions []string
 	var args []any

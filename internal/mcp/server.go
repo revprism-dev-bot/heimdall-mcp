@@ -198,6 +198,15 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 						"type":        "object",
 						"description": "Filter by metadata key-value pairs (e.g. {\"status\": \"in_progress\"})",
 					},
+					"detail": map[string]any{
+						"type":        "string",
+						"description": "Detail level: summary (one-line), snippet (200 chars), full (default). Use summary for token-efficient browsing, then heimdall_expand for full content.",
+						"enum":        []string{"summary", "snippet", "full"},
+					},
+					"scope": map[string]any{
+						"type":        "string",
+						"description": "Path prefix to scope results (e.g. \"internal/heimdall\" returns only chunks under that directory)",
+					},
 				},
 				"required": []string{"query"},
 			},
@@ -296,8 +305,8 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 					},
 					"type": map[string]any{
 						"type":        "string",
-						"enum":        []string{"preference", "decision", "fact", "context"},
-						"description": "Memory type (default: fact)",
+						"enum":        []string{"preference", "decision", "fact", "context", "skill"},
+						"description": "Memory type. Use 'skill' for reusable procedures (name, when-to-use, steps). Default: fact.",
 						"default":     "fact",
 					},
 					"project": map[string]any{
@@ -383,6 +392,41 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 			},
 		},
 		{
+			Name:        "heimdall_expand",
+			Description: "Expand a chunk by ID to get its full content. Use after searching with detail=summary or detail=snippet to drill down into a specific result.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"chunk_id": map[string]any{
+						"type":        "string",
+						"description": "The chunk ID from a search result (chunkId field)",
+					},
+					"project": map[string]any{
+						"type":        "string",
+						"description": "Project name or path (optional — auto-detected from CWD or registry)",
+					},
+				},
+				"required": []string{"chunk_id"},
+			},
+		},
+		{
+			Name:        "heimdall_ls",
+			Description: "List the context path hierarchy — filesystem-style navigation of indexed content. Shows directories and chunk counts at each level. Use to explore what's indexed before searching.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path": map[string]any{
+						"type":        "string",
+						"description": "Context path prefix to list (empty = root). Example: \"internal\" shows children of internal/.",
+					},
+					"project": map[string]any{
+						"type":        "string",
+						"description": "Project name or path (optional)",
+					},
+				},
+			},
+		},
+		{
 			Name:        "heimdall_configure",
 			Description: "Get or set Heimdall configuration. Use action \"get\" to read the full config or a specific key, and \"set\" to update a key and persist to disk. Supported keys: git.enabled, git.depth, git.include_diffs, git.branches, stale_timeout_minutes, lifecycle.active_days, lifecycle.archive_days, max_chunks_per_project.",
 			InputSchema: map[string]any{
@@ -465,6 +509,10 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 		result = s.toolIngestSession(params.Arguments)
 	case "heimdall_explain":
 		result = s.toolExplain(params.Arguments)
+	case "heimdall_expand":
+		result = s.toolExpand(params.Arguments)
+	case "heimdall_ls":
+		result = s.toolLs(params.Arguments)
 	case "heimdall_configure":
 		result = s.toolConfigure(params.Arguments)
 	case "heimdall_manage_paths":
@@ -553,7 +601,7 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
-		return ErrResult("store error: " + err.Error())
+		return sanitizeStoreError("store", err)
 	}
 	defer store.Close()
 
@@ -846,7 +894,7 @@ func (s *Server) toolExplain(args json.RawMessage) MCPToolResult {
 
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
-		return ErrResult("store error: " + err.Error())
+		return sanitizeStoreError("store", err)
 	}
 	defer store.Close()
 

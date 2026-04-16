@@ -52,9 +52,9 @@ func (e *OllamaEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 	return all, nil
 }
 
-// MockEmbedder returns fixed embeddings for testing.
+// StubEmbedder returns fixed embeddings for testing.
 // Map keys are the input text; if not found, returns a zero vector.
-type MockEmbedder struct {
+type StubEmbedder struct {
 	Vectors        map[string][]float32
 	Dimension      int
 	CallCount      int
@@ -62,7 +62,7 @@ type MockEmbedder struct {
 }
 
 // Embed returns a stored vector for the text, or a zero vector if not found.
-func (m *MockEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
+func (m *StubEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
 	m.CallCount++
 	if v, ok := m.Vectors[text]; ok {
 		return v, nil
@@ -71,7 +71,7 @@ func (m *MockEmbedder) Embed(_ context.Context, text string) ([]float32, error) 
 }
 
 // EmbedBatch generates embeddings for multiple texts by calling Embed in a loop.
-func (m *MockEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+func (m *StubEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	m.BatchCallCount++
 	results := make([][]float32, 0, len(texts))
 	for _, text := range texts {

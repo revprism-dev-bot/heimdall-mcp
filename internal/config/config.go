@@ -24,6 +24,7 @@ type Config struct {
 	LifecycleActiveDays  int      `json:"lifecycleActiveDays"`
 	LifecycleArchiveDays int      `json:"lifecycleArchiveDays"`
 	MaxChunksPerProject  int      `json:"maxChunksPerProject"`
+	EmbedBatchSize       int      `json:"embedBatchSize"`
 	IndexedPaths         []string `json:"indexedPaths"`
 }
 
@@ -43,6 +44,7 @@ func DefaultConfig() Config {
 		LifecycleActiveDays:  30,
 		LifecycleArchiveDays: 90,
 		MaxChunksPerProject:  10000,
+		EmbedBatchSize:       32,
 		IndexedPaths:         []string{},
 	}
 }
@@ -97,6 +99,9 @@ func LoadConfig() Config {
 	}
 	if cfg.MaxChunksPerProject == 0 {
 		cfg.MaxChunksPerProject = defaults.MaxChunksPerProject
+	}
+	if cfg.EmbedBatchSize == 0 {
+		cfg.EmbedBatchSize = defaults.EmbedBatchSize
 	}
 
 	return cfg

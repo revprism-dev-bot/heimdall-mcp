@@ -17,6 +17,29 @@ import (
 	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
 
+// computeETA returns a human-readable ETA string given indexing progress.
+func computeETA(chunksSoFar, filesCurrent, filesTotal int, elapsed time.Duration) string {
+	if chunksSoFar <= 0 || filesCurrent <= 0 || filesTotal <= 0 {
+		return ""
+	}
+	elapsedSecs := elapsed.Seconds()
+	if elapsedSecs <= 0 {
+		return ""
+	}
+	chunksPerSec := float64(chunksSoFar) / elapsedSecs
+	if chunksPerSec <= 0 {
+		return ""
+	}
+	remainingFiles := filesTotal - filesCurrent
+	if remainingFiles <= 0 {
+		return ""
+	}
+	avgChunksPerFile := float64(chunksSoFar) / float64(filesCurrent)
+	remainingChunks := float64(remainingFiles) * avgChunksPerFile
+	remainingSecs := remainingChunks / chunksPerSec
+	return fmt.Sprintf(" | ETA: %s", (time.Duration(remainingSecs) * time.Second).Round(time.Second))
+}
+
 // buildVersion returns a short version string suitable for `--version` output.
 // Reads the module version and vcs.revision from the Go build info so local
 // `go build` and `go install` both produce something meaningful without needing
@@ -230,6 +253,11 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string) {
 	if len(selectedModels) > 1 {
 		fmt.Printf("\nDone. %d indexes created.\n", len(selectedModels))
 	}
+
+	// OQ-2 follow-up: hint about install-hooks if not already installed.
+	if !hooksDetected(envMap()) {
+		fmt.Fprintln(os.Stderr, "Tip: run `heimdall-mcp install-hooks` to have Claude Code use heimdall automatically.")
+	}
 }
 
 func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.OllamaClient, absPath, baseDir, modelName string) {
@@ -287,21 +315,7 @@ func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.Oll
 		now := time.Now()
 		if now.Sub(lastPrint) > 500*time.Millisecond || p.Current == p.Total {
 			elapsed := now.Sub(startTime).Round(time.Second)
-			eta := ""
-			if p.ChunksSoFar > 0 && p.Current > 0 && p.Total > 0 {
-				// ETA based on chunks processed — accounts for embedding time
-				elapsedSecs := now.Sub(startTime).Seconds()
-				if elapsedSecs > 0 {
-					chunksPerSec := float64(p.ChunksSoFar) / elapsedSecs
-					if chunksPerSec > 0 {
-						remainingFiles := p.Total - p.Current
-						avgChunksPerFile := float64(p.ChunksSoFar) / float64(p.Current)
-						remainingChunks := float64(remainingFiles) * avgChunksPerFile
-						remainingSecs := remainingChunks / chunksPerSec
-						eta = fmt.Sprintf(" | ETA: %s", (time.Duration(remainingSecs) * time.Second).Round(time.Second))
-					}
-				}
-			}
+			eta := computeETA(p.ChunksSoFar, p.Current, p.Total, now.Sub(startTime))
 			pct := ""
 			if p.BytesTotal > 0 {
 				pct = fmt.Sprintf(" %d%%", p.BytesDone*100/p.BytesTotal)
