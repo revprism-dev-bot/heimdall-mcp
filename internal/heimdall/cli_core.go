@@ -15,6 +15,11 @@ type RecallParams struct {
 	Tags    []string
 	Project string
 	Limit   int
+	// Scope is an optional prefix filter on Memory.ContextPath. When set,
+	// only memories whose ContextPath starts with this prefix are returned.
+	// Used by retrieval hooks to narrow context when the CWD is a subpath
+	// of the repo root.
+	Scope string
 }
 
 // RecallHit is a single result from a memory recall, shaped to match the
@@ -53,8 +58,9 @@ func RunRecall(ctx context.Context, p RecallParams, embedder Embedder, store *Me
 	}
 
 	filters := MemoryFilter{
-		Tags:    p.Tags,
-		Project: p.Project,
+		Tags:        p.Tags,
+		Project:     p.Project,
+		ContextPath: p.Scope,
 	}
 	if p.Type != "" {
 		filters.Type = MemoryType(p.Type)

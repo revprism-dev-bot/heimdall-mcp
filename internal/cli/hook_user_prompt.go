@@ -131,25 +131,33 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	// --- read prompt + project root from stdin JSON -------------------------
 	prompt, stdinProject := readUserPromptStdin(stdin, promptFlag)
 
-	projectRoot := ""
+	rawCWD := ""
 	if projectFlag != "" {
 		if abs, err := filepath.Abs(projectFlag); err == nil {
-			projectRoot = abs
+			rawCWD = abs
 		} else {
-			projectRoot = projectFlag
+			rawCWD = projectFlag
 		}
 	} else if stdinProject != "" {
-		projectRoot = stdinProject
+		rawCWD = stdinProject
 	} else if cwd, err := os.Getwd(); err == nil {
-		projectRoot = cwd
+		rawCWD = cwd
 	}
-	if projectRoot == "" {
+	if rawCWD == "" {
 		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
 			"stage":  "resolve_root",
 			"reason": "no cwd resolvable",
 		})
 		return 0
 	}
+	// When CWD is a subpath of a repo, use the repo root for store lookup
+	// and pass the subpath as a scope filter on code search. When
+	// CWD == repoRoot or is outside any repo, scope stays empty.
+	projectRoot := rawCWD
+	if root := findRepoRoot(rawCWD); root != "" {
+		projectRoot = root
+	}
+	scope := computeScope(rawCWD, projectRoot)
 
 	// --- skip heuristic: trivial prompt ------------------------------------
 	trimmed := strings.TrimSpace(prompt)
@@ -228,7 +236,13 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	}
 
 	// --- cache lookup -------------------------------------------------------
-	cacheKey := userPromptCacheKey(trimmed, store.GetIndexVersion(), projectRoot)
+	// Fold scope into the cache key so subpath queries don't collide with
+	// repo-root queries (they'd return different result sets otherwise).
+	cacheScope := projectRoot
+	if scope != "" {
+		cacheScope = projectRoot + "::" + scope
+	}
+	cacheKey := userPromptCacheKey(trimmed, store.GetIndexVersion(), cacheScope)
 	if cached, cerr := store.HookCacheGet(cacheKey, userPromptCacheTTL); cerr == nil {
 		_, _ = stdout.Write(cached)
 		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
@@ -265,7 +279,11 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	}
 
 	// --- search -------------------------------------------------------------
-	results := store.SearchFiltered(ctx, queryVec, 5, "", "", nil)
+	var searchOpts []heimdall.SearchOption
+	if scope != "" {
+		searchOpts = append(searchOpts, heimdall.WithScope(scope))
+	}
+	results := store.SearchFiltered(ctx, queryVec, 5, "", "", nil, searchOpts...)
 
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		heimdall.LogHookEvent("WARN", "user-prompt", map[string]any{
@@ -311,6 +329,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 		"skills": len(skillBullets),
 		"bytes":  len(body),
 		"model":  resolvedModel,
+		"scope":  scope,
 	})
 	return 0
 }

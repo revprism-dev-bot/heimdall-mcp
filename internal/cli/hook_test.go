@@ -666,3 +666,132 @@ func TestHookSessionStart_RaceFree(t *testing.T) {
 
 // Compile-time guard — make sure the deps zero value is usable.
 var _ HookSessionStartDeps = HookSessionStartDeps{}
+
+// ---------------------------------------------------------------------------
+// Scope tests (Feature 1: hook scope filtering by CWD subpath)
+//
+// SessionStart uses RunRecall, which takes MemoryFilter.ContextPath.
+// When Claude Code's CWD is a subpath of a repo, only memories whose
+// ContextPath matches should be recalled.
+// ---------------------------------------------------------------------------
+
+// seedMemoriesWithContextPaths inserts named memories with specific
+// ContextPath values so scope filtering can be asserted.
+func seedMemoriesWithContextPaths(t *testing.T, vec []float32, items map[string]string) *heimdall.MemoryStore {
+	t.Helper()
+	dir := t.TempDir()
+	store, err := heimdall.OpenMemoryStore(filepath.Join(dir, "memories.db"))
+	if err != nil {
+		t.Fatalf("open mem: %v", err)
+	}
+	now := time.Now().Unix()
+	for id, cp := range items {
+		if err := store.UpsertMemory(heimdall.Memory{
+			ID:          id,
+			Content:     id + " content",
+			Type:        heimdall.MemoryTypeFact,
+			Vector:      vec,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+			Source:      heimdall.MemorySourceExplicit,
+			ContentHash: heimdall.ContentHash(id + " content"),
+			ContextPath: cp,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	t.Cleanup(func() { store.Close() })
+	return store
+}
+
+func TestHookSessionStart_CWDSubpath_NarrowsRecallScope(t *testing.T) {
+	const model = "test-model"
+	const dim = 3
+	fake := newFakeOllama(t, model, dim)
+	cfg := config.Config{OllamaEndpoint: fake.server.URL, Model: model}
+
+	projectRoot := t.TempDir()
+	seedVectorStore(t, projectRoot, model, dim, time.Now().Unix())
+	// Create a real subdir so the helpers resolve absolute paths consistently.
+	subdir := filepath.Join(projectRoot, "internal", "cli")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+
+	// One memory under the subpath, one under a sibling. With scope active,
+	// only "cli-mem" should be recalled.
+	mem := seedMemoriesWithContextPaths(t, fake.embedVec, map[string]string{
+		"cli-mem": "internal/cli",
+		"api-mem": "internal/api",
+	})
+
+	stdout, _, code := runHookSessionStart(t, runOpts{
+		stdin:       fmt.Sprintf(`{"cwd":%q}`, subdir),
+		cfg:         cfg,
+		memoryStore: mem,
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	// Must include the cli-mem bullet, must NOT include the api-mem bullet.
+	if !strings.Contains(stdout, "cli-mem content") {
+		t.Errorf("expected in-scope memory, got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "api-mem content") {
+		t.Errorf("out-of-scope memory leaked through:\n%s", stdout)
+	}
+}
+
+func TestHookSessionStart_CWDAtRepoRoot_NoScope(t *testing.T) {
+	const model = "test-model"
+	const dim = 3
+	fake := newFakeOllama(t, model, dim)
+	cfg := config.Config{OllamaEndpoint: fake.server.URL, Model: model}
+
+	projectRoot := t.TempDir()
+	seedVectorStore(t, projectRoot, model, dim, time.Now().Unix())
+
+	// Two memories with different scopes; with no scope filter both should
+	// surface (subject to top-K=5).
+	mem := seedMemoriesWithContextPaths(t, fake.embedVec, map[string]string{
+		"cli-mem": "internal/cli",
+		"api-mem": "internal/api",
+	})
+
+	stdout, _, code := runHookSessionStart(t, runOpts{
+		stdin:       fmt.Sprintf(`{"cwd":%q}`, projectRoot),
+		cfg:         cfg,
+		memoryStore: mem,
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if !strings.Contains(stdout, "cli-mem content") || !strings.Contains(stdout, "api-mem content") {
+		t.Errorf("expected both memories (no scope), got:\n%s", stdout)
+	}
+}
+
+func TestHookSessionStart_CWDOutsideRepo_NoCrashNoScope(t *testing.T) {
+	// A cwd that doesn't resolve to any indexed repo. findRepoRoot may
+	// either return "" (no ancestor marker) or a genuine ancestor that has
+	// one — either way, computeScope relative to projectRoot cannot produce
+	// a scope that narrows the recall. The hook must exit 0 without panic.
+	const model = "test-model"
+	fake := newFakeOllama(t, model, 3)
+	cfg := config.Config{OllamaEndpoint: fake.server.URL, Model: model}
+
+	// An isolated temp dir with no index (no .heimdall_db) — the "no usable
+	// index" branch fires, which writes empty or "no index yet" output but
+	// MUST NOT panic due to scope handling.
+	outsideCWD := t.TempDir()
+	mem := seedMemories(t, 0, []float32{1, 0, 0})
+
+	_, _, code := runHookSessionStart(t, runOpts{
+		stdin:       fmt.Sprintf(`{"cwd":%q}`, outsideCWD),
+		cfg:         cfg,
+		memoryStore: mem,
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d (expected 0 — OQ-5)", code)
+	}
+}

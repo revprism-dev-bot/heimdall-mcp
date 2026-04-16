@@ -4,11 +4,37 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
+
+// deriveMemoryContextPath returns the Memory.ContextPath to persist for a
+// heimdall_remember call. Priority:
+//  1. explicit input.ContextPath (whitespace-trimmed, leading "./" stripped)
+//  2. auto-detect from cwd: if cwd is inside an indexed project (findable
+//     via heimdall.FindRepoRoot), use ComputeScope(cwd, root).
+//  3. empty string — memory is stored project-global.
+//
+// Extracted as a pure function so the server-side tests can exercise
+// resolution without touching embedding or store layers.
+func deriveMemoryContextPath(explicit, cwd string) string {
+	explicit = strings.TrimSpace(explicit)
+	if explicit != "" {
+		explicit = strings.TrimPrefix(explicit, "./")
+		return explicit
+	}
+	if cwd == "" {
+		return ""
+	}
+	root := heimdall.FindRepoRoot(cwd)
+	if root == "" {
+		return ""
+	}
+	return heimdall.ComputeScope(cwd, root)
+}
 
 func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 	var input rememberInput
@@ -26,6 +52,13 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 
 	// Sanitize: strip null bytes
 	input.Content = strings.ReplaceAll(input.Content, "\x00", "")
+
+	// Auto-detect context_path: explicit input wins; otherwise derive from
+	// the MCP server's CWD (the project Claude Code is running in) relative
+	// to the nearest repo root. Enables later scope= filtering of memories
+	// the same way code chunks are filtered.
+	cwd, _ := os.Getwd()
+	contextPath := deriveMemoryContextPath(input.ContextPath, cwd)
 
 	// Validate memory type
 	memType := heimdall.MemoryTypeFact
@@ -49,10 +82,17 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 		return ErrResult("memory lookup error: " + err.Error())
 	}
 	if existing != nil {
-		// Update existing: merge tags, update type and timestamp
+		// Update existing: merge tags, update type and timestamp. Preserve
+		// the existing ContextPath unless the caller explicitly overrode it
+		// (auto-detect only fills blanks — never overwrites).
 		existing.Tags = heimdall.MergeTags(existing.Tags, input.Tags)
 		existing.Type = memType
 		existing.UpdatedAt = time.Now().Unix()
+		if strings.TrimSpace(input.ContextPath) != "" {
+			existing.ContextPath = contextPath
+		} else if existing.ContextPath == "" && contextPath != "" {
+			existing.ContextPath = contextPath
+		}
 		if err := s.MemoryStore.UpsertMemory(*existing); err != nil {
 			return ErrResult("memory update error: " + err.Error())
 		}
@@ -94,6 +134,12 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 		similar.Type = memType
 		similar.Source = heimdall.MemorySourceExplicit
 		similar.UpdatedAt = time.Now().Unix()
+		// Preserve existing ContextPath; fill if empty. Explicit overrides.
+		if strings.TrimSpace(input.ContextPath) != "" {
+			similar.ContextPath = contextPath
+		} else if similar.ContextPath == "" && contextPath != "" {
+			similar.ContextPath = contextPath
+		}
 		if err := s.MemoryStore.UpsertMemory(*similar); err != nil {
 			return ErrResult("memory update error: " + err.Error())
 		}
@@ -115,6 +161,7 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 		Type:        memType,
 		Tags:        input.Tags,
 		Project:     input.Project,
+		ContextPath: contextPath,
 		Vector:      vec,
 		CreatedAt:   now,
 		UpdatedAt:   now,
@@ -164,6 +211,7 @@ func (s *Server) toolRecall(args json.RawMessage) MCPToolResult {
 		Tags:    input.Tags,
 		Project: input.Project,
 		Limit:   input.Limit,
+		Scope:   input.Scope,
 	}, embedder, s.MemoryStore)
 	if err != nil {
 		return ErrResult(err.Error())

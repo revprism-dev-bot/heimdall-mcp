@@ -35,6 +35,7 @@ type Memory struct {
 	Type        MemoryType   `json:"type"`
 	Tags        []string     `json:"tags,omitempty"`
 	Project     string       `json:"project,omitempty"`
+	ContextPath string       `json:"contextPath,omitempty"` // slash-separated subpath within Project; used for scope filtering
 	Vector      []float32    `json:"-"`
 	CreatedAt   int64        `json:"createdAt"`
 	UpdatedAt   int64        `json:"updatedAt"`
@@ -50,10 +51,11 @@ type MemorySearchResult struct {
 
 // MemoryFilter holds optional filters for memory search.
 type MemoryFilter struct {
-	Type    MemoryType
-	Tags    []string
-	Project string
-	Source  MemorySource
+	Type        MemoryType
+	Tags        []string
+	Project     string
+	Source      MemorySource
+	ContextPath string // prefix filter on Memory.ContextPath; empty disables the filter
 }
 
 // MemoryStoreStats holds memory-specific index statistics.

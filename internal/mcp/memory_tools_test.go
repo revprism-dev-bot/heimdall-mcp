@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -176,6 +177,203 @@ func TestToolIngestSession_NilMemoryStore(t *testing.T) {
 	result := s.toolIngestSession(args)
 	if !result.IsError {
 		t.Error("expected error for nil memory store")
+	}
+}
+
+// --- context_path auto-detection tests (Feature 2) --------------------------
+
+func TestDeriveMemoryContextPath_ExplicitWins(t *testing.T) {
+	if got := deriveMemoryContextPath("internal/cli", "/tmp/nowhere"); got != "internal/cli" {
+		t.Errorf("explicit: got %q", got)
+	}
+	if got := deriveMemoryContextPath("./internal/cli", "/tmp/nowhere"); got != "internal/cli" {
+		t.Errorf("leading ./ not trimmed: %q", got)
+	}
+	if got := deriveMemoryContextPath("  internal/api  ", ""); got != "internal/api" {
+		t.Errorf("trim: got %q", got)
+	}
+}
+
+func TestDeriveMemoryContextPath_AutoDetectSubpath(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".heimdall_db"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	sub := filepath.Join(root, "internal", "cli")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	if got := deriveMemoryContextPath("", sub); got != "internal/cli" {
+		t.Errorf("auto-detect: got %q, want internal/cli", got)
+	}
+}
+
+func TestDeriveMemoryContextPath_CwdEqualsRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".heimdall_db"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if got := deriveMemoryContextPath("", root); got != "" {
+		t.Errorf("root cwd: got %q, want empty", got)
+	}
+}
+
+func TestDeriveMemoryContextPath_EmptyCwd(t *testing.T) {
+	if got := deriveMemoryContextPath("", ""); got != "" {
+		t.Errorf("empty/empty: got %q, want empty", got)
+	}
+}
+
+// Integration: toolRemember tier-1 update path persists explicit context_path
+// without needing Ollama (tier-1 short-circuits before the embed call).
+func TestToolRemember_SetsContextPathOnUpdate(t *testing.T) {
+	s := testServerWithMemory(t)
+
+	content := "test context path memory"
+	hash := heimdall.ContentHash(content)
+	if err := s.MemoryStore.UpsertMemory(heimdall.Memory{
+		ID: "mem:seed:" + hash, Content: content, Type: heimdall.MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: 1, UpdatedAt: 1,
+		Source: heimdall.MemorySourceExplicit, ContentHash: hash,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	args, _ := json.Marshal(map[string]any{
+		"content":      content,
+		"context_path": "internal/cli",
+	})
+	result := s.toolRemember(args)
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content[0].Text)
+	}
+
+	got, err := s.MemoryStore.GetMemoryByHash(hash)
+	if err != nil || got == nil {
+		t.Fatalf("GetMemoryByHash: got=%v err=%v", got, err)
+	}
+	if got.ContextPath != "internal/cli" {
+		t.Errorf("ContextPath = %q, want internal/cli", got.ContextPath)
+	}
+}
+
+// Auto-detect from CWD on tier-1 update path.
+func TestToolRemember_AutoDetectsContextPathFromCWD(t *testing.T) {
+	s := testServerWithMemory(t)
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".heimdall_db"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	sub := filepath.Join(root, "internal", "cli")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	old, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	if err := os.Chdir(sub); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	content := "auto-detect test"
+	hash := heimdall.ContentHash(content)
+	if err := s.MemoryStore.UpsertMemory(heimdall.Memory{
+		ID: "mem:seed:" + hash, Content: content, Type: heimdall.MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: 1, UpdatedAt: 1,
+		Source: heimdall.MemorySourceExplicit, ContentHash: hash,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	args, _ := json.Marshal(map[string]any{"content": content})
+	result := s.toolRemember(args)
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content[0].Text)
+	}
+
+	got, err := s.MemoryStore.GetMemoryByHash(hash)
+	if err != nil || got == nil {
+		t.Fatalf("GetMemoryByHash: %v", err)
+	}
+	if got.ContextPath != "internal/cli" {
+		t.Errorf("ContextPath = %q, want internal/cli", got.ContextPath)
+	}
+}
+
+// Auto-detect must NOT clobber an existing ContextPath when caller omitted one.
+func TestToolRemember_PreservesExistingContextPath(t *testing.T) {
+	s := testServerWithMemory(t)
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".heimdall_db"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	sub := filepath.Join(root, "other", "place")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	old, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	if err := os.Chdir(sub); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	content := "preserve existing"
+	hash := heimdall.ContentHash(content)
+	if err := s.MemoryStore.UpsertMemory(heimdall.Memory{
+		ID: "mem:seed:" + hash, Content: content, Type: heimdall.MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: 1, UpdatedAt: 1,
+		Source: heimdall.MemorySourceExplicit, ContentHash: hash,
+		ContextPath: "internal/original",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	args, _ := json.Marshal(map[string]any{"content": content})
+	result := s.toolRemember(args)
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content[0].Text)
+	}
+
+	got, err := s.MemoryStore.GetMemoryByHash(hash)
+	if err != nil || got == nil {
+		t.Fatalf("GetMemoryByHash: %v", err)
+	}
+	if got.ContextPath != "internal/original" {
+		t.Errorf("ContextPath = %q, want internal/original (preserved)", got.ContextPath)
+	}
+}
+
+// Explicit input overrides an existing ContextPath (user opts into changing).
+func TestToolRemember_ExplicitOverridesExisting(t *testing.T) {
+	s := testServerWithMemory(t)
+
+	content := "override existing"
+	hash := heimdall.ContentHash(content)
+	if err := s.MemoryStore.UpsertMemory(heimdall.Memory{
+		ID: "mem:seed:" + hash, Content: content, Type: heimdall.MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: 1, UpdatedAt: 1,
+		Source: heimdall.MemorySourceExplicit, ContentHash: hash,
+		ContextPath: "old/scope",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	args, _ := json.Marshal(map[string]any{
+		"content":      content,
+		"context_path": "new/scope",
+	})
+	result := s.toolRemember(args)
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content[0].Text)
+	}
+
+	got, err := s.MemoryStore.GetMemoryByHash(hash)
+	if err != nil || got == nil {
+		t.Fatalf("GetMemoryByHash: %v", err)
+	}
+	if got.ContextPath != "new/scope" {
+		t.Errorf("ContextPath = %q, want new/scope (explicit override)", got.ContextPath)
 	}
 }
 

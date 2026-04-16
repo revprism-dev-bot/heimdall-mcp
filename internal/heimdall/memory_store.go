@@ -58,6 +58,13 @@ func OpenMemoryStore(dbPath string) (*MemoryStore, error) {
 		return nil, err
 	}
 
+	// Migrate: add context_path column for scoped recall (mirrors the
+	// entries.context_path column used for code-search scope filtering).
+	// On fresh DBs ALTER is a no-op due to the preceding CREATE; required
+	// on upgrades from pre-feature DBs.
+	db.Exec(`ALTER TABLE memories ADD COLUMN context_path TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_memories_context_path ON memories(context_path)`)
+
 	return &MemoryStore{db: db}, nil
 }
 
@@ -78,9 +85,9 @@ func (s *MemoryStore) UpsertMemory(m Memory) error {
 	vecBlob := EncodeFloat32Vec(m.Vector)
 
 	_, err := s.db.Exec(`
-		INSERT OR REPLACE INTO memories (id, content, type, tags, project, vector, created_at, updated_at, source, content_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, m.ID, m.Content, string(m.Type), string(tagsJSON), m.Project, vecBlob, m.CreatedAt, m.UpdatedAt, string(m.Source), m.ContentHash)
+		INSERT OR REPLACE INTO memories (id, content, type, tags, project, vector, created_at, updated_at, source, content_hash, context_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, m.ID, m.Content, string(m.Type), string(tagsJSON), m.Project, vecBlob, m.CreatedAt, m.UpdatedAt, string(m.Source), m.ContentHash, m.ContextPath)
 	return err
 }
 
@@ -92,7 +99,7 @@ func (s *MemoryStore) SearchMemories(query []float32, topK int, filters MemoryFi
 
 	// SAFETY: All filter values are passed as parameterized arguments (?),
 	// never interpolated into the SQL string.
-	sqlQuery := `SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash FROM memories`
+	sqlQuery := `SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash, context_path FROM memories`
 	var conditions []string
 	var args []any
 	if filters.Type != "" {
@@ -106,6 +113,12 @@ func (s *MemoryStore) SearchMemories(query []float32, topK int, filters MemoryFi
 	if filters.Source != "" {
 		conditions = append(conditions, `source = ?`)
 		args = append(args, string(filters.Source))
+	}
+	if filters.ContextPath != "" {
+		// Prefix filter so "internal/cli" matches both "internal/cli" and
+		// "internal/cli/hooks" but not "internal/api".
+		conditions = append(conditions, `context_path LIKE ? || '%'`)
+		args = append(args, filters.ContextPath)
 	}
 	if len(conditions) > 0 {
 		sqlQuery += ` WHERE ` + strings.Join(conditions, ` AND `)
@@ -152,7 +165,7 @@ func (s *MemoryStore) FindSimilarMemory(vector []float32, threshold float64) (*M
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query(`SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash FROM memories`)
+	rows, err := s.db.Query(`SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash, context_path FROM memories`)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -197,14 +210,14 @@ func (s *MemoryStore) GetMemoryByHash(hash string) (*Memory, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	row := s.db.QueryRow(`SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash FROM memories WHERE content_hash = ?`, hash)
+	row := s.db.QueryRow(`SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash, context_path FROM memories WHERE content_hash = ?`, hash)
 
 	var m Memory
 	var tagsJSON string
 	var vecBlob []byte
 	var memType, source string
 
-	err := row.Scan(&m.ID, &m.Content, &memType, &tagsJSON, &m.Project, &vecBlob, &m.CreatedAt, &m.UpdatedAt, &source, &m.ContentHash)
+	err := row.Scan(&m.ID, &m.Content, &memType, &tagsJSON, &m.Project, &vecBlob, &m.CreatedAt, &m.UpdatedAt, &source, &m.ContentHash, &m.ContextPath)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -228,14 +241,14 @@ func (s *MemoryStore) GetMemoryByID(id string) (*Memory, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	row := s.db.QueryRow(`SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash FROM memories WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT id, content, type, tags, project, vector, created_at, updated_at, source, content_hash, context_path FROM memories WHERE id = ?`, id)
 
 	var m Memory
 	var tagsJSON string
 	var vecBlob []byte
 	var memType, source string
 
-	err := row.Scan(&m.ID, &m.Content, &memType, &tagsJSON, &m.Project, &vecBlob, &m.CreatedAt, &m.UpdatedAt, &source, &m.ContentHash)
+	err := row.Scan(&m.ID, &m.Content, &memType, &tagsJSON, &m.Project, &vecBlob, &m.CreatedAt, &m.UpdatedAt, &source, &m.ContentHash, &m.ContextPath)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -346,13 +359,17 @@ func (s *MemoryStore) MemoryCount() int {
 }
 
 // scanMemory scans a single memory row from a *sql.Rows.
+// Expects the trailing column order:
+//
+//	id, content, type, tags, project, vector, created_at, updated_at,
+//	source, content_hash, context_path
 func scanMemory(rows *sql.Rows) (Memory, error) {
 	var m Memory
 	var tagsJSON string
 	var vecBlob []byte
 	var memType, source string
 
-	err := rows.Scan(&m.ID, &m.Content, &memType, &tagsJSON, &m.Project, &vecBlob, &m.CreatedAt, &m.UpdatedAt, &source, &m.ContentHash)
+	err := rows.Scan(&m.ID, &m.Content, &memType, &tagsJSON, &m.Project, &vecBlob, &m.CreatedAt, &m.UpdatedAt, &source, &m.ContentHash, &m.ContextPath)
 	if err != nil {
 		return m, err
 	}

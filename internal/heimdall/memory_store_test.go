@@ -374,3 +374,108 @@ func TestLoadAllMemoryVectors(t *testing.T) {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
 }
+
+// --- context_path tests (Feature: memory scope filtering) -------------------
+
+func TestUpsertMemory_PersistsContextPath(t *testing.T) {
+	store := testMemoryStore(t)
+	now := time.Now().Unix()
+	m := Memory{
+		ID: "mem:cp:1", Content: "scoped", Type: MemoryTypeFact,
+		Vector:    []float32{1, 0, 0},
+		CreatedAt: now, UpdatedAt: now,
+		Source: MemorySourceExplicit, ContentHash: "hash-cp-1",
+		ContextPath: "internal/cli",
+	}
+	if err := store.UpsertMemory(m); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	got, err := store.GetMemoryByID("mem:cp:1")
+	if err != nil || got == nil {
+		t.Fatalf("GetMemoryByID: got=%v err=%v", got, err)
+	}
+	if got.ContextPath != "internal/cli" {
+		t.Errorf("ContextPath = %q, want internal/cli", got.ContextPath)
+	}
+
+	got2, err := store.GetMemoryByHash("hash-cp-1")
+	if err != nil || got2 == nil {
+		t.Fatalf("GetMemoryByHash: got=%v err=%v", got2, err)
+	}
+	if got2.ContextPath != "internal/cli" {
+		t.Errorf("ByHash ContextPath = %q, want internal/cli", got2.ContextPath)
+	}
+}
+
+func TestSearchMemories_FilterByContextPath_ExactMatch(t *testing.T) {
+	store := testMemoryStore(t)
+	now := time.Now().Unix()
+	store.UpsertMemory(Memory{
+		ID: "mem:1", Content: "cli", Type: MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: now, UpdatedAt: now,
+		Source: MemorySourceExplicit, ContentHash: "h1",
+		ContextPath: "internal/cli",
+	})
+	store.UpsertMemory(Memory{
+		ID: "mem:2", Content: "api", Type: MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: now, UpdatedAt: now,
+		Source: MemorySourceExplicit, ContentHash: "h2",
+		ContextPath: "internal/api",
+	})
+
+	results := store.SearchMemories([]float32{1, 0, 0}, 5, MemoryFilter{ContextPath: "internal/cli"})
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	if results[0].Memory.ID != "mem:1" {
+		t.Errorf("got %q, want mem:1", results[0].Memory.ID)
+	}
+}
+
+func TestSearchMemories_FilterByContextPath_PrefixMatch(t *testing.T) {
+	store := testMemoryStore(t)
+	now := time.Now().Unix()
+	store.UpsertMemory(Memory{
+		ID: "mem:1", Content: "hooks", Type: MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: now, UpdatedAt: now,
+		Source: MemorySourceExplicit, ContentHash: "h1",
+		ContextPath: "internal/cli/hooks",
+	})
+	store.UpsertMemory(Memory{
+		ID: "mem:2", Content: "sibling", Type: MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: now, UpdatedAt: now,
+		Source: MemorySourceExplicit, ContentHash: "h2",
+		ContextPath: "internal/api",
+	})
+
+	// "internal/cli" should match child "internal/cli/hooks".
+	results := store.SearchMemories([]float32{1, 0, 0}, 5, MemoryFilter{ContextPath: "internal/cli"})
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	if results[0].Memory.ID != "mem:1" {
+		t.Errorf("got %q, want mem:1", results[0].Memory.ID)
+	}
+}
+
+func TestSearchMemories_ContextPathEmpty_ReturnsAll(t *testing.T) {
+	store := testMemoryStore(t)
+	now := time.Now().Unix()
+	store.UpsertMemory(Memory{
+		ID: "mem:1", Content: "one", Type: MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: now, UpdatedAt: now,
+		Source: MemorySourceExplicit, ContentHash: "h1",
+		ContextPath: "internal/cli",
+	})
+	store.UpsertMemory(Memory{
+		ID: "mem:2", Content: "two", Type: MemoryTypeFact,
+		Vector: []float32{1, 0, 0}, CreatedAt: now, UpdatedAt: now,
+		Source: MemorySourceExplicit, ContentHash: "h2",
+	})
+
+	results := store.SearchMemories([]float32{1, 0, 0}, 5, MemoryFilter{})
+	if len(results) != 2 {
+		t.Fatalf("results = %d, want 2 (no filter)", len(results))
+	}
+}

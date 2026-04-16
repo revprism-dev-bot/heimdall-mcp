@@ -185,16 +185,27 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 		now = time.Now
 	}
 
-	// --- resolve project root -----------------------------------------------
+	// --- resolve project root + scope ---------------------------------------
+	//
+	// The stdin/flag gives us the raw CWD Claude Code is in. When that CWD
+	// is a subpath of a repo, we want the store lookup at the repo root
+	// (`.heimdall_db/` lives there) but narrowed retrieval to the subpath
+	// via MemoryFilter.ContextPath. When CWD == repoRoot or CWD is outside
+	// any repo, scope stays empty and nothing changes.
 
-	projectRoot := resolveProjectRoot(stdin, projectFlag)
-	if projectRoot == "" {
+	rawCWD := resolveProjectRoot(stdin, projectFlag)
+	if rawCWD == "" {
 		heimdall.LogHookEvent("INFO", "session-start", map[string]any{
 			"stage":  "resolve_root",
 			"reason": "no cwd resolvable",
 		})
 		return 0
 	}
+	projectRoot := rawCWD
+	if root := findRepoRoot(rawCWD); root != "" {
+		projectRoot = root
+	}
+	scope := computeScope(rawCWD, projectRoot)
 
 	// --- disable gate (§5.7) -------------------------------------------------
 
@@ -300,6 +311,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 		hits, rerr := heimdall.RunRecall(ctx, heimdall.RecallParams{
 			Query: query,
 			Limit: 5,
+			Scope: scope,
 		}, embedder, memStore)
 		if rerr != nil {
 			heimdall.LogHookEvent("WARN", "session-start", map[string]any{
@@ -348,6 +360,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 		"skills":  len(skillBullets),
 		"chunks":  status.TotalChunks,
 		"model":   resolvedModel,
+		"scope":   scope,
 	})
 	return 0
 }

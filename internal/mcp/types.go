@@ -170,10 +170,11 @@ type RelatedItem struct {
 // --- Memory tool input types ---
 
 type rememberInput struct {
-	Content string   `json:"content"`
-	Tags    []string `json:"tags"`
-	Type    string   `json:"type"`    // "preference", "decision", "fact", "context"
-	Project string   `json:"project"`
+	Content     string   `json:"content"`
+	Tags        []string `json:"tags"`
+	Type        string   `json:"type"`         // "preference", "decision", "fact", "context"
+	Project     string   `json:"project"`
+	ContextPath string   `json:"context_path"` // optional slash-separated subpath within the project; auto-derived from CWD when empty
 }
 
 type recallInput struct {
@@ -182,6 +183,7 @@ type recallInput struct {
 	Type    string   `json:"type"`
 	Limit   int      `json:"limit"`
 	Project string   `json:"project"`
+	Scope   string   `json:"scope"` // prefix filter on Memory.ContextPath
 }
 
 type ingestSessionInput struct {
