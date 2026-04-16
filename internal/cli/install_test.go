@@ -887,3 +887,107 @@ func TestHooksDetected_ProjectScope(t *testing.T) {
 		t.Errorf("hooksDetected should return true when heimdall hooks exist in project scope")
 	}
 }
+
+// ----- autoUpgradeHooks -----
+
+func TestAutoUpgrade_AddsMissingHooks(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(settingsPath), 0o755)
+
+	// Install only SessionStart — simulates an old binary that had fewer hooks.
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{
+					"source":  "heimdall",
+					"version": float64(1),
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "heimdall-mcp hook session-start --source=heimdall --version=1"},
+					},
+				},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(settings, "", "  ")
+	os.WriteFile(settingsPath, b, 0o600)
+
+	autoUpgradeHooks(env)
+
+	// Should now have all hooks from phase1aHooks template.
+	m := readJSON(t, settingsPath)
+	events := hookEvents(m)
+	for _, h := range phase1aHooks {
+		found := false
+		for _, e := range events {
+			if e == h.event {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected event %q after auto-upgrade, got events: %v", h.event, events)
+		}
+	}
+}
+
+func TestAutoUpgrade_NoopWhenComplete(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+
+	// Do a full install first.
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(config.Config{}, nil, &stdout, &stderr, env, []string{"--scope=user"})
+	if code != 0 {
+		t.Fatalf("install failed: %d", code)
+	}
+
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	before, _ := os.ReadFile(settingsPath)
+
+	autoUpgradeHooks(env)
+
+	after, _ := os.ReadFile(settingsPath)
+	if string(before) != string(after) {
+		t.Errorf("auto-upgrade should not modify a fully installed settings.json")
+	}
+}
+
+func TestAutoUpgrade_SkipsWhenNoHeimdallEntries(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(settingsPath), 0o755)
+
+	// Non-heimdall hooks — should NOT be upgraded (OQ-2: opt-in first install).
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "/usr/local/bin/other-tool"},
+					},
+				},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(settings, "", "  ")
+	os.WriteFile(settingsPath, b, 0o600)
+
+	autoUpgradeHooks(env)
+
+	m := readJSON(t, settingsPath)
+	events := hookEvents(m)
+	if len(events) != 1 || events[0] != "SessionStart" {
+		t.Errorf("auto-upgrade should not add hooks when no heimdall entries exist; got events: %v", events)
+	}
+}
+
+func TestAutoUpgrade_SkipsWhenNoSettings(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	// No settings.json — should be a no-op.
+	autoUpgradeHooks(env)
+	// No crash = pass.
+}
