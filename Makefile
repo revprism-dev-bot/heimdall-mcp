@@ -1,6 +1,6 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
-.PHONY: build install clean test test-integration test-e2e test-all
+.PHONY: build install clean test test-integration test-e2e test-all bench bench-test
 
 build:
 	go build -ldflags "-X main.version=$(VERSION)" -o heimdall-mcp ./cmd/heimdall-mcp
@@ -32,3 +32,17 @@ test-e2e:
 
 # Convenience: run unit + integration in sequence. e2e stays opt-in.
 test-all: test test-integration
+
+# Tiered-retrieval token-savings benchmark (TODO section 2 follow-up).
+# Runs the 18 built-in queries against the local .heimdall_db/ with Ollama
+# embeddings, prints a per-query + aggregate table, and reports the
+# summary-then-expand saving vs full-detail output.
+# See docs/plans/hooks/09-tiered-retrieval-benchmark.md for methodology.
+bench:
+	go run ./cmd/bench-retrieval --db=.heimdall_db/nomic-embed-text --top-k=10 --expand-rate=0.2
+
+# Smoke test for the bench harness — build-tag gated so `make test` stays
+# focused on product code. Runs the bench against a fixture index with
+# stub embeddings and asserts saving > 0% vs full.
+bench-test:
+	go test -tags=bench -race -count=1 ./cmd/bench-retrieval/

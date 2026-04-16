@@ -82,7 +82,7 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] `heimdall_search` gains `detail: summary|snippet|full` param — summary returns one-line, snippet 200 chars, full (default) unchanged
 - [x] New `heimdall_expand(chunk_id)` MCP tool — returns full content for drill-down after summary search
 - [x] `SearchResultEnriched` includes `summary` and `contextPath` fields
-- [ ] Token-savings measurement before/after (follow-up)
+- [x] Token-savings measurement before/after — done: see `docs/plans/hooks/09-tiered-retrieval-benchmark.md`. Summary-then-expand saves **62.4%** vs full-detail on 18 dogfood queries (mean tokens 884 / 1101 / 4012 for summary / snippet / full, top-k=10, expand-rate=0.2, 2546-chunk index).
 
 ## 3. Path-based context hierarchy — **SHIPPED**
 
