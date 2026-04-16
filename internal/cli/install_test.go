@@ -755,3 +755,135 @@ func TestApplyUninstall_Idempotent(t *testing.T) {
 	}
 	_ = out2
 }
+
+// ----- hooksDetected (OQ-2 first-run hint) -----
+
+func TestHooksDetected_TrueWhenInstalled(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+
+	// Install hooks into user scope.
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(config.Config{}, nil, &stdout, &stderr, env, []string{"--scope=user"})
+	if code != 0 {
+		t.Fatalf("install failed: %d %s", code, stderr.String())
+	}
+
+	if !hooksDetected(env) {
+		t.Errorf("hooksDetected should return true after install-hooks")
+	}
+}
+
+func TestHooksDetected_FalseWhenNoSettings(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+
+	if hooksDetected(env) {
+		t.Errorf("hooksDetected should return false when settings.json does not exist")
+	}
+}
+
+func TestHooksDetected_FalseWhenNoHeimdallEntries(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(settingsPath), 0o755)
+
+	// settings.json with non-heimdall hooks only.
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "/usr/local/bin/other-tool"},
+					},
+				},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(settings, "", "  ")
+	os.WriteFile(settingsPath, b, 0o600)
+
+	if hooksDetected(env) {
+		t.Errorf("hooksDetected should return false when only non-heimdall hooks exist")
+	}
+}
+
+func TestHooksDetected_FalseWhenEmptyHooksMap(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(settingsPath), 0o755)
+
+	settings := map[string]any{
+		"hooks": map[string]any{},
+	}
+	b, _ := json.MarshalIndent(settings, "", "  ")
+	os.WriteFile(settingsPath, b, 0o600)
+
+	if hooksDetected(env) {
+		t.Errorf("hooksDetected should return false when hooks map is empty")
+	}
+}
+
+func TestHooksDetected_TrueWhenOnlyCommandMarker(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(settingsPath), 0o755)
+
+	// Entry without "source":"heimdall" but with --source=heimdall in command.
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "heimdall-mcp hook session-start --source=heimdall --version=1"},
+					},
+				},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(settings, "", "  ")
+	os.WriteFile(settingsPath, b, 0o600)
+
+	if !hooksDetected(env) {
+		t.Errorf("hooksDetected should return true when command contains --source=heimdall")
+	}
+}
+
+func TestHooksDetected_ProjectScope(t *testing.T) {
+	home := t.TempDir()
+	// Create a project root with .heimdall_db so project scope resolves.
+	projectDir := filepath.Join(home, "myproject")
+	os.MkdirAll(filepath.Join(projectDir, ".heimdall_db"), 0o755)
+
+	env := map[string]string{
+		"HOME":               home,
+		"HEIMDALL_TEST_HOME": home,
+		"HEIMDALL_TEST_CWD":  projectDir,
+	}
+
+	// No user-scope settings — only project-scope settings with heimdall entries.
+	settingsPath := filepath.Join(projectDir, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(settingsPath), 0o755)
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{
+					"source":  "heimdall",
+					"version": float64(1),
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "heimdall-mcp hook session-start --source=heimdall --version=1"},
+					},
+				},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(settings, "", "  ")
+	os.WriteFile(settingsPath, b, 0o600)
+
+	if !hooksDetected(env) {
+		t.Errorf("hooksDetected should return true when heimdall hooks exist in project scope")
+	}
+}

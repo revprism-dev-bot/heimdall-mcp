@@ -30,6 +30,8 @@ type VectorRecord struct {
 	SourceType    string    `json:"sourceType"`    // "code", "ticket", "doc", "pr", etc.
 	Metadata      string    `json:"metadata"`      // JSON object string
 	Relationships string    `json:"relationships"` // JSON array string
+	Summary       string    `json:"summary"`       // one-line heuristic summary for L0 tiered retrieval
+	ContextPath   string    `json:"contextPath"`   // hierarchical path for scoped retrieval (e.g. "src/api/auth")
 	LastAccessed  int64     `json:"lastAccessed"`  // unix timestamp of last search hit
 	SubProject    string    `json:"subProject"`    // sub-repo directory name (empty = root project)
 }
@@ -38,6 +40,24 @@ type VectorRecord struct {
 type SearchResult struct {
 	Record     VectorRecord
 	Similarity float64
+}
+
+// SearchOption is a functional option for SearchFiltered.
+type SearchOption func(*searchConfig)
+
+type searchConfig struct {
+	scopePath string // context_path prefix filter (empty = no filter)
+	detail    string // "summary", "snippet", "full" (empty = "full")
+}
+
+// WithScope restricts results to entries whose context_path starts with the given prefix.
+func WithScope(path string) SearchOption {
+	return func(c *searchConfig) { c.scopePath = path }
+}
+
+// WithDetail controls the level of content returned: "summary" (one-line), "snippet" (first 200 chars), "full".
+func WithDetail(level string) SearchOption {
+	return func(c *searchConfig) { c.detail = level }
 }
 
 // StoreStats holds index statistics.
@@ -52,6 +72,13 @@ type VectorStore struct {
 	mu               sync.RWMutex
 	db               *sql.DB
 	lastLifecycleRun int64 // unix timestamp, protected by mu
+
+	// hookCacheRows tracks the current number of rows in hook_cache so that
+	// HookCachePut can decide whether to evict without running SELECT COUNT(*)
+	// on every insert. The value is loaded lazily on first HookCachePut (when
+	// it is -1) and maintained incrementally thereafter. Protected by mu.
+	// PERF-003.
+	hookCacheRows int64
 }
 
 // OpenStore loads or creates a vector store at the given directory.
@@ -96,6 +123,13 @@ func OpenStore(dbDir string) (*VectorStore, error) {
 	db.Exec(`ALTER TABLE entries ADD COLUMN relationships TEXT DEFAULT '[]'`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_source_type ON entries(source_type)`)
 
+	// Migrate: add summary column for tiered retrieval (L0 one-line summary).
+	db.Exec(`ALTER TABLE entries ADD COLUMN summary TEXT DEFAULT ''`)
+
+	// Migrate: add context_path column for path-based scoping.
+	db.Exec(`ALTER TABLE entries ADD COLUMN context_path TEXT DEFAULT ''`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_context_path ON entries(context_path)`)
+
 	// Migrate: add last_accessed column for content lifecycle tracking.
 	db.Exec(`ALTER TABLE entries ADD COLUMN last_accessed INTEGER DEFAULT 0`)
 
@@ -123,7 +157,7 @@ func OpenStore(dbDir string) (*VectorStore, error) {
 		return nil, err
 	}
 
-	return &VectorStore{db: db}, nil
+	return &VectorStore{db: db, hookCacheRows: -1}, nil
 }
 
 // SetMetadata stores a key-value pair in the store metadata table.
@@ -167,14 +201,23 @@ func (s *VectorStore) Search(ctx context.Context, query []float32, topK int) []S
 // rather than nil — the caller can still surface whatever we managed to score
 // before the deadline. A nil ctx is treated as context.Background() so this
 // stays callable from test helpers that don't care about cancellation.
-func (s *VectorStore) SearchFiltered(ctx context.Context, query []float32, topK int, sourceType string, subProject string, metadataFilter map[string]any) []SearchResult {
+func (s *VectorStore) SearchFiltered(ctx context.Context, query []float32, topK int, sourceType string, subProject string, metadataFilter map[string]any, opts ...SearchOption) []SearchResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	var cfg searchConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	sqlQuery := `SELECT id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, source_type, metadata, relationships, last_accessed, sub_project FROM entries`
+	// SAFETY: All filter values are passed as parameterized arguments (?),
+	// never interpolated into the SQL string. The dynamic WHERE clause
+	// only appends fixed column-name conditions.
+	sqlQuery := `SELECT id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, source_type, metadata, relationships, summary, context_path, last_accessed, sub_project FROM entries`
 	var conditions []string
 	var args []any
 	if sourceType != "" {
@@ -184,6 +227,10 @@ func (s *VectorStore) SearchFiltered(ctx context.Context, query []float32, topK 
 	if subProject != "" {
 		conditions = append(conditions, `sub_project = ?`)
 		args = append(args, subProject)
+	}
+	if cfg.scopePath != "" {
+		conditions = append(conditions, `context_path LIKE ? || '%'`)
+		args = append(args, cfg.scopePath)
 	}
 	if len(conditions) > 0 {
 		sqlQuery += ` WHERE ` + strings.Join(conditions, ` AND `)
@@ -202,10 +249,10 @@ func (s *VectorStore) SearchFiltered(ctx context.Context, query []float32, topK 
 		}
 		var rec VectorRecord
 		var vecBlob []byte
-		var kind, identifier, srcType, meta, rels, subProj sql.NullString
+		var kind, identifier, srcType, meta, rels, summary, ctxPath, subProj sql.NullString
 		var lastAccessed sql.NullInt64
 		if err := rows.Scan(&rec.ID, &rec.FilePath, &rec.StartLine, &rec.EndLine, &rec.Content,
-			&kind, &identifier, &vecBlob, &rec.ModTime, &srcType, &meta, &rels, &lastAccessed, &subProj); err != nil {
+			&kind, &identifier, &vecBlob, &rec.ModTime, &srcType, &meta, &rels, &summary, &ctxPath, &lastAccessed, &subProj); err != nil {
 			continue
 		}
 		rec.Kind = kind.String
@@ -213,6 +260,8 @@ func (s *VectorStore) SearchFiltered(ctx context.Context, query []float32, topK 
 		rec.SourceType = srcType.String
 		rec.Metadata = meta.String
 		rec.Relationships = rels.String
+		rec.Summary = summary.String
+		rec.ContextPath = ctxPath.String
 		rec.LastAccessed = lastAccessed.Int64
 		rec.SubProject = subProj.String
 		rec.Embedding = DecodeFloat32Vec(vecBlob)
@@ -232,6 +281,25 @@ func (s *VectorStore) SearchFiltered(ctx context.Context, query []float32, topK 
 	if topK > 0 && len(results) > topK {
 		results = results[:topK]
 	}
+
+	// Apply detail level to trim content for token savings.
+	switch cfg.detail {
+	case "summary":
+		for i := range results {
+			if results[i].Record.Summary != "" {
+				results[i].Record.Content = results[i].Record.Summary
+			} else if len(results[i].Record.Content) > 120 {
+				results[i].Record.Content = results[i].Record.Content[:120] + "..."
+			}
+		}
+	case "snippet":
+		for i := range results {
+			if len(results[i].Record.Content) > 200 {
+				results[i].Record.Content = results[i].Record.Content[:200] + "..."
+			}
+		}
+	}
+
 	return results
 }
 
@@ -271,8 +339,8 @@ func (s *VectorStore) Upsert(records []VectorRecord) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO entries (id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, content_hash, source_type, metadata, relationships, sub_project)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT OR REPLACE INTO entries (id, file_path, start_line, end_line, content, kind, identifier, vector, mod_time, content_hash, source_type, metadata, relationships, summary, context_path, sub_project)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -295,7 +363,15 @@ func (s *VectorStore) Upsert(records []VectorRecord) error {
 		if relationships == "" {
 			relationships = "[]"
 		}
-		if _, err := stmt.Exec(r.ID, r.FilePath, r.StartLine, r.EndLine, content, r.Kind, r.Identifier, vecBlob, r.ModTime, r.ContentHash, sourceType, metadata, relationships, r.SubProject); err != nil {
+		summary := r.Summary
+		if summary == "" {
+			summary = GenerateSummary(r.Content, r.Kind, r.Identifier)
+		}
+		contextPath := r.ContextPath
+		if contextPath == "" {
+			contextPath = deriveContextPath(r.FilePath)
+		}
+		if _, err := stmt.Exec(r.ID, r.FilePath, r.StartLine, r.EndLine, content, r.Kind, r.Identifier, vecBlob, r.ModTime, r.ContentHash, sourceType, metadata, relationships, summary, contextPath, r.SubProject); err != nil {
 			return err
 		}
 	}
@@ -456,6 +532,129 @@ func (s *VectorStore) MarkLifecycleRun() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastLifecycleRun = time.Now().Unix()
+}
+
+// ExpandByID returns the full content for a given chunk ID.
+// Used by the heimdall_expand tool for tiered retrieval drill-down.
+func (s *VectorStore) ExpandByID(chunkID string) (*VectorRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	row := s.db.QueryRow(`SELECT id, file_path, start_line, end_line, content, kind, identifier, source_type, metadata, relationships, summary, context_path, sub_project FROM entries WHERE id = ?`, chunkID)
+
+	var rec VectorRecord
+	var kind, identifier, srcType, meta, rels, summary, ctxPath, subProj sql.NullString
+	err := row.Scan(&rec.ID, &rec.FilePath, &rec.StartLine, &rec.EndLine, &rec.Content,
+		&kind, &identifier, &srcType, &meta, &rels, &summary, &ctxPath, &subProj)
+	if err != nil {
+		return nil, err
+	}
+	rec.Kind = kind.String
+	rec.Identifier = identifier.String
+	rec.SourceType = srcType.String
+	rec.Metadata = meta.String
+	rec.Relationships = rels.String
+	rec.Summary = summary.String
+	rec.ContextPath = ctxPath.String
+	rec.SubProject = subProj.String
+	return &rec, nil
+}
+
+// ListByContextPath returns distinct context_path prefixes at the given depth.
+// Used by the heimdall_ls tool for filesystem-style navigation.
+func (s *VectorStore) ListByContextPath(prefix string) []PathEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var entries []PathEntry
+
+	// Count direct entries at this prefix
+	sqlQ := `SELECT context_path, COUNT(*) as cnt FROM entries WHERE context_path LIKE ? || '%' GROUP BY context_path`
+	rows, err := s.db.Query(sqlQ, prefix)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	children := make(map[string]int)
+	prefixLen := len(prefix)
+	for rows.Next() {
+		var path string
+		var count int
+		if rows.Scan(&path, &count) != nil {
+			continue
+		}
+		// Find the next path segment after the prefix
+		rest := path[prefixLen:]
+		rest = strings.TrimPrefix(rest, "/")
+		if rest == "" {
+			continue
+		}
+		seg := rest
+		if idx := strings.Index(rest, "/"); idx >= 0 {
+			seg = rest[:idx]
+		}
+		children[seg] += count
+	}
+
+	for name, count := range children {
+		childPath := prefix + name
+		if prefix != "" && !strings.HasSuffix(prefix, "/") {
+			childPath = prefix + "/" + name
+		}
+		entries = append(entries, PathEntry{Name: name, Path: childPath, ChunkCount: count})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	return entries
+}
+
+// PathEntry represents one child in a context path listing.
+type PathEntry struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	ChunkCount int    `json:"chunkCount"`
+}
+
+// GenerateSummary produces a heuristic one-line summary for tiered retrieval.
+func GenerateSummary(content, kind, identifier string) string {
+	if identifier != "" {
+		switch kind {
+		case "function":
+			return kind + " " + identifier
+		case "type":
+			return kind + " " + identifier
+		default:
+			if kind != "" {
+				return kind + " " + identifier
+			}
+			return identifier
+		}
+	}
+	// For content without an identifier, take the first non-empty line
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "/*") {
+			continue
+		}
+		if len(line) > 120 {
+			line = line[:120] + "..."
+		}
+		return line
+	}
+	if len(content) > 120 {
+		return content[:120] + "..."
+	}
+	return content
+}
+
+// deriveContextPath computes a hierarchical context_path from a file path.
+// Strips the file extension and filename, keeping the directory hierarchy.
+func deriveContextPath(filePath string) string {
+	dir := filepath.Dir(filePath)
+	if dir == "." || dir == "" {
+		return ""
+	}
+	return filepath.ToSlash(dir)
 }
 
 // DB exposes the underlying *sql.DB for lifecycle operations.

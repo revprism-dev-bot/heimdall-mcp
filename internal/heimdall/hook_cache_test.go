@@ -414,6 +414,158 @@ func TestHookCache_ConcurrentClearDuringGet(t *testing.T) {
 	wg.Wait()
 }
 
+// ---- PERF-002 tests: atomic bumpIndexVersionTx ----
+
+// TestBumpIndexVersion_AtomicSingleQuery verifies that the rewritten
+// bumpIndexVersionTx correctly initialises from zero and increments
+// thereafter, exercising both the INSERT (first call) and ON CONFLICT
+// UPDATE (second+ call) branches in one test.
+func TestBumpIndexVersion_AtomicSingleQuery(t *testing.T) {
+	store := newTestStore(t)
+
+	// Fresh store: version starts at 0.
+	if v := store.GetIndexVersion(); v != 0 {
+		t.Fatalf("fresh store: got %d want 0", v)
+	}
+
+	// First upsert: INSERT branch fires (no row yet).
+	rec := VectorRecord{
+		ID: "a", FilePath: "a.go", Content: "x", Embedding: []float32{1}, ModTime: 1,
+	}
+	if err := store.Upsert([]VectorRecord{rec}); err != nil {
+		t.Fatalf("upsert 1: %v", err)
+	}
+	if v := store.GetIndexVersion(); v != 1 {
+		t.Errorf("after first upsert: got %d want 1", v)
+	}
+
+	// Five more upserts — ON CONFLICT UPDATE path each time.
+	for i := 2; i <= 6; i++ {
+		rec.Content = fmt.Sprintf("content-%d", i)
+		if err := store.Upsert([]VectorRecord{rec}); err != nil {
+			t.Fatalf("upsert %d: %v", i, err)
+		}
+	}
+	if v := store.GetIndexVersion(); v != 6 {
+		t.Errorf("after 6 upserts: got %d want 6", v)
+	}
+
+	// RemoveByFile also bumps.
+	if err := store.RemoveByFile("a.go"); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if v := store.GetIndexVersion(); v != 7 {
+		t.Errorf("after remove: got %d want 7", v)
+	}
+}
+
+// ---- PERF-003 tests: incremental row-count tracking ----
+
+// TestHookCachePut_RowCountTracking verifies that the incremental row counter
+// stays consistent with the actual database row count across inserts,
+// replacements, evictions, and clears.
+func TestHookCachePut_RowCountTracking(t *testing.T) {
+	store := newTestStore(t)
+
+	// Helper: verify the tracked counter matches reality.
+	assertConsistent := func(label string) {
+		t.Helper()
+		var actual int64
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM hook_cache`).Scan(&actual); err != nil {
+			t.Fatalf("%s: count query: %v", label, err)
+		}
+		store.mu.RLock()
+		tracked := store.hookCacheRows
+		store.mu.RUnlock()
+		// tracked may be -1 if no Put has happened yet; skip the check in that case.
+		if tracked >= 0 && tracked != actual {
+			t.Errorf("%s: tracked=%d actual=%d", label, tracked, actual)
+		}
+	}
+
+	// Insert 5 distinct keys.
+	for i := 0; i < 5; i++ {
+		if err := store.HookCachePut(fmt.Sprintf("k%d", i), []byte("v"), time.Minute, 0); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	assertConsistent("after 5 inserts")
+
+	// Replace an existing key — count must not change.
+	if err := store.HookCachePut("k2", []byte("v2"), time.Minute, 0); err != nil {
+		t.Fatalf("replace k2: %v", err)
+	}
+	assertConsistent("after replace")
+	count, _, _, _ := store.HookCacheStats()
+	if count != 5 {
+		t.Errorf("expected 5 rows after replace, got %d", count)
+	}
+
+	// Insert a 6th key with cap=4 → evict 2, leaving 4.
+	// Force ordered created_at so eviction order is deterministic.
+	for i := 0; i < 5; i++ {
+		if _, err := store.db.Exec(
+			`UPDATE hook_cache SET created_at = ? WHERE key = ?`,
+			int64(1000+i), fmt.Sprintf("k%d", i),
+		); err != nil {
+			t.Fatalf("rewind: %v", err)
+		}
+	}
+	if err := store.HookCachePut("k5", []byte("v"), time.Minute, 4); err != nil {
+		t.Fatalf("put k5 with cap: %v", err)
+	}
+	assertConsistent("after capped insert")
+	count, _, _, _ = store.HookCacheStats()
+	if count != 4 {
+		t.Errorf("expected 4 rows after capped insert, got %d", count)
+	}
+
+	// Clear and verify counter resets.
+	if err := store.HookCacheClear(); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	assertConsistent("after clear")
+	store.mu.RLock()
+	if store.hookCacheRows != 0 {
+		t.Errorf("expected hookCacheRows=0 after clear, got %d", store.hookCacheRows)
+	}
+	store.mu.RUnlock()
+
+	// Insert after clear — counter should be incremented from 0.
+	if err := store.HookCachePut("fresh", []byte("v"), time.Minute, 0); err != nil {
+		t.Fatalf("put after clear: %v", err)
+	}
+	assertConsistent("after post-clear insert")
+}
+
+// TestHookCachePut_LazyInit verifies the counter is -1 before any Put and
+// gets populated on first Put.
+func TestHookCachePut_LazyInit(t *testing.T) {
+	store := newTestStore(t)
+	store.mu.RLock()
+	if store.hookCacheRows != -1 {
+		t.Errorf("expected hookCacheRows=-1 before any put, got %d", store.hookCacheRows)
+	}
+	store.mu.RUnlock()
+
+	// Seed a row directly via SQL (bypassing Put) to test lazy init picks it up.
+	if _, err := store.db.Exec(
+		`INSERT INTO hook_cache (key, stdout, created_at, hit_count) VALUES ('pre', 'x', 1, 0)`,
+	); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// First Put should lazy-load counter (seeing the pre-seeded row) then add its own.
+	if err := store.HookCachePut("new", []byte("y"), time.Minute, 0); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	store.mu.RLock()
+	if store.hookCacheRows != 2 {
+		t.Errorf("expected hookCacheRows=2 (1 pre-seeded + 1 new), got %d", store.hookCacheRows)
+	}
+	store.mu.RUnlock()
+}
+
 // TestHookCachePut_BinaryStdout asserts the BLOB column round-trips
 // arbitrary bytes — NUL, 0xFF, and multi-byte Unicode — byte-for-byte.
 func TestHookCachePut_BinaryStdout(t *testing.T) {

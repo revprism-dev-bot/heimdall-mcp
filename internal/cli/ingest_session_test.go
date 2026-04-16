@@ -20,7 +20,7 @@ func testIngestDeps(store *heimdall.MemoryStore) IngestDeps {
 		},
 		OpenMemoryStore: func() (*heimdall.MemoryStore, error) { return store, nil },
 		NewEmbedder: func(context.Context, string, string) (heimdall.Embedder, error) {
-			return &heimdall.MockEmbedder{Dimension: 3}, nil
+			return &heimdall.StubEmbedder{Dimension: 3}, nil
 		},
 	}
 }

@@ -176,7 +176,7 @@ func TestIngestSession_Basic(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{
+	embedder := &StubEmbedder{
 		Dimension: 3,
 		Vectors: map[string][]float32{
 			// Will map any text to a deterministic vector
@@ -208,7 +208,7 @@ func TestIngestSession_Dedup(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{
+	embedder := &StubEmbedder{
 		Dimension: 3,
 		Vectors:   map[string][]float32{},
 	}
@@ -248,7 +248,7 @@ func TestIngestSession_ExplicitWins(t *testing.T) {
 	// Create a vector that the mock embedder will return
 	vec := []float32{1.0, 0.0, 0.0}
 
-	embedder := &MockEmbedder{
+	embedder := &StubEmbedder{
 		Dimension: 3,
 		Vectors: map[string][]float32{
 			"We decided to use Go.": vec,

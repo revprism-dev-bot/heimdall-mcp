@@ -52,12 +52,18 @@ func DispatchHook(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, 
 		return HookPostEditActor(cfg, stdin, stdout, stderr, env, rest)
 	case "user-prompt":
 		return HookUserPrompt(cfg, stdin, stdout, stderr, env, rest, HookUserPromptDeps{})
+	case "stop":
+		return HookStop(cfg, stdin, stdout, stderr, env, rest)
+	case "session-end":
+		return HookSessionEnd(cfg, stdin, stdout, stderr, env, rest)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "heimdall-mcp hook — Claude Code retrieval hook entry points")
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, "  hook session-start [--budget-ms N] [--project <path>]")
 		fmt.Fprintln(stdout, "  hook post-edit [--project <path>]")
 		fmt.Fprintln(stdout, "  hook user-prompt [--budget-ms N] [--project <path>]")
+		fmt.Fprintln(stdout, "  hook stop [--project <path>]")
+		fmt.Fprintln(stdout, "  hook session-end [--project <path>]")
 		return 0
 	default:
 		// Unknown subcommand: same reasoning as empty-args. Log, short stderr

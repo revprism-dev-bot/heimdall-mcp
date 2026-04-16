@@ -41,7 +41,7 @@ func TestIncrementalIndex_SkipsUnchangedFiles(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
 	indexer := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
 
 	ctx := context.Background()
@@ -126,7 +126,7 @@ func TestIncrementalIndex_NewFileIsIndexed(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
 	indexer := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
 
 	ctx := context.Background()
@@ -170,7 +170,7 @@ func TestIncrementalIndex_ContentHashFallback(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
 	indexer := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
 
 	ctx := context.Background()
@@ -220,7 +220,7 @@ func TestIndexAll_DoesNotSkip(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
 	indexer := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
 
 	ctx := context.Background()
@@ -277,7 +277,7 @@ func TestIndexAll_SkipsSubRepoDirectories(t *testing.T) {
 	}
 	defer store.Close()
 
-	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
 	indexer := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
 
 	ctx := context.Background()
@@ -324,7 +324,7 @@ func TestIndexAll_SubProjectTagging(t *testing.T) {
 	os.MkdirAll(filepath.Join(root, "service-b", ".git"), 0755)
 	os.MkdirAll(filepath.Join(root, "lib"), 0755) // not a sub-repo
 
-	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
 	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
 	store, err := OpenStore(dbDir)
 	if err != nil {
@@ -367,7 +367,7 @@ func TestIndexAll_SubProjectTagging(t *testing.T) {
 
 func TestDiscoverSubRepoDirs_Empty(t *testing.T) {
 	root := t.TempDir()
-	embedder := &MockEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
 	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
 	store, err := OpenStore(dbDir)
 	if err != nil {

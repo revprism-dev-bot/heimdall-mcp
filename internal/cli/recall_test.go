@@ -45,7 +45,7 @@ func testRecallDeps(store *heimdall.MemoryStore) RecallDeps {
 		},
 		OpenMemoryStore: func() (*heimdall.MemoryStore, error) { return store, nil },
 		NewEmbedder: func(_ context.Context, _, _ string) (heimdall.Embedder, error) {
-			return &heimdall.MockEmbedder{
+			return &heimdall.StubEmbedder{
 				Vectors:   map[string][]float32{"testing workflow": {1, 0, 0}},
 				Dimension: 3,
 			}, nil
@@ -195,7 +195,7 @@ func TestCLIRecall_EmptyStore_JSONArrayNotNull(t *testing.T) {
 		},
 		OpenMemoryStore: func() (*heimdall.MemoryStore, error) { return empty, nil },
 		NewEmbedder: func(_ context.Context, _, _ string) (heimdall.Embedder, error) {
-			return &heimdall.MockEmbedder{
+			return &heimdall.StubEmbedder{
 				Vectors:   map[string][]float32{"anything": {1, 0, 0}},
 				Dimension: 3,
 			}, nil

@@ -29,26 +29,18 @@ var ErrHookCacheOversize = errors.New("heimdall: hook cache payload exceeds 32KB
 const indexVersionKey = "index_version"
 
 // bumpIndexVersionTx atomically increments the index_version metadata key
-// inside an open transaction. Must be called from Upsert / RemoveByFile so
-// the bump and the data write share one commit boundary — otherwise readers
-// can observe stale-key cache hits against freshly-written data.
+// inside an open transaction using a single SQL statement. Must be called
+// from Upsert / RemoveByFile so the bump and the data write share one commit
+// boundary — otherwise readers can observe stale-key cache hits against
+// freshly-written data.
+//
+// PERF-002: Uses INSERT ... ON CONFLICT to do an atomic read-modify-write in
+// one round-trip instead of the previous SELECT-then-INSERT OR REPLACE pair.
 func bumpIndexVersionTx(tx *sql.Tx) error {
-	var raw string
-	err := tx.QueryRow(`SELECT value FROM store_metadata WHERE key = ?`, indexVersionKey).Scan(&raw)
-	var current int64
-	switch {
-	case err == sql.ErrNoRows:
-		current = 0
-	case err != nil:
-		return err
-	default:
-		current, _ = strconv.ParseInt(raw, 10, 64)
-	}
-	next := current + 1
-	_, err = tx.Exec(
-		`INSERT OR REPLACE INTO store_metadata (key, value) VALUES (?, ?)`,
-		indexVersionKey, strconv.FormatInt(next, 10),
-	)
+	_, err := tx.Exec(`
+		INSERT INTO store_metadata (key, value) VALUES (?, '1')
+		ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+	`, indexVersionKey)
 	return err
 }
 
@@ -73,12 +65,36 @@ func (s *VectorStore) GetIndexVersion() int64 {
 //
 // ttl is accepted for symmetry with HookCacheGet but is not stored —
 // freshness is enforced on read by the ttl parameter of HookCacheGet.
+//
+// PERF-003: Row count is tracked incrementally in s.hookCacheRows instead
+// of running SELECT COUNT(*) on every insert. The counter is lazily
+// initialized on first call (hookCacheRows == -1) and adjusted for
+// inserts, replacements, and evictions.
 func (s *VectorStore) HookCachePut(key string, stdout []byte, ttl time.Duration, rowCap int) error {
 	if len(stdout) > MaxHookCacheStdoutBytes {
 		return ErrHookCacheOversize
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Lazy-initialize the row counter on first call.
+	if s.hookCacheRows < 0 {
+		var count int64
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM hook_cache`).Scan(&count); err != nil {
+			return err
+		}
+		s.hookCacheRows = count
+	}
+
+	// Check whether this key already exists so we know whether the INSERT OR
+	// REPLACE will be a net-new row (increment counter) or a replacement
+	// (counter stays the same).
+	var exists int64
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM hook_cache WHERE key = ?`, key,
+	).Scan(&exists); err != nil {
+		return err
+	}
 
 	now := time.Now().Unix()
 	// hit_count resets on replace — this row's stdout has changed, so old
@@ -91,21 +107,22 @@ func (s *VectorStore) HookCachePut(key string, stdout []byte, ttl time.Duration,
 	}
 	_ = ttl
 
-	if rowCap > 0 {
-		var count int64
-		if err := s.db.QueryRow(`SELECT COUNT(*) FROM hook_cache`).Scan(&count); err != nil {
+	if exists == 0 {
+		s.hookCacheRows++
+	}
+
+	if rowCap > 0 && s.hookCacheRows > int64(rowCap) {
+		excess := s.hookCacheRows - int64(rowCap)
+		res, err := s.db.Exec(
+			`DELETE FROM hook_cache WHERE key IN (
+				SELECT key FROM hook_cache ORDER BY created_at ASC LIMIT ?
+			)`, excess,
+		)
+		if err != nil {
 			return err
 		}
-		if count > int64(rowCap) {
-			// Evict oldest-first until we're back within cap.
-			excess := count - int64(rowCap)
-			if _, err := s.db.Exec(
-				`DELETE FROM hook_cache WHERE key IN (
-					SELECT key FROM hook_cache ORDER BY created_at ASC LIMIT ?
-				)`, excess,
-			); err != nil {
-				return err
-			}
+		if evicted, err := res.RowsAffected(); err == nil {
+			s.hookCacheRows -= evicted
 		}
 	}
 	return nil
@@ -154,11 +171,14 @@ func (s *VectorStore) HookCacheGet(key string, ttl time.Duration) ([]byte, error
 }
 
 // HookCacheClear removes every row from the hook_cache table. Returns an
-// error only on driver-level failure.
+// error only on driver-level failure. Resets the incremental row counter.
 func (s *VectorStore) HookCacheClear() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM hook_cache`)
+	if err == nil {
+		s.hookCacheRows = 0
+	}
 	return err
 }
 
