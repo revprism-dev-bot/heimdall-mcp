@@ -35,9 +35,11 @@ const heimdallHookVersion = 1
 
 // heimdallBinaryVersion is the string recorded in the `x-heimdall` metadata
 // bag on installed hook entries. Distinct from heimdallHookVersion because the
-// binary can churn without changing the hook shape. Wave 2 Phase 1a ships
-// with this hard-coded; a later wave can plumb it from build flags.
-const heimdallBinaryVersion = "wave2-phase1b"
+// binary can churn without changing the hook shape. Bumped to "wave2-phase3"
+// when Phase 3 added the PreToolUse guardrail entry — the auto-upgrade path
+// uses this string to decide whether an existing 5-hook install should be
+// expanded to the current 6-hook template on SessionStart.
+const heimdallBinaryVersion = "wave2-phase3"
 
 // phase1aHook describes one Claude Code hook entry heimdall owns. The list
 // below is the canonical Phase 1a install set; `--only` filters over it by
@@ -48,12 +50,17 @@ type phase1aHook struct {
 	command string // full command string including --source=heimdall
 }
 
-// phase1aHooks is the canonical install set as of Wave 2 phase 1b. The name
-// is preserved for call-site stability, but the list now includes the T6
-// UserPromptSubmit entry (phase 1b) alongside the original phase-1a
-// SessionStart + PostToolUse pair. Command strings here are baked verbatim
-// into `settings.json`; changes must be coordinated with the hook handlers
-// in `hook.go`, `hook_post_edit.go`, and `hook_user_prompt.go`.
+// phase1aHooks is the canonical install set. The variable name is preserved
+// for call-site stability; the list has grown across waves:
+//   - Phase 1a: SessionStart, PostToolUse(Edit|Write)
+//   - Phase 1b: +UserPromptSubmit
+//   - Phase 2:  +Stop, +SessionEnd
+//   - Phase 3:  +PreToolUse(Bash) guardrail — ships in shadow mode by default
+//
+// Command strings here are baked verbatim into `settings.json`; changes
+// must be coordinated with the hook handlers in `hook.go`,
+// `hook_post_edit.go`, `hook_user_prompt.go`, `hook_stop.go`, and
+// `hook_pre_tool_use.go`.
 var phase1aHooks = []phase1aHook{
 	{
 		event:   "SessionStart",
@@ -79,6 +86,14 @@ var phase1aHooks = []phase1aHook{
 		event:   "SessionEnd",
 		matcher: "",
 		command: "heimdall-mcp hook session-end --source=heimdall --version=1",
+	},
+	{
+		// Phase 3 — destructive-op guardrails. Ships in shadow mode by
+		// default: the hook always exits 0 and never emits unless the user
+		// opts in via HEIMDALL_GUARDRAILS=warn|block.
+		event:   "PreToolUse",
+		matcher: "Bash",
+		command: "heimdall-mcp hook pre-tool-use --source=heimdall --version=1",
 	},
 }
 

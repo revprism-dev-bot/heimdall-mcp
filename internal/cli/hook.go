@@ -38,7 +38,7 @@ func DispatchHook(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, 
 		// stderr for interactive shells, but still return 0 so Claude Code
 		// never sees a non-zero exit from a retrieval hook. (OQ-5.)
 		heimdall.LogHookEvent("WARN", "hook", map[string]any{"err": "no_subcommand"})
-		fmt.Fprintln(stderr, "Usage: heimdall-mcp hook <session-start|post-edit|post-edit-actor|user-prompt|stop> [flags]")
+		fmt.Fprintln(stderr, "Usage: heimdall-mcp hook <session-start|post-edit|post-edit-actor|user-prompt|stop|pre-tool-use> [flags]")
 		return 0
 	}
 	sub := args[0]
@@ -56,6 +56,8 @@ func DispatchHook(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, 
 		return HookStop(cfg, stdin, stdout, stderr, env, rest)
 	case "session-end":
 		return HookSessionEnd(cfg, stdin, stdout, stderr, env, rest)
+	case "pre-tool-use":
+		return HookPreToolUse(cfg, stdin, stdout, stderr, env, rest, HookPreToolUseDeps{})
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "heimdall-mcp hook — Claude Code retrieval hook entry points")
 		fmt.Fprintln(stdout)
@@ -64,6 +66,7 @@ func DispatchHook(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, 
 		fmt.Fprintln(stdout, "  hook user-prompt [--budget-ms N] [--project <path>]")
 		fmt.Fprintln(stdout, "  hook stop [--project <path>]")
 		fmt.Fprintln(stdout, "  hook session-end [--project <path>]")
+		fmt.Fprintln(stdout, "  hook pre-tool-use         Phase 3 guardrail (Bash tool calls)")
 		return 0
 	default:
 		// Unknown subcommand: same reasoning as empty-args. Log, short stderr
