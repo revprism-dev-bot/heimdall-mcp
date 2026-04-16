@@ -104,7 +104,7 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] New `MemoryTypeSkill` constant + validation
 - [x] `heimdall_remember --type=skill` accepted (validated in MCP tool schema + memory type map)
 - [ ] Auto-surface via `SessionStart` (top-N skills for repo) (follow-up)
-- [ ] Optional: two-way sync with `~/.claude/skills/` directory (follow-up)
+- [x] Two-way sync with `~/.claude/skills/` directory: `heimdall-mcp skills import` walks `~/.claude/skills/<name>/SKILL.md`, parses YAML frontmatter, and upserts a `type=skill` memory per file (idempotent via `ContentHash` + deterministic `mem:skill:disk:<slug>` IDs). MCP `heimdall_remember` accepts `write_file=true` (default OFF) plus `skill_name`, `skill_description`, `write_file_overwrite` to materialize a `SKILL.md` back to `~/.claude/skills/<slug>/`. `hooks doctor` adds a 12th check rolling up disk SKILL.md count vs synced memory rows. `HEIMDALL_CLAUDE_SKILLS_DIR` env override keeps tests off real user state.
 
 ## 5. Misc / carried over — **SHIPPED**
 
