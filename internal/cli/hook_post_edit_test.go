@@ -514,3 +514,32 @@ func TestDispatchHook_PostEdit_NoStdin_ExitZero(t *testing.T) {
 		t.Fatalf("code=%d; want 0", code)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Session-id threading (Wave A).
+// ---------------------------------------------------------------------------
+
+func TestHookPostEdit_LogsSessionID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	payload := `{"session_id":"sess-pe","tool_name":"Edit","tool_input":{"file_path":"/nonexistent/path.go"},"cwd":"/tmp"}`
+	stdin := strings.NewReader(payload)
+	var out, errBuf bytes.Buffer
+
+	deps := PostEditDeps{
+		Now:       time.Now,
+		Spawn:     func(string) error { return nil },
+		UseFlock:  false,
+		KillCheck: func(int) bool { return false },
+	}
+	rc := hookPostEditWithDeps(config.Config{}, stdin, &out, &errBuf, map[string]string{"HEIMDALL_HOOKS": "1"}, []string{"--project", tmp}, deps)
+	if rc != 0 {
+		t.Fatalf("expected exit 0, got %d", rc)
+	}
+
+	data, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if !strings.Contains(string(data), "session=sess-pe") {
+		t.Fatalf("expected session=sess-pe:\n%s", string(data))
+	}
+}
