@@ -506,3 +506,138 @@ var _ = fmt.Sprintf
 var _ = errors.New
 var _ = context.Background
 var _ = filepath.Join
+
+// ---------------------------------------------------------------------------
+// Scope tests (Feature 1: hook scope filtering by CWD subpath)
+//
+// UserPrompt calls SearchFiltered — when CWD is a subpath of the repo, the
+// WithScope(scope) filter restricts results to entries whose context_path
+// starts with that subpath.
+// ---------------------------------------------------------------------------
+
+// 17. CWD is a subpath → scope is applied, only matching results returned.
+func TestHookUserPrompt_CWDSubpath_NarrowsSearch(t *testing.T) {
+	const model = "test-model"
+	const dim = 3
+	project := t.TempDir()
+	baseDir := seedVectorStore(t, project, model, dim, time.Now().Unix())
+	dbDir := heimdall.ModelDBDir(baseDir, model)
+
+	// Two records with distinct context_paths. "internal/cli/foo.go" →
+	// context_path "internal/cli"; "docs/bar.md" → context_path "docs".
+	recs := []heimdall.VectorRecord{
+		{ID: "1", FilePath: "internal/cli/foo.go", StartLine: 1, EndLine: 5, Content: "cli code", Embedding: []float32{1, 0, 0}},
+		{ID: "2", FilePath: "docs/bar.md", StartLine: 1, EndLine: 5, Content: "docs content", Embedding: []float32{1, 0, 0}},
+	}
+	seedStoreWithRecords(t, dbDir, recs)
+
+	// Create an internal/cli subdir so it resolves correctly.
+	sub := filepath.Join(project, "internal", "cli")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+
+	fake := newFakeOllama(t, model, dim)
+	out, _, code := runHookUserPrompt(t, runUPOpts{
+		stdin: `{"prompt":"explain the post-edit flow","cwd":"` + sub + `"}`,
+		cfg:   baseCfg(fake.server.URL, model),
+	})
+	if code != 0 {
+		t.Errorf("code = %d, want 0", code)
+	}
+	if !strings.Contains(out, "## Heimdall context") {
+		t.Fatalf("missing header, got: %q", out)
+	}
+	// Only the cli hit should appear; the docs hit should be filtered out.
+	if !strings.Contains(out, "internal/cli/foo.go") {
+		t.Errorf("expected in-scope hit internal/cli/foo.go, got:\n%s", out)
+	}
+	if strings.Contains(out, "docs/bar.md") {
+		t.Errorf("out-of-scope docs/bar.md leaked through:\n%s", out)
+	}
+}
+
+// 18. CWD at repo root → no scope applied, both results returned.
+func TestHookUserPrompt_CWDAtRepoRoot_NoScope(t *testing.T) {
+	const model = "test-model"
+	const dim = 3
+	project := t.TempDir()
+	baseDir := seedVectorStore(t, project, model, dim, time.Now().Unix())
+	dbDir := heimdall.ModelDBDir(baseDir, model)
+
+	recs := []heimdall.VectorRecord{
+		{ID: "1", FilePath: "internal/cli/foo.go", StartLine: 1, EndLine: 5, Content: "cli", Embedding: []float32{1, 0, 0}},
+		{ID: "2", FilePath: "docs/bar.md", StartLine: 1, EndLine: 5, Content: "docs", Embedding: []float32{1, 0, 0}},
+	}
+	seedStoreWithRecords(t, dbDir, recs)
+
+	fake := newFakeOllama(t, model, dim)
+	out, _, code := runHookUserPrompt(t, runUPOpts{
+		stdin: `{"prompt":"explain the post-edit flow","cwd":"` + project + `"}`,
+		cfg:   baseCfg(fake.server.URL, model),
+	})
+	if code != 0 {
+		t.Errorf("code = %d, want 0", code)
+	}
+	if !strings.Contains(out, "internal/cli/foo.go") || !strings.Contains(out, "docs/bar.md") {
+		t.Errorf("expected both hits (no scope), got:\n%s", out)
+	}
+}
+
+// 19. CWD outside any repo → no scope, no crash, exit 0. The handler should
+// still run; lacking an index yields the "no usable index" log branch
+// (empty stdout) but MUST NOT panic due to scope handling.
+func TestHookUserPrompt_CWDOutsideRepo_NoCrashNoScope(t *testing.T) {
+	const model = "test-model"
+	outside := t.TempDir()
+
+	fake := newFakeOllama(t, model, 3)
+	_, _, code := runHookUserPrompt(t, runUPOpts{
+		stdin: `{"prompt":"explain the post-edit flow","cwd":"` + outside + `"}`,
+		cfg:   baseCfg(fake.server.URL, model),
+	})
+	if code != 0 {
+		t.Errorf("code = %d, want 0 (OQ-5)", code)
+	}
+}
+
+// 20. Subpath and repo-root cache keys must differ so subpath queries don't
+// serve repo-root payloads from cache (and vice-versa).
+func TestHookUserPrompt_ScopeCacheKeyDiffers(t *testing.T) {
+	const model = "test-model"
+	const dim = 3
+	project := t.TempDir()
+	baseDir := seedVectorStore(t, project, model, dim, time.Now().Unix())
+	dbDir := heimdall.ModelDBDir(baseDir, model)
+	sub := filepath.Join(project, "internal", "cli")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Seed the cache under the REPO-ROOT key with a distinctive payload.
+	store, err := heimdall.OpenStore(dbDir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	prompt := "explain the post-edit flow"
+	rootKey := userPromptCacheKey(prompt, store.GetIndexVersion(), project)
+	if err := store.HookCachePut(rootKey, []byte("ROOT-PAYLOAD\n"), 24*time.Hour, userPromptCacheRowCap); err != nil {
+		t.Fatalf("put root cache: %v", err)
+	}
+	store.Close()
+
+	// Fire the hook from the subpath — key differs, so we must NOT see the
+	// ROOT-PAYLOAD in stdout. The fake Ollama will embed and the real
+	// search (empty result set) will render a fresh payload.
+	fake := newFakeOllama(t, model, dim)
+	out, _, code := runHookUserPrompt(t, runUPOpts{
+		stdin: `{"prompt":"` + prompt + `","cwd":"` + sub + `"}`,
+		cfg:   baseCfg(fake.server.URL, model),
+	})
+	if code != 0 {
+		t.Errorf("code = %d, want 0", code)
+	}
+	if strings.Contains(out, "ROOT-PAYLOAD") {
+		t.Errorf("subpath call served root-scoped cache entry:\n%s", out)
+	}
+}
