@@ -9,34 +9,37 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> Wave 2 phase **1b** of the Claude Code hooks integration for heimdall-mcp
-> is merged to `origin/main` (PR #10, merge commit `320c4bd`; implementation
-> commit `648a388`). Phase 1a shipped earlier via PR #5 (`67e8335`) with
-> dogfood follow-ups in PR #7 (`15d1723`). The full roadmap, locked
-> decisions, implementation plan, and review gate history are in
-> `docs/plans/hooks/`.
+> **Wave 2 phase 2** (session learning) plus TODO sections 2–5 (tiered
+> retrieval, path hierarchy, skills, LOW fixes, perf) are all merged to
+> `origin/main` via PR #11 (merge `b05af92`). Phase 1a shipped in PR #5,
+> phase 1b in PR #10. The full roadmap, locked decisions, and review
+> history are in `docs/plans/hooks/`.
 >
-> **Phase 1a was dogfooded end-to-end on 2026-04-16** and verified: 1758
-> chunks on `nomic-embed-text`, `hooks doctor` 11/11 green, real
-> `SessionStart` fires `## Heimdall context` into the first turn, real
-> `Edit` tool call fires `PostToolUse` → `fork+setsid` actor reaches
-> `files=1 msg=reindex_ok` with no deadletter. First embed was a ~67 s
-> Ollama cold-load — subsequent edits are fast.
+> **Heimdall now installs 5 hooks**: `SessionStart`, `PostToolUse(Edit|Write)`,
+> `UserPromptSubmit`, `Stop`, and `SessionEnd`. The Stop event payload
+> shape was confirmed from Claude Code docs on 2026-04-16: `session_id`,
+> `transcript_path`, `last_assistant_message`, `cwd`, `stop_hook_active`.
+> SessionEnd provides `reason` (clear/resume/logout/etc.). Stop appends
+> assistant messages to a rolling JSONL buffer per session; SessionEnd
+> triggers `ingest-session` from the transcript path and cleans up.
 >
-> **Phase 1b then landed without waiting on a soak gate.** The original
-> plan called for "phase 1a stable ≥ 1 week" before cutting 1b; per user
-> direction this gate was killed — for a solo local tool, wall-clock
-> soak tests nothing. Phase 1b rides on the unit test suite (16 new cases
-> in `hook_user_prompt_test.go`) plus live dogfood of `UserPromptSubmit`
-> (the hook fires on every turn of this very session). The original T21
-> microbenchmark was also skipped in favor of a same-task
-> with-vs-without-hooks comparison to be run as a follow-up after merge.
+> **New MCP tools shipped**: `heimdall_expand` (chunk drill-down for tiered
+> retrieval), `heimdall_ls` (path hierarchy navigation). `heimdall_search`
+> gained `detail=summary|snippet|full`, `scope=` (path prefix filter).
+> Schema has `summary` and `context_path` columns, both auto-generated at
+> index time. Skills are a new memory type (`type=skill`).
 >
-> Before touching code, read this file — it has the current state of all
-> three retrieval hooks, known caveats, recovery paths, and open
-> follow-ups. The next code work is **Wave 2 phase 2** (T8 `hook stop` →
-> rolling buffer → `ingest-session`) and it is blocked on confirming the
-> Claude Code `Stop` event payload shape against a real sample.
+> **All 6 LOW-severity findings fixed**, PERF-002/003 implemented, first-run
+> hint after `index`, T24 Windows path redaction verified, `MockEmbedder`
+> renamed to `StubEmbedder`, `EmbedBatchSize` now config-driven, ETA
+> computation extracted and tested.
+>
+> **What's next**: Phase 3 guardrails (`PreToolUse` destructive-op hook),
+> live dogfood of Stop/SessionEnd hooks, with-vs-without comparison,
+> and the follow-up items listed in TODO.md. Phase 3 is blocked on
+> designing a destructive-op judgment primitive.
+>
+> Before touching code, read this file + `TODO.md` for the full picture.
 
 ---
 
@@ -56,7 +59,7 @@ Main repo: `/home/noname/Code/heimdall-mcp`. All Wave 1/2 work is on the
 
 ---
 
-## What shipped (Wave 0 → Wave 1 → Wave 2 phase 1a → Wave 2 phase 1b)
+## What shipped (Wave 0 → Wave 1 → Wave 2 phases 1a/1b/2 → Sections 2–5)
 
 ### Wave 0 — initial review fixes (commits up to `93384c8`)
 11 code fixes from a 1224-line review pass: dead `checkModelMismatch` removed,
@@ -164,6 +167,60 @@ cases and a `ResolveUsableModelDB` table-driven test.
   flag override, malformed JSON payload, dispatcher routing, version
   stamp.
 
+### Wave 2 phase 2 + sections 2–5 (merged as PR #11, merge `b05af92`, impl `8b3442b`)
+
+**T8 — session learning (hook stop + session-end):**
+- `hook stop` appends `last_assistant_message` to a per-session JSONL
+  rolling buffer at `<project>/.heimdall_db/hooks/sessions/<session_id>.jsonl`,
+  capped at 2 MB. Confirmed Stop event payload: `session_id`,
+  `transcript_path`, `last_assistant_message`, `cwd`, `stop_hook_active`.
+- `hook session-end` triggers `ingest-session` from `transcript_path`
+  JSONL (last 5 assistant messages, 500 chars each, 5 KB total cap),
+  then cleans up the rolling buffer file. SessionEnd payload: `session_id`,
+  `transcript_path`, `cwd`, `reason`.
+- Install template updated to **5 hooks**: SessionStart, PostToolUse,
+  UserPromptSubmit, Stop, SessionEnd.
+- 12 unit tests in `hook_stop_test.go`.
+
+**Section 2 — tiered retrieval (L0/L1/L2):**
+- `summary TEXT` column on entries, auto-generated via heuristic
+  `GenerateSummary()` (identifier+kind for named chunks, first
+  non-comment line for paragraphs).
+- `heimdall_search` gained `detail=summary|snippet|full` param.
+- New `heimdall_expand(chunk_id)` MCP tool for drill-down.
+- `SearchResultEnriched` includes `summary` and `contextPath`.
+
+**Section 3 — path-based context hierarchy:**
+- `context_path TEXT` column, auto-derived from file path directory
+  hierarchy via `deriveContextPath()`, slash-normalized.
+- `heimdall_search` gained `scope=` prefix filter via `WithScope()`
+  functional option.
+- New `heimdall_ls(path)` MCP tool — returns child paths with chunk
+  counts for filesystem-style navigation.
+
+**Section 4 — skills as indexable content:**
+- `MemoryTypeSkill` added to memory type system + validation.
+- `heimdall_remember --type=skill` accepted in MCP tool schema.
+
+**Section 5 — all 6 LOW-severity findings fixed:**
+- SEC-001: SAFETY comments on dynamic SQL builders.
+- SEC-002: `sub_project` 255-char length cap in toolSearch.
+- SEC-003: `sanitizeStoreError()` logs full error server-side, returns
+  generic message to client.
+- DES-006: `EmbedBatchSize` added to Config with default 32.
+- DES-010: `computeETA()` extracted as pure function + 6 tests.
+- TEST-013: `MockEmbedder` → `StubEmbedder` across all source files.
+
+**Performance (PERF-002, PERF-003):**
+- `bumpIndexVersionTx`: single atomic `INSERT...ON CONFLICT UPDATE`.
+- hook_cache eviction: lazy-init row counter, no O(n) COUNT per insert.
+- 3 new perf tests in `hook_cache_test.go`.
+
+**Other:**
+- First-run hint after `index` (6 tests in `install_test.go`).
+- T24 Windows path redaction verified correct (no changes needed).
+- Pre-Wave-1 review docs archived to `docs/reviews/pre-wave1/`.
+
 ### Wave 2 phase 1a dogfood follow-ups — merged as PR #7 (merge commit `15d1723`)
 
 Four bugs surfaced on the first real dogfood run that blocked or soft-failed
@@ -224,42 +281,33 @@ From `docs/plans/hooks/06-decisions.md`:
 
 ## Next steps (in order)
 
-1. ~~Phase 1a end-to-end dogfood (SessionStart + PostToolUse + actor).~~
-   **✅ VERIFIED 2026-04-16.** See the "dogfood follow-ups" section for
-   the four PR #7 fixes and the Dogfood sequence table below for the
-   command-by-command trace. fork+setsid works in the wild.
+1. ~~Phase 1a dogfood.~~ **✅ VERIFIED 2026-04-16.**
+2. ~~Soak gate.~~ **❌ KILLED.**
+3. ~~Phase 1b (T4 + T6).~~ **✅ SHIPPED** — PR #10.
+4. ~~Phase 2 (T8 + sections 2–5).~~ **✅ SHIPPED** — PR #11.
 
-2. ~~**Soak ≥ 1 day before starting phase 1b.**~~ **❌ KILLED.** Per
-   user direction the wall-clock soak gate was dropped as a
-   solo-local-tool nonsense — for a tool with exactly one user, time
-   without usage measures nothing. Phase 1b cut immediately after
-   phase 1a dogfood landed.
+5. **Reinstall hooks.** The install template now has 5 hooks (was 3).
+   Run `heimdall-mcp install-hooks --scope=project --force` to pick up
+   the Stop + SessionEnd entries, then `hooks doctor` to verify.
 
-3. ~~**Start Wave 2 phase 1b** (T4 + T6 + install template update).~~
-   **✅ SHIPPED** — PR #10, merge `320c4bd`, impl `648a388`. See the
-   phase 1b section above for the full scope.
+6. **Dogfood Stop + SessionEnd end-to-end.** Work a real session, then
+   close Claude Code. Check:
+   - `heimdall-mcp hooks tail --event=stop --since=1h` — buffer_appended lines
+   - `heimdall-mcp hooks tail --event=session-end --since=1h` — ingest_ok or session_ended
+   - `ls <project>/.heimdall_db/hooks/sessions/` — buffer files should be cleaned up
 
-4. **Dogfood `UserPromptSubmit` end-to-end.** The hook fires on every
-   turn. Verify the `## Heimdall context` block arrives on prompt
-   submission, check `heimdall-mcp hooks tail --event=user-prompt
-   --since=1h` for cache-hit vs cache-miss lines, and watch
-   `hooks.log` for any Tier B suppression. This is the replacement
-   for the killed T21 microbenchmark — real usage on a real session.
+7. **Dogfood tiered retrieval.** Use `heimdall_search` with `detail=summary`
+   then `heimdall_expand` on a result. Use `heimdall_ls` to browse the
+   path hierarchy. Verify summaries are useful and context_paths are correct.
 
-5. **Run the with-vs-without comparison.** The agreed replacement for
-   T21 is a same-task A/B: pick a representative task in this repo,
-   run it twice in fresh Claude Code sessions — once with
-   `HEIMDALL_HOOKS=0`, once with hooks live — and compare quality,
-   token spend, and tool-call count. Report findings back into the
-   plan.
+8. **With-vs-without comparison (T21 replacement).** Pick a real task, run
+   twice in fresh sessions — `HEIMDALL_HOOKS=0` control vs defaults.
+   Compare quality, token spend, tool-call count.
 
-6. **Start Wave 2 phase 2** — `hook stop` rolling buffer →
-   `ingest-session`. **Blocked** until the Claude Code `Stop` event
-   payload shape is confirmed against a real sample (01 OQ §1 /
-   consolidated plan §8 blocker #10). The defensive fallback chain
-   in §3.4 ships blind until that's resolved. Phase 2 gate criteria
-   otherwise: retention policy confirmed, ingest-session failure rate
-   observed from the with-vs-without run.
+9. **Phase 3 — guardrails.** `PreToolUse(Bash(rm *|git push --force*))`
+   as an `agent`-type hook. **Blocked** on designing a destructive-op
+   judgment primitive — heimdall has no way to classify a bash command
+   as dangerous today. Needs a design decision before implementation.
 
 ---
 
@@ -385,42 +433,29 @@ heimdall-mcp hooks tail --event=post-edit --since=5m
 
 ---
 
-## What's next — post phase 1b
+## What's next — post phase 2
 
-Phase 1b is **shipped**. The three immediate follow-ups that came with
-that merge:
+Phases 1a, 1b, and 2 are all **shipped**. TODO sections 2–5 are done.
 
-1. **Dogfood `UserPromptSubmit` live.** Every turn of every Claude Code
-   session in this repo now runs the hook. Watch
-   `heimdall-mcp hooks tail --event=user-prompt --since=1h` for:
-   - `stage=ok` lines with `cache=miss` then `cache=hit` on repeats
-   - Tier B suppression lines if Ollama goes down (first occurrence
-     visible, subsequent 5 min silent per `(project, code)`)
-   - Any stage=err lines — those are always a bug because retrieval
-     hooks exit 0 by OQ-5 and errors route through `LogHookEvent`.
-2. **With-vs-without comparison (replaces T21).** Not a benchmark, a
-   qualitative A/B. Pick a real task, run it twice in fresh sessions:
-   `HEIMDALL_HOOKS=0` for control, defaults for the treatment.
-   Compare: quality of output, token spend, tool-call count, number
-   of `heimdall_search` / `heimdall_recall` calls the model made on
-   its own (treatment should need fewer because SessionStart +
-   UserPromptSubmit inject context upfront).
-3. **Phase 2 scoping (T8 `hook stop`) blocked on Claude Code docs.**
-   The `Stop` event payload shape isn't yet confirmed from docs — 01
-   OQ §1 / 00 §8 blocker #10. Until we have a real sample, the
-   defensive parse chain in §3.4 is a guess. Do **not** start T8
-   implementation until that's resolved — confirm the payload first.
+**Immediate follow-ups (manual, need human):**
+- Reinstall hooks (5 hooks now, was 3) — `install-hooks --scope=project --force`
+- Dogfood Stop + SessionEnd live — close a real session, check hooks tail
+- Dogfood tiered retrieval — test `detail=summary` + `heimdall_expand`
+- With-vs-without comparison (T21 replacement)
 
-**If the `UserPromptSubmit` dogfood reveals latency that feels wrong
-in practice:** run a quick `go test -run TestHookUserPrompt -bench=.`
-on the hook cache path, then decide whether to revive T21 as a proper
-regression benchmark. The ceiling is still 500 ms hard / 250 ms budget
-from 00 §7.
+**Open follow-ups (incremental, from TODO.md):**
+- Auto-surface skills in SessionStart/UserPromptSubmit hooks
+- Memory path auto-detect for `context_path`
+- Hook scope filtering by CWD subpath
+- Token-savings measurement for tiered retrieval
+- Two-way sync with `~/.claude/skills/` directory
 
-**If the hook surfaces an unexpected shape of prompt payload:** the
-Claude Code docs aren't comprehensive. `hook_user_prompt.go` uses a
-tolerant JSON parser that falls back to `os.Stdin` raw text if the
-JSON envelope is missing. Malformed JSON case is unit-tested.
+**Blocked:**
+- Phase 3 guardrails — needs a destructive-op judgment primitive
+
+**Deferred (testing infrastructure):**
+- T20 Layer 2 integration tests (os/exec + fake Ollama)
+- T23 Layer 3 e2e harness (needs real Claude CLI)
 
 ---
 
@@ -437,11 +472,14 @@ internal/
     hook_post_edit_test.go — 20 tests for post-edit + actor
     hook_user_prompt.go    — HookUserPrompt (phase 1b, cache-first hot path)
     hook_user_prompt_test.go — 16 tests for user-prompt hook
+    hook_stop.go           — HookStop (rolling buffer) + HookSessionEnd (ingest trigger)
+    hook_stop_test.go      — 12 tests for stop + session-end
+    eta_test.go            — 6 tests for computeETA (DES-010)
     hooks.go               — DispatchHooks (admin: tail/cache-clear/cache-stats/doctor)
     hooks_test.go          — Wave 1 hooks admin tests
-    install.go             — CLIInstallHooks + CLIUninstallHooks
+    install.go             — CLIInstallHooks + CLIUninstallHooks + hooksDetected
     doctor.go              — HooksDoctor (11-check pipeline)
-    install_test.go        — 29 tests for install/uninstall/doctor
+    install_test.go        — 35+ tests for install/uninstall/doctor/hooksDetected
     recall.go              — CLIRecall (top-level, shared core)
     ingest_session.go      — CLIIngestSession (top-level)
     status.go              — CLIStatus (top-level)
@@ -493,47 +531,35 @@ docs/plans/hooks/
 
 ---
 
-## Final git state at session end (2026-04-16, post phase 1b merge)
+## Final git state at session end (2026-04-16, post phase 2 + sections 2–5 merge)
 
 ```
-$ git log --oneline -8
+$ git log --oneline -6
+b05af92 Merge pull request #11 from revprism-dev-bot/docs/hooks-phase1b-post-merge-handoff
+8b3442b feat: tiered retrieval, path hierarchy, session learning, LOW fixes, perf
+7550aa3 docs(hooks): post phase 1b handoff + archive pre-wave1 reviews
 320c4bd Merge pull request #10 from revprism-dev-bot/feat/hooks-phase1b-wave2
 648a388 feat(hooks): Wave 2 phase 1b — T4 search --format=hook-md + T6 hook user-prompt
 d0fb79c Merge pull request #9 from revprism-dev-bot/docs/hooks-phase1a-fully-verified
-8518d00 docs(hooks): mark Wave 2 phase 1a verified end-to-end
-50f4793 Merge pull request #8 from revprism-dev-bot/docs/hooks-handoff-post-dogfood
-90e9934 docs(hooks): update 07-next-session-handoff after phase 1a dogfood
-15d1723 Merge pull request #7 from revprism-dev-bot/fix/index-noninteractive-model-flag
-67e8335 Merge pull request #5 from revprism-dev-bot/feat/hooks-integration-waves-0-2
 ```
 
-Main is **in sync with `origin/main`** at `320c4bd`. Three stale
-`agent-*` worktrees still listed in `git worktree list` from 2026-04-11 —
-harmless, excluded from indexing, prune manually at leisure.
+Main is **in sync with `origin/main`** at `b05af92`. Three stale
+`agent-*` worktrees from 2026-04-11 remain in `git worktree list` —
+harmless, excluded from indexing, prune manually.
 
 **Open known-unknowns (ordered by urgency):**
 
-1. ~~Does `SessionStart` actually fire when Claude Code reopens the repo?~~
-   **✅ ANSWERED 2026-04-16: yes.**
-2. ~~Does `PostToolUse(Edit|Write)` actually fire on a real Claude Code
-   `Edit` tool call, and does the detached `fork+setsid` actor reach
-   `stage=ok` or hit deadletter?~~ **✅ ANSWERED 2026-04-16: yes,
-   `files=1 msg=reindex_ok`, no deadletter.**
-3. **Does `UserPromptSubmit` behave correctly end-to-end on real
-   sessions?** Unit tests pass under `-race`; live dogfood is the
-   remaining validation — the hook fires on every turn of this very
-   session. Cache-hit vs cache-miss ratio, Tier B paths under flaky
-   Ollama, and real cold-start latency all unmeasured in production.
-4. **With-vs-without comparison (T21 replacement).** Not yet run.
-   Feeds the phase 2 entry criterion "ingest-session failure rate
-   observed from the with-vs-without measurement".
-5. **Claude Code `Stop` event payload shape.** Blocker for phase 2
-   (T8). 00 §8 blocker #10. Confirm before any T8 implementation.
-6. Is `.claude/settings.json` worth gitignoring in this repo, given
-   that it now contains a machine-local install? (Cosmetic.)
-7. Do the unit-test hook-log artifacts indicate any deeper test
-   hygiene bugs beyond the obvious temp-dir fix? (Follow-up PR scope.)
-8. Does the cold-Ollama first-embed latency (~67 s observed during
-   phase 1a dogfood) mean the post-edit actor should pre-warm Ollama
-   on install, or should the hook log surface it so users don't
-   mistake it for a hang?
+1. ~~SessionStart fires?~~ **✅ yes.**
+2. ~~PostToolUse fires + actor works?~~ **✅ yes.**
+3. ~~Stop event payload shape?~~ **✅ CONFIRMED from Claude Code docs.**
+4. **Do Stop + SessionEnd hooks work end-to-end in real sessions?**
+   Unit-tested but not yet dogfooded. Need to reinstall hooks (5 now,
+   was 3) and close a session to exercise both.
+5. **Does `UserPromptSubmit` cache-hit ratio improve over sessions?**
+   The hook fires on every turn — check `hooks tail --event=user-prompt`.
+6. **With-vs-without comparison (T21 replacement).** Not yet run.
+7. **Phase 3 guardrails design.** Needs a destructive-op judgment
+   primitive that doesn't exist. Design decision required.
+8. Is `.claude/settings.json` worth gitignoring? (Cosmetic.)
+9. Do unit-test hook-log artifacts need a temp-dir fix? (Follow-up.)
+10. Should the post-edit actor pre-warm Ollama on install?
