@@ -3,7 +3,7 @@
 Tracking all outstanding work across the "steal ideas from OpenViking" roadmap.
 Tackled progressively — see status per item.
 
-## 1. Claude Code Hooks Integration (**WAVE 2 PHASE 1b LANDING** — hot-path UserPromptSubmit)
+## 1. Claude Code Hooks Integration (**WAVE 2 PHASE 1b SHIPPED** — next: dogfood + phase 2 T8 hook stop)
 
 **Goal:** make Claude actually use heimdall on every turn via Claude Code hooks,
 not via hopeful tool exposure. Highest-leverage item by a wide margin.
@@ -38,7 +38,7 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] Reopen Claude Code → `SessionStart` fires, `## Heimdall context` block in first turn
 - [x] `Edit` tool call → `PostToolUse` → `fork+setsid` actor reached `files=1 msg=reindex_ok` (no deadletter, ~67 s first embed, Ollama cold)
 
-**Wave 2 phase 1b ✅ landing (this PR):**
+**Wave 2 phase 1b shipped** (PR #10, merge `320c4bd`, impl `648a388`):
 - [x] T4 `--format=hook-md` on `search` + `--budget-ms` — breaking `SearchFiltered` signature (ctx first arg), 30+ call sites updated, real ctx cancellation in the row loop
 - [x] T4 side-effect: killed the `TestSearchFiltered_BudgetTimeout` skip stub, replaced with real pre-cancelled-ctx assertions + nil-ctx tolerance
 - [x] T6 `hook user-prompt` command — 250 ms default budget, skip heuristic (`len < 8`), cache lookup keyed on `(normalized_prompt, index_version, project)`, Tier B suppression on Ollama down / model mismatch, cache store on miss
@@ -47,6 +47,10 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] Version constants bumped to `wave2-phase1b` (doctor `--version` check + install envelope)
 - [~] **T21 benchmark skipped for now** — original plan called for a microbenchmark; replaced with a same-task with-vs-without-hooks comparison after merge (per user direction)
 - [~] **Soak gate killed** — wall-clock soak tests nothing for a solo local tool; phase 1b rides on the unit test suite + dogfood instead
+
+**Wave 2 phase 1b follow-ups (post-merge, open):**
+- [ ] Live dogfood `UserPromptSubmit` — watch `hooks tail --event=user-prompt` for cache-hit/miss ratio, Tier B paths, any stage=err lines
+- [ ] With-vs-without comparison (T21 replacement): pick a real task, run twice — `HEIMDALL_HOOKS=0` control vs defaults — compare quality, token spend, tool-call count
 
 **Wave 2 phase 2 (pending, session learning):**
 - [ ] T8 `hook stop` command (rolling buffer → ingest-session handoff)

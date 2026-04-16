@@ -9,31 +9,34 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> Wave 2 phase 1a of the Claude Code hooks integration for heimdall-mcp is
-> merged to `origin/main` (PR #5, merge commit `67e8335`), and four follow-up
-> bugs caught by the first real dogfood run are also merged (PR #7, merge
-> commit `15d1723`). The full roadmap, locked decisions, implementation plan,
-> and review gate history are in `docs/plans/hooks/`.
+> Wave 2 phase **1b** of the Claude Code hooks integration for heimdall-mcp
+> is merged to `origin/main` (PR #10, merge commit `320c4bd`; implementation
+> commit `648a388`). Phase 1a shipped earlier via PR #5 (`67e8335`) with
+> dogfood follow-ups in PR #7 (`15d1723`). The full roadmap, locked
+> decisions, implementation plan, and review gate history are in
+> `docs/plans/hooks/`.
 >
-> **Dogfood steps 0–8 are done, AND the post-edit path is verified too.**
-> The repo is indexed (1758 chunks on `nomic-embed-text`), hooks are
-> installed to `.claude/settings.json`, `hooks doctor` reports **11/11
-> green**, and on 2026-04-16 a fresh Claude Code session reopened the repo
-> and the `## Heimdall context` block arrived via the real hook pipeline
-> (`event=session-start bullets=5 chunks=1758 model=nomic-embed-text stage=ok`).
-> A real `Edit` tool call through Claude Code then fired `PostToolUse`,
-> spawned the detached `fork+setsid` actor, and the actor reached
-> `event=post-edit-actor files=1 msg=reindex_ok` with no deadletter and
-> clean state-file cleanup. First embed was slow (~67 s cold on
-> `nomic-embed-text`) because Ollama had to load the model — subsequent
-> edits should be fast. **Phase 1a is verified end-to-end; the
-> `.claude/settings.json` schema guess was correct.**
+> **Phase 1a was dogfooded end-to-end on 2026-04-16** and verified: 1758
+> chunks on `nomic-embed-text`, `hooks doctor` 11/11 green, real
+> `SessionStart` fires `## Heimdall context` into the first turn, real
+> `Edit` tool call fires `PostToolUse` → `fork+setsid` actor reaches
+> `files=1 msg=reindex_ok` with no deadletter. First embed was a ~67 s
+> Ollama cold-load — subsequent edits are fast.
 >
-> Before touching code, read this file — it has the exact command sequence,
-> known caveats, recovery paths, and the four follow-up fixes from PR #7.
-> Do not start Wave 2 phase 1b (the UserPromptSubmit hot path) until
-> phase 1a has soaked for at least a day. Soak clock started
-> **2026-04-16 00:19 local** (first verified post-edit reindex).
+> **Phase 1b then landed without waiting on a soak gate.** The original
+> plan called for "phase 1a stable ≥ 1 week" before cutting 1b; per user
+> direction this gate was killed — for a solo local tool, wall-clock
+> soak tests nothing. Phase 1b rides on the unit test suite (16 new cases
+> in `hook_user_prompt_test.go`) plus live dogfood of `UserPromptSubmit`
+> (the hook fires on every turn of this very session). The original T21
+> microbenchmark was also skipped in favor of a same-task
+> with-vs-without-hooks comparison to be run as a follow-up after merge.
+>
+> Before touching code, read this file — it has the current state of all
+> three retrieval hooks, known caveats, recovery paths, and open
+> follow-ups. The next code work is **Wave 2 phase 2** (T8 `hook stop` →
+> rolling buffer → `ingest-session`) and it is blocked on confirming the
+> Claude Code `Stop` event payload shape against a real sample.
 
 ---
 
@@ -53,7 +56,7 @@ Main repo: `/home/noname/Code/heimdall-mcp`. All Wave 1/2 work is on the
 
 ---
 
-## What shipped (Wave 0 → Wave 1 → Wave 2 phase 1a)
+## What shipped (Wave 0 → Wave 1 → Wave 2 phase 1a → Wave 2 phase 1b)
 
 ### Wave 0 — initial review fixes (commits up to `93384c8`)
 11 code fixes from a 1224-line review pass: dead `checkModelMismatch` removed,
@@ -115,6 +118,52 @@ cases and a `ResolveUsableModelDB` table-driven test.
   Performance 97, Tests 96, Design 98. 110 tests in `internal/cli`, all
   green under `-race`.
 
+### Wave 2 phase 1b — hot path (merged as PR #10, merge `320c4bd`, impl `648a388`)
+
+- **T4** `heimdall-mcp search --format=hook-md` + `--budget-ms`. Breaking
+  change: `heimdall.SearchFiltered` now takes `ctx context.Context` as its
+  first argument. 30+ call sites updated across CLI, MCP server, and
+  tests. The Wave 1 `TestSearchFiltered_BudgetTimeout` skip stub was
+  deleted and replaced with real pre-cancelled-ctx assertions plus a
+  nil-ctx tolerance case. The row loop now checks `ctx.Err()` so a
+  budget timeout cuts scoring mid-flight rather than only at the end.
+- **T6** `heimdall-mcp hook user-prompt` — the hot-path retrieval hook.
+  250 ms default budget, 500 ms hard cap via `context.WithTimeout`.
+  Length-guard skip heuristic: prompts under 8 chars short-circuit with
+  no output (rejected LLM-gate variant stays rejected — see 00 §5.2).
+  Cache lookup keyed on `(normalized_prompt, index_version, project)`
+  using the Wave 1 `hook_cache` table. Tier B suppression on Ollama
+  down / model mismatch / missing index via the Wave 1 suppress store.
+  Cache store on miss; cache hit short-circuits embedding entirely.
+  Empty stdin falls back to CWD for project resolution. `--prompt` flag
+  override for doctor dry-fires. All retrieval-hook OQ-5 rules apply:
+  always exits 0, routes everything through `LogHookEvent`, never
+  writes to stderr.
+- **T14 update** — `install-hooks` template now installs **three** hooks:
+  `SessionStart`, `PostToolUse(Edit|Write)`, and `UserPromptSubmit`. The
+  dual marker detection (JSON `"source": "heimdall"` + command-string
+  `--source=heimdall`) extends to the new entry. Version constants
+  bumped to `wave2-phase1b` on both the `--version` handler and the
+  install envelope.
+- **T21 skipped.** Original plan called for `BenchmarkUserPromptHook`
+  asserting p95 ≤ 250 ms uncached, p50 ≤ 50 ms cached, hard ≤ 500 ms.
+  Replaced per user direction with a post-merge same-task
+  with-vs-without-hooks comparison on a real Claude Code session.
+  Tracked as an open follow-up below, not a gate.
+- **Soak gate killed.** The `00-consolidated-plan.md §7` language still
+  says "1a verified end-to-end" is the 1b entry criterion and it is —
+  but the "stable ≥ 1 week" version of that gate was dropped. Phase 1b
+  tests instead are: 16 new unit cases under `-race`, `hooks doctor`
+  dry-fire of `user-prompt` green, and live dogfood.
+- **Tests:** 16 new cases in `internal/cli/hook_user_prompt_test.go`
+  covering: skip (length guard), disabled (env + marker file), Ollama
+  down (Tier B suppressed first occurrence, silent after), no index,
+  model mismatch, happy path caches result, cache hit short-circuits,
+  cache invalidation on `index_version` bump, budget timeout cuts row
+  loop, prompt normalization, empty stdin → CWD fallback, `--prompt`
+  flag override, malformed JSON payload, dispatcher routing, version
+  stamp.
+
 ### Wave 2 phase 1a dogfood follow-ups — merged as PR #7 (merge commit `15d1723`)
 
 Four bugs surfaced on the first real dogfood run that blocked or soft-failed
@@ -175,37 +224,42 @@ From `docs/plans/hooks/06-decisions.md`:
 
 ## Next steps (in order)
 
-1. ~~**User closes and reopens Claude Code in this repo** (dogfood step 8).~~
-   **✅ VERIFIED 2026-04-16.** On session reopen, the `## Heimdall context`
-   block arrived in the first turn's system-reminder. Hook log:
-   `2026-04-15T23:15:27Z INFO event=session-start bullets=5 chunks=1758 model=nomic-embed-text stage=ok`.
-   The `.claude/settings.json` schema guess was correct — no patch needed
-   to `phase1aHooks` in `internal/cli/install.go`.
+1. ~~Phase 1a end-to-end dogfood (SessionStart + PostToolUse + actor).~~
+   **✅ VERIFIED 2026-04-16.** See the "dogfood follow-ups" section for
+   the four PR #7 fixes and the Dogfood sequence table below for the
+   command-by-command trace. fork+setsid works in the wild.
 
-2. ~~**Edit any file** via Claude Code's `Edit` tool.~~
-   **✅ VERIFIED 2026-04-16.** A trivial `Edit` on `TODO.md` fired
-   `PostToolUse(Edit)`. Foreground log:
-   `2026-04-15T23:18:09Z INFO event=post-edit msg=actor_spawned`.
-   The detached `fork+setsid` actor (PID 2930097, state `SNsl`, session
-   leader confirmed) reached
-   `2026-04-15T23:19:16Z INFO event=post-edit-actor files=1 msg=reindex_ok`
-   after ~67 s. That long first-embed was an Ollama cold-load of
-   `nomic-embed-text`, not a hang — `/proc/<pid>/net` confirmed the socket
-   to `127.0.0.1:11434` was ESTAB the whole time. `reindex.deadletter.jsonl`
-   stayed empty, `reindex.inflight.pid` was cleaned up, and
-   `reindex.last_run` was stamped. **fork+setsid works in the wild**; the
-   `HEIMDALL_POST_EDIT_SYNC=1` fallback hinted at in §"What to do after
-   dogfood succeeds" is not needed.
+2. ~~**Soak ≥ 1 day before starting phase 1b.**~~ **❌ KILLED.** Per
+   user direction the wall-clock soak gate was dropped as a
+   solo-local-tool nonsense — for a tool with exactly one user, time
+   without usage measures nothing. Phase 1b cut immediately after
+   phase 1a dogfood landed.
 
-3. **Soak ≥1 day.** Phase 1b gate criteria (see
-   `00-consolidated-plan.md §7`) require phase 1a stable for at least a
-   week, but at minimum sleep on it overnight before cutting phase 1b.
-   Soak clock started **2026-04-16 00:19 local**.
+3. ~~**Start Wave 2 phase 1b** (T4 + T6 + install template update).~~
+   **✅ SHIPPED** — PR #10, merge `320c4bd`, impl `648a388`. See the
+   phase 1b section above for the full scope.
 
-4. **Start Wave 2 phase 1b** — see the "What to do after dogfood
-   succeeds" section below for scope (T4 `--format=hook-md` +
-   `--budget-ms` breaking change, T6 `hook user-prompt` hot path,
-   T21 benchmark).
+4. **Dogfood `UserPromptSubmit` end-to-end.** The hook fires on every
+   turn. Verify the `## Heimdall context` block arrives on prompt
+   submission, check `heimdall-mcp hooks tail --event=user-prompt
+   --since=1h` for cache-hit vs cache-miss lines, and watch
+   `hooks.log` for any Tier B suppression. This is the replacement
+   for the killed T21 microbenchmark — real usage on a real session.
+
+5. **Run the with-vs-without comparison.** The agreed replacement for
+   T21 is a same-task A/B: pick a representative task in this repo,
+   run it twice in fresh Claude Code sessions — once with
+   `HEIMDALL_HOOKS=0`, once with hooks live — and compare quality,
+   token spend, and tool-call count. Report findings back into the
+   plan.
+
+6. **Start Wave 2 phase 2** — `hook stop` rolling buffer →
+   `ingest-session`. **Blocked** until the Claude Code `Stop` event
+   payload shape is confirmed against a real sample (01 OQ §1 /
+   consolidated plan §8 blocker #10). The defensive fallback chain
+   in §3.4 ships blind until that's resolved. Phase 2 gate criteria
+   otherwise: retention policy confirmed, ingest-session failure rate
+   observed from the with-vs-without run.
 
 ---
 
@@ -331,38 +385,42 @@ heimdall-mcp hooks tail --event=post-edit --since=5m
 
 ---
 
-## What to do after dogfood succeeds
+## What's next — post phase 1b
 
-**If dogfood goes clean:** open Wave 2 phase 1b. Scope:
+Phase 1b is **shipped**. The three immediate follow-ups that came with
+that merge:
 
-- **T4** `--format=hook-md` on `search` + `--budget-ms`. Breaking change:
-  adds `ctx context.Context` parameter to `SearchFiltered` (removes the
-  Wave 1 `TestSearchFiltered_BudgetTimeout` skip stub). Required before T6.
-- **T6** `hook user-prompt` — the hot path. 250 ms p95 uncached, 50 ms
-  p50 cached, 500 ms hard timeout. Calls the Wave 1 `hook_cache` keyed on
-  `(normalized_prompt, index_version, scope)`. Length-guard skip heuristic
-  for trivial prompts (`len(prompt) < 8`). The `prompt`-hook LLM gate was
-  rejected (see consolidated plan §5.2) — do not revisit.
-- **T21** `BenchmarkUserPromptHook` regression baseline.
+1. **Dogfood `UserPromptSubmit` live.** Every turn of every Claude Code
+   session in this repo now runs the hook. Watch
+   `heimdall-mcp hooks tail --event=user-prompt --since=1h` for:
+   - `stage=ok` lines with `cache=miss` then `cache=hit` on repeats
+   - Tier B suppression lines if Ollama goes down (first occurrence
+     visible, subsequent 5 min silent per `(project, code)`)
+   - Any stage=err lines — those are always a bug because retrieval
+     hooks exit 0 by OQ-5 and errors route through `LogHookEvent`.
+2. **With-vs-without comparison (replaces T21).** Not a benchmark, a
+   qualitative A/B. Pick a real task, run it twice in fresh sessions:
+   `HEIMDALL_HOOKS=0` for control, defaults for the treatment.
+   Compare: quality of output, token spend, tool-call count, number
+   of `heimdall_search` / `heimdall_recall` calls the model made on
+   its own (treatment should need fewer because SessionStart +
+   UserPromptSubmit inject context upfront).
+3. **Phase 2 scoping (T8 `hook stop`) blocked on Claude Code docs.**
+   The `Stop` event payload shape isn't yet confirmed from docs — 01
+   OQ §1 / 00 §8 blocker #10. Until we have a real sample, the
+   defensive parse chain in §3.4 is a guess. Do **not** start T8
+   implementation until that's resolved — confirm the payload first.
 
-Phase 1b gate criteria (from `00-consolidated-plan.md §7`):
-- Phase 1a stable ≥ 1 week.
-- T21 benchmark green on a mid-size repo (≥ 10k chunks): p95 ≤ 250 ms
-  uncached, p50 ≤ 50 ms cached, hard ≤ 500 ms.
-- Model-mismatch Tier B path exercised end-to-end.
-- Cache-invalidation path verified against a concurrent edit.
+**If the `UserPromptSubmit` dogfood reveals latency that feels wrong
+in practice:** run a quick `go test -run TestHookUserPrompt -bench=.`
+on the hook cache path, then decide whether to revive T21 as a proper
+regression benchmark. The ceiling is still 500 ms hard / 250 ms budget
+from 00 §7.
 
-**If dogfood reveals a settings.json shape bug:** do NOT try to fix it
-while blind. Uninstall, read a working Claude Code settings.json, update
-the `phase1aHooks` template in `internal/cli/install.go`, add a regression
-test, reinstall, retry dogfood.
-
-**If dogfood reveals a fork+setsid bug:** the simplest first fix is to
-fall back to synchronous in-process reindex in the actor path. Add a
-`HEIMDALL_POST_EDIT_SYNC=1` env var that short-circuits the fork and
-runs the actor body in the foreground goroutine. It's not production-ideal
-(reindex blocks the hook for seconds) but it unblocks dogfood while the
-real fork issue is triaged.
+**If the hook surfaces an unexpected shape of prompt payload:** the
+Claude Code docs aren't comprehensive. `hook_user_prompt.go` uses a
+tolerant JSON parser that falls back to `os.Stdin` raw text if the
+JSON envelope is missing. Malformed JSON case is unit-tested.
 
 ---
 
@@ -377,6 +435,8 @@ internal/
     hook_post_edit.go      — HookPostEdit (foreground + spawn wrapper)
     hook_post_edit_actor.go — runPostEditActor (pure testable actor core)
     hook_post_edit_test.go — 20 tests for post-edit + actor
+    hook_user_prompt.go    — HookUserPrompt (phase 1b, cache-first hot path)
+    hook_user_prompt_test.go — 16 tests for user-prompt hook
     hooks.go               — DispatchHooks (admin: tail/cache-clear/cache-stats/doctor)
     hooks_test.go          — Wave 1 hooks admin tests
     install.go             — CLIInstallHooks + CLIUninstallHooks
@@ -433,26 +493,23 @@ docs/plans/hooks/
 
 ---
 
-## Final git state at session end (2026-04-15, post-dogfood)
+## Final git state at session end (2026-04-16, post phase 1b merge)
 
 ```
-$ git log --oneline -6
+$ git log --oneline -8
+320c4bd Merge pull request #10 from revprism-dev-bot/feat/hooks-phase1b-wave2
+648a388 feat(hooks): Wave 2 phase 1b — T4 search --format=hook-md + T6 hook user-prompt
+d0fb79c Merge pull request #9 from revprism-dev-bot/docs/hooks-phase1a-fully-verified
+8518d00 docs(hooks): mark Wave 2 phase 1a verified end-to-end
+50f4793 Merge pull request #8 from revprism-dev-bot/docs/hooks-handoff-post-dogfood
+90e9934 docs(hooks): update 07-next-session-handoff after phase 1a dogfood
 15d1723 Merge pull request #7 from revprism-dev-bot/fix/index-noninteractive-model-flag
-367d225 fix(cli): phase 1a dogfood follow-ups — --model flag, version, =form flags
 67e8335 Merge pull request #5 from revprism-dev-bot/feat/hooks-integration-waves-0-2
-5ce482b docs(hooks): add 07-next-session-handoff — dogfood runbook
-8027105 docs: mark Wave 2 phase 1a merged in TODO.md
-fbcb4dc Merge feat/wave2-stream-f-install-uninstall-doctor (Wave 2 T14/T15/T16)
-
-$ git status --short
-# nothing tracked on main; only untracked noise under .claude/ and .idea/
-# plus .claude/settings.json from the dogfood install (not gitignored yet —
-# worth a follow-up)
 ```
 
-Main is clean and **in sync with `origin/main`** at `15d1723`. Three stale
+Main is **in sync with `origin/main`** at `320c4bd`. Three stale
 `agent-*` worktrees still listed in `git worktree list` from 2026-04-11 —
-harmless, now excluded from indexing, prune manually at leisure.
+harmless, excluded from indexing, prune manually at leisure.
 
 **Open known-unknowns (ordered by urgency):**
 
@@ -461,16 +518,22 @@ harmless, now excluded from indexing, prune manually at leisure.
 2. ~~Does `PostToolUse(Edit|Write)` actually fire on a real Claude Code
    `Edit` tool call, and does the detached `fork+setsid` actor reach
    `stage=ok` or hit deadletter?~~ **✅ ANSWERED 2026-04-16: yes,
-   `files=1 msg=reindex_ok`, no deadletter.** First-embed cold-load cost
-   was ~67 s — worth characterizing in the T21 benchmark on a warm
-   Ollama so phase 1b's 250 ms p95 budget isn't held hostage to cold
-   model reloads.
-3. Is `.claude/settings.json` worth gitignoring in this repo, given that
-   it now contains a machine-local install? (Cosmetic.) — **still open.**
-4. Do the unit-test hook-log artifacts indicate any deeper test
+   `files=1 msg=reindex_ok`, no deadletter.**
+3. **Does `UserPromptSubmit` behave correctly end-to-end on real
+   sessions?** Unit tests pass under `-race`; live dogfood is the
+   remaining validation — the hook fires on every turn of this very
+   session. Cache-hit vs cache-miss ratio, Tier B paths under flaky
+   Ollama, and real cold-start latency all unmeasured in production.
+4. **With-vs-without comparison (T21 replacement).** Not yet run.
+   Feeds the phase 2 entry criterion "ingest-session failure rate
+   observed from the with-vs-without measurement".
+5. **Claude Code `Stop` event payload shape.** Blocker for phase 2
+   (T8). 00 §8 blocker #10. Confirm before any T8 implementation.
+6. Is `.claude/settings.json` worth gitignoring in this repo, given
+   that it now contains a machine-local install? (Cosmetic.)
+7. Do the unit-test hook-log artifacts indicate any deeper test
    hygiene bugs beyond the obvious temp-dir fix? (Follow-up PR scope.)
-   — **still open.**
-5. Does the cold-Ollama first-embed latency (~67 s observed here) mean
-   the post-edit actor should pre-warm Ollama on install, or should the
-   hook log surface it so users don't mistake it for a hang? — **new
-   from the 2026-04-16 verification run.**
+8. Does the cold-Ollama first-embed latency (~67 s observed during
+   phase 1a dogfood) mean the post-edit actor should pre-warm Ollama
+   on install, or should the hook log surface it so users don't
+   mistake it for a hang?
