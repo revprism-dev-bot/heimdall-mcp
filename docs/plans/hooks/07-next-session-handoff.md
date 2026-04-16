@@ -9,73 +9,112 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> **Wave 2 phase 2** (session learning) plus TODO sections 2–5 (tiered
-> retrieval, path hierarchy, skills, LOW fixes, perf) are all merged to
-> `origin/main` via PR #11 (merge `b05af92`). Phase 1a shipped in PR #5,
-> phase 1b in PR #10. The full roadmap, locked decisions, and review
-> history are in `docs/plans/hooks/`.
+> **Status at `65a396b` (2026-04-16 late):** Waves 1–2 plus the late-session
+> parallel push are all merged to `origin/main`. Phase 3 destructive-op
+> guardrails **shipped in shadow mode by default** in PR #23. 10 PRs landed
+> today in parallel (#14–#23). See "What shipped" for the roll-up.
 >
-> **Heimdall now installs 5 hooks**: `SessionStart`, `PostToolUse(Edit|Write)`,
-> `UserPromptSubmit`, `Stop`, and `SessionEnd`. The Stop event payload
-> shape was confirmed from Claude Code docs on 2026-04-16: `session_id`,
-> `transcript_path`, `last_assistant_message`, `cwd`, `stop_hook_active`.
-> SessionEnd provides `reason` (clear/resume/logout/etc.). Stop appends
-> assistant messages to a rolling JSONL buffer per session; SessionEnd
-> triggers `ingest-session` from the transcript path and cleans up.
+> **Heimdall installs 6 hooks**: `SessionStart`, `PostToolUse(Edit|Write)`,
+> `UserPromptSubmit`, `Stop`, `SessionEnd`, and **`PreToolUse(Bash)`**
+> (new — Phase 3 guardrail). The PreToolUse hook runs a 19-rule classifier
+> against every Bash tool invocation and logs `class=allow|warn|block` via
+> `LogHookEvent`. Default mode is **shadow** — classifier runs but never
+> blocks. Toggle via `HEIMDALL_GUARDRAILS=shadow|warn|block|off`.
 >
-> **New MCP tools shipped**: `heimdall_expand` (chunk drill-down for tiered
-> retrieval), `heimdall_ls` (path hierarchy navigation). `heimdall_search`
-> gained `detail=summary|snippet|full`, `scope=` (path prefix filter).
-> Schema has `summary` and `context_path` columns, both auto-generated at
-> index time. Skills are a new memory type (`type=skill`).
+> **MCP tool surface:** `heimdall_search` (`detail`, `scope`), `heimdall_expand`,
+> `heimdall_ls`, `heimdall_remember` (now with `context_path` auto-derive from
+> CWD and optional `write_file=true` for skills → disk), `heimdall_recall`.
+> New CLI commands: `heimdall-mcp skills import` (sync `~/.claude/skills/` →
+> heimdall memory), `heimdall-mcp hooks explain-command "<cmd>"` (dry-run the
+> guardrail classifier).
 >
-> **All 6 LOW-severity findings fixed**, PERF-002/003 implemented, first-run
-> hint after `index`, T24 Windows path redaction verified, `MockEmbedder`
-> renamed to `StubEmbedder`, `EmbedBatchSize` now config-driven, ETA
-> computation extracted and tested.
+> **Measured win:** tiered retrieval bench shows **62.4% token savings** at
+> a 20% expand rate vs `detail=full`. See `docs/plans/hooks/09-tiered-retrieval-benchmark.md`
+> and run `make bench` to re-measure.
 >
-> **What's next**: Phase 3 guardrails (`PreToolUse` destructive-op hook),
-> live dogfood of Stop/SessionEnd hooks, with-vs-without comparison,
-> and the follow-up items listed in TODO.md. Phase 3 is blocked on
-> designing a destructive-op judgment primitive.
+> **What's actually live now:**
+> - CWD-subpath scope filtering in SessionStart + UserPromptSubmit (PR #17)
+> - Top-N skill memories surfaced in both retrieval hooks (PR #15)
+> - Ollama pre-warm on `install-hooks` (PR #19) — removes the ~67 s first-turn cold start
+> - Test-isolation: unit tests no longer pollute real `~/.local/state/heimdall/hooks.log` (PR #14)
+> - 2-way skills sync with `~/.claude/skills/` (PR #20)
+> - Layer-2 integration + Layer-3 e2e test harnesses, both build-tag gated (PR #16)
+> - `.claude/` and `.idea/` gitignored (PR #21)
 >
-> Before touching code, read this file + `TODO.md` for the full picture.
+> **What's next** (needs live sessions or decisions, not more dispatched agents):
+> 1. Dogfood the full 6-hook pipeline — especially PreToolUse guardrails in shadow, then promote to warn
+> 2. Measure savings with `heimdall-mcp sessions report --session-id=<latest>` after real sessions (new in PR #28 — supersedes the old T21 plan)
+> 3. Any follow-ups surfaced by live dogfood telemetry (`hooks tail --event=pre-tool-use`)
+>
+> Before touching code, read this file + `TODO.md` + `docs/plans/hooks/08-destructive-op-primitive.md` (design for Phase 3) for full context.
 
 ---
 
-## First actions on resumption (2026-04-16 session end)
+## First actions on resumption (2026-04-16 late session end)
 
-**Auto-upgrade check (if this is the first open after PR #13):**
-- ✅ **VERIFIED 2026-04-16.** Auto-upgrade fired on SessionStart, added
-  `[Stop SessionEnd]` at `2026-04-16T19:15:27Z scope=project`.
-  `hooks doctor` reports 11/11 green, 5 hooks installed.
+**Binary + hooks state at session close:**
+- Binary rebuilt from `65a396b` and installed at `/home/noname/.local/bin/heimdall-mcp`
+  (symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`).
+  `heimdall-mcp --version` → `v0.0.2-0.20260416204003-65a396b1b0b2 (65a396b)`.
+- `install-hooks --scope=project` run fresh — 6 hooks installed at
+  `/home/noname/Code/heimdall-mcp/.claude/settings.json`.
+- Prewarm succeeded in 31 ms (Ollama was hot).
+- `hooks doctor` = **12/13 OK** + 1 warn (skills sync: 5/7 synced — two skills
+  exceed `nomic-embed-text` context length, see note below).
+- `guardrail classifier: 19 rules loaded` ✅ — Phase 3 primitive active.
 
-**Stop + SessionEnd dogfood (the reason this session was closed):**
-Run immediately after open:
+**Immediate dogfood to run (paste these in the first turn after reopen):**
 ```bash
-heimdall-mcp hooks tail --event=stop        --since=2h
-heimdall-mcp hooks tail --event=session-end --since=2h
-ls /home/noname/Code/heimdall-mcp/.heimdall_db/hooks/sessions/
+# Did the full 6-hook pipeline fire cleanly?
+heimdall-mcp hooks tail --event=session-start --since=10m
+heimdall-mcp hooks tail --event=user-prompt   --since=10m
+heimdall-mcp hooks tail --event=pre-tool-use  --since=10m   # NEW — Phase 3 shadow mode
+heimdall-mcp hooks tail --event=post-edit     --since=10m
+heimdall-mcp hooks tail --event=stop          --since=10m
+heimdall-mcp hooks tail --event=session-end   --since=10m
+
+# Per-session savings summary (NEW — PR #28)
+heimdall-mcp sessions list
+heimdall-mcp sessions report --session-id=<latest-from-list>
 ```
-Expect:
-- ≥1 `event=stop msg=buffer_appended` line (one per assistant turn before close)
-- 1 `event=session-end msg=ingest_ok` **or** `msg=session_ended` line
-  (reason should be `clear` for `/exit`, `logout` for quit)
-- sessions/ dir empty (SessionEnd cleans up the rolling buffer after ingest)
 
-Red flags:
-- `event=stop` lines but no `session-end` → SessionEnd never fired.
-- `session-end err=ingest_failed` → transcript_path missing or bad JSONL.
-- sessions/*.jsonl leftover after `session-end ok` → cleanup path broken.
+**What "healthy" looks like on first open:**
+- `session-start stage=ok bullets=N chunks=2546 model=nomic-embed-text skills=K scope=`
+  (the new `skills=` and `scope=` fields were added in PR #15 and #17 respectively;
+  scope is empty when CWD == repo root)
+- `user-prompt stage=ok hits=N skills=K bytes=B model=nomic-embed-text scope=` on every prompt
+- `pre-tool-use` lines only appear when you run a `Bash` tool call. Format:
+  `mode=shadow class=allow rule=... reason=...`. Exit is always 0 in shadow mode.
+- `post-edit` + actor `reindex_ok` if you edit any file
+- `stop` `buffer_appended` per assistant turn; `session-end session_ended` on close
 
-**Pending branch to PR (implemented but not yet pushed):**
-- Branch: `fix/hook-log-test-isolation`
-- What: adds `internal/cli/testmain_test.go` that redirects
-  `HEIMDALL_HOOK_LOG` to a per-binary temp dir, fixing caveat #7
-  (test runs polluting the real `~/.local/state/heimdall/hooks.log`)
-- Verified: `go test ./... -race` green; deleting real hooks.log and
-  re-running tests leaves it uncreated.
-- TODO next session: confirm with user, then commit + push + open PR.
+**Red flags to watch for:**
+- `pre-tool-use mode=shadow class=block` for a command you expect to be safe →
+  false positive in the 19-rule starter set. Run
+  `heimdall-mcp hooks explain-command "<cmd>"` to reproduce. Add a test case
+  + rule refinement in `internal/heimdall/destructive_ops.go`.
+- `guardrail classifier` warn in `hooks doctor` → primitive panic on load.
+- Any retrieval hook (non-`pre-tool-use`) writes to stderr on a real fire —
+  that's an OQ-5 violation.
+
+**Known warn from `hooks doctor`:**
+```
+[!!] skills sync    5/7 synced — run 'heimdall-mcp skills import'
+```
+Two skill files in `~/.claude/skills/` exceed `nomic-embed-text`'s 8192-token
+context window (`code-improvement-orchestrator/SKILL.md`,
+`deep-code-review/SKILL.md`). Their import errored out with
+`ollama embed: status 400: the input length exceeds the context length`. Not
+blocking — the other 5 skills imported fine. Follow-ups: either (a) chunk
+large skill files before embedding, (b) swap to a larger-context embed
+model, or (c) accept that outlier skills stay disk-only. Track as a
+section 4 follow-up in TODO.md.
+
+**Promoting PreToolUse guardrails from shadow:**
+After ≥1 day of shadow-mode telemetry with zero false-positive blocks,
+promote by setting `HEIMDALL_GUARDRAILS=warn` (`block` mode is the eventual
+target, but only after a false-positive audit). See the rollout section of
+`docs/plans/hooks/08-destructive-op-primitive.md`.
 
 ---
 
@@ -288,6 +327,82 @@ landed on `main` after the phase 1a body.
   plus an assertion in `TestDefaultConfig_NewFields` that the new exclude is
   present. Full suite green under `-race`.
 
+### Late-2026-04-16 parallel push (PRs #14–#23, 10 merges, main at `65a396b`)
+
+All 10 PRs were dispatched as parallel background agents under the user directive
+"launch as many agents as you can, all to be done now." Each landed independently
+with its own test suite; conflicts were resolved during merge. Final `go test
+./... -race -count=1` green across all 5 packages after every merge.
+
+**Hooks foundation / DX (5 PRs):**
+- **PR #14** `fix(cli)`: `internal/cli/testmain_test.go` redirects `HEIMDALL_HOOK_LOG`
+  to a per-binary temp dir. Closes long-running caveat #7 — unit tests no
+  longer pollute `~/.local/state/heimdall/hooks.log`.
+- **PR #15** `feat(hooks)`: surface top-N `type=skill` memories in both
+  SessionStart and UserPromptSubmit blocks. New helper
+  `internal/cli/hook_skills.go::surfaceRelevantSkills()`. Section omitted
+  when no skills match. Respects existing 2 s / 250 ms budgets.
+  Test helper isolates memory store per test.
+- **PR #16** `test(hooks)`: Layer-2 integration tests (`//go:build integration`,
+  `internal/cli/integration_test.go` — 4 cases using `os/exec` + fake Ollama)
+  and Layer-3 e2e harness (`//go:build e2e`, gated by `HEIMDALL_E2E_CLAUDE=1` +
+  `claude` on PATH, skips cleanly otherwise). Makefile targets `test-integration`,
+  `test-e2e`, `test-all`.
+- **PR #17** `feat(hooks)`: CWD scope filter + auto-detect memory path.
+  `internal/heimdall/scope.go::FindRepoRoot` + `ComputeScope`; shared by CLI
+  and MCP. Session/UserPrompt hooks pass `scope=<relpath>` when CWD is a
+  subpath of repo root. `heimdall_remember` auto-fills `context_path` from
+  MCP request CWD. Cache key for UserPrompt now includes scope (subpath vs
+  root get different cache rows).
+- **PR #19** `feat(install)`: pre-warm Ollama after `install-hooks` with a
+  5 s-bounded `EmbedForHook` call. `--no-prewarm` to skip. Skips on
+  `--dry-run` or empty `cfg.Model`. Best-effort — install never fails on
+  prewarm error. Removes the ~67 s first-turn cold start that was
+  burning the first real PostToolUse.
+
+**Phase 3 guardrails (design + impl, 2 PRs):**
+- **PR #18** `docs(hooks)`: `docs/plans/hooks/08-destructive-op-primitive.md`
+  (499 lines). Recommends 3-level classification (`allow` / `warn` / `block`),
+  static Go rules as v1, shadow→warn→block rollout. Justifies static rules
+  over YAML and LLM judgment.
+- **PR #23** `feat(hooks)`: full Phase 3 implementation per the design.
+  - `internal/heimdall/destructive_ops.go` — 19-rule classifier (`ClassifyBashCommand`),
+    allowlist-first precedence (`git push --force-with-lease` beats generic
+    `--force` block). `DestructiveRuleCount()` asserts against drift. 80
+    classifier test assertions.
+  - `internal/cli/hook_pre_tool_use.go` — new hook handler, honors
+    `HEIMDALL_GUARDRAILS=shadow|warn|block|off`, `HEIMDALL_HOOKS=0`, and
+    `<project>/.heimdall/hooks.disabled`. Default `shadow`. Exit 2 + stderr
+    ONLY in `block` mode on `ClassBlock`.
+  - `internal/cli/hooks_explain_test.go` — `heimdall-mcp hooks explain-command
+    "<cmd>"` CLI for dry-running the classifier.
+  - `internal/cli/install.go` — 6-hook template, envelope bumped to `wave2-phase3`,
+    auto-upgrade path (PR #13) picks this up cleanly.
+  - `internal/cli/doctor.go` — 13th check (`guardrail classifier: 19 rules loaded`).
+  - ~105 new test cases total.
+
+**TODO follow-ups closed (3 PRs):**
+- **PR #20** `feat(skills)`: two-way sync with `~/.claude/skills/`.
+  - Inbound: `heimdall-mcp skills import [--dir PATH] [--dry-run] [--format text|json]`
+    walks `<dir>/<name>/SKILL.md`, parses YAML frontmatter (stdlib only, no deps),
+    upserts `type=skill` memory with deterministic ID `mem:skill:disk:<slug>`.
+    Idempotent via `ContentHash`.
+  - Outbound: `heimdall_remember --type=skill --write_file=true` writes
+    `<skills-dir>/<slug>/SKILL.md`. Default OFF.
+  - Doctor: 12th check `skills sync` reports drift; warn, not fail.
+  - `HEIMDALL_CLAUDE_SKILLS_DIR` env override isolates tests from real
+    user state. 35 new test cases.
+- **PR #21** `chore`: gitignore `.claude/` + `.idea/`; fix stale "phase-2
+  destructive-op hook" references across `01-architecture.md`,
+  `02-cli-surface.md`, `08-destructive-op-primitive.md`; extend OQ-5 in
+  `06-decisions.md` with a guardrail-hook sibling clause (PreToolUse may
+  exit 2 + stderr ONLY on `block` mode + `ClassBlock`).
+- **PR #22** `feat(bench)`: `cmd/bench-retrieval` + `docs/plans/hooks/09-tiered-retrieval-benchmark.md`.
+  Measured: summary 884 / snippet 1101 / full 4012 mean tokens per query.
+  **62.4% saving vs full at expand-rate=0.2.** Makefile `bench` +
+  `bench-test` targets. Tokenizer-agnostic (chars/4 approximation, constant
+  factor cancels). Read-only snapshot of the production DB — never mutates.
+
 ---
 
 ## Locked decisions (OQ-1..OQ-5) — do not relitigate
@@ -307,11 +422,18 @@ From `docs/plans/hooks/06-decisions.md`:
    always-on backup. No `hujson` vendoring. Top-level keys sorted
    alphabetically — users with hand-edited settings will see a reformat.
 5. **OQ-5 Exit codes.** **Retrieval hooks always exit 0** (`hook
-   session-start`, `hook post-edit`, `hook post-edit-actor`, and even
-   `DispatchHook`'s usage-error paths). Interactive commands
-   (`install-hooks`, `uninstall-hooks`, `hooks doctor`, `hooks tail`,
-   `hooks cache-clear`, `hooks cache-stats`, `recall`, `ingest-session`,
-   `status`) use `0 / 1 / 2`.
+   session-start`, `hook post-edit`, `hook post-edit-actor`, `hook user-prompt`,
+   `hook stop`, `hook session-end`, and even `DispatchHook`'s usage-error paths).
+   **Guardrail hooks (PreToolUse) — added in Phase 3 (PR #23)** — may exit 2 +
+   write one stderr line, but ONLY when `HEIMDALL_GUARDRAILS=block` AND
+   classification is `block`. Shadow, warn, off, allow, timeout, and error
+   cases all exit 0 with no stderr. Interactive commands (`install-hooks`,
+   `uninstall-hooks`, `hooks doctor`, `hooks tail`, `hooks cache-clear`,
+   `hooks cache-stats`, `hooks explain-command`, `recall`, `ingest-session`,
+   `status`, `skills import`) use `0 / 1 / 2`. See
+   `docs/plans/hooks/06-decisions.md` for the full sibling clause and
+   `docs/plans/hooks/08-destructive-op-primitive.md` for the classification
+   contract.
 
 ---
 
@@ -322,27 +444,41 @@ From `docs/plans/hooks/06-decisions.md`:
 3. ~~Phase 1b (T4 + T6).~~ **✅ SHIPPED** — PR #10.
 4. ~~Phase 2 (T8 + sections 2–5).~~ **✅ SHIPPED** — PR #11.
 5. ~~Auto-upgrade hooks on SessionStart.~~ **✅ SHIPPED** — PR #13.
-   Hooks auto-upgrade silently when the binary adds new events. No
-   manual `install-hooks --force` needed after binary upgrades.
+6. ~~Stop + SessionEnd dogfood.~~ **✅ VERIFIED 2026-04-16** — stop `buffer_appended`
+   and session-end `session_ended` both fired in real session.
+7. ~~Phase 3 guardrails design.~~ **✅ SHIPPED** — PR #18 (design) + PR #23 (impl).
+8. ~~Phase 3 implementation.~~ **✅ SHIPPED** — PR #23, shadow mode default.
+9. ~~Token-savings measurement.~~ **✅ SHIPPED** — PR #22, 62.4% saving at
+   20% expand rate.
+10. ~~Two-way `~/.claude/skills/` sync.~~ **✅ SHIPPED** — PR #20.
+11. ~~Ollama pre-warm.~~ **✅ SHIPPED** — PR #19.
+12. ~~CWD scope filter + memory path auto-detect.~~ **✅ SHIPPED** — PR #17.
+13. ~~Skills in SessionStart/UserPromptSubmit.~~ **✅ SHIPPED** — PR #15.
+14. ~~T20 integration + T23 e2e harness.~~ **✅ SHIPPED** — PR #16.
+15. ~~Test-log isolation.~~ **✅ SHIPPED** — PR #14.
 
-6. **Dogfood Stop + SessionEnd end-to-end.** Work a real session, then
-   close Claude Code. Check:
-   - `heimdall-mcp hooks tail --event=stop --since=1h` — buffer_appended lines
-   - `heimdall-mcp hooks tail --event=session-end --since=1h` — ingest_ok or session_ended
-   - `ls <project>/.heimdall_db/hooks/sessions/` — buffer files should be cleaned up
+**Remaining (all require live sessions or telemetry, not dispatchable work):**
 
-7. **Dogfood tiered retrieval.** Use `heimdall_search` with `detail=summary`
-   then `heimdall_expand` on a result. Use `heimdall_ls` to browse the
-   path hierarchy. Verify summaries are useful and context_paths are correct.
+16. **Dogfood the full 6-hook pipeline.** Especially PreToolUse in shadow mode.
+    Collect `hooks tail --event=pre-tool-use` for a session or two. Audit for
+    false-positive `class=block` verdicts. Only after an audit with zero
+    false positives, promote to `HEIMDALL_GUARDRAILS=warn`.
 
-8. **With-vs-without comparison (T21 replacement).** Pick a real task, run
-   twice in fresh sessions — `HEIMDALL_HOOKS=0` control vs defaults.
-   Compare quality, token spend, tool-call count.
+17. ~~**T21 with-vs-without comparison.**~~ **SUPERSEDED by `heimdall-mcp
+    sessions report`** (PR #28, Wave D of
+    `docs/plans/hooks/10-per-session-savings-report.md`). The report
+    command joins the Claude Code transcript (tokens, tool-call counts,
+    hook_success attachment bytes) with `hooks.log` (cache hits, guardrail
+    verdicts, reindex counts) keyed on `session_id` — i.e. the T21 metrics
+    surface automatically on every real session, no dedicated with-vs-without
+    runs required. Run `heimdall-mcp sessions list && heimdall-mcp sessions
+    report --session-id=<latest>` after any session to see the numbers.
 
-9. **Phase 3 — guardrails.** `PreToolUse(Bash(rm *|git push --force*))`
-   as an `agent`-type hook. **Blocked** on designing a destructive-op
-   judgment primitive — heimdall has no way to classify a bash command
-   as dangerous today. Needs a design decision before implementation.
+18. **Re-embed the oversized skill files.** Two skills
+    (`code-improvement-orchestrator`, `deep-code-review`) failed import
+    because they exceed the `nomic-embed-text` 8192-token context. Options:
+    chunk-at-import, switch to a larger-context embed model, or leave them
+    disk-only. Low priority — blocks nothing.
 
 ---
 
@@ -462,73 +598,121 @@ heimdall-mcp hooks tail --event=post-edit --since=5m
    (`feat/hooks-integration-waves-0-2`) was deleted on the #5 merge.
    Same commit was resubmitted and merged as #7.
 
-7. **~~Unit tests in `internal/cli` write to the real
-   `$XDG_STATE_HOME/heimdall/hooks.log`~~** — **FIX IMPLEMENTED 2026-04-16**
-   on branch `fix/hook-log-test-isolation` (not yet pushed / PR'd).
-   Adds `internal/cli/testmain_test.go` whose `TestMain` points
-   `HEIMDALL_HOOK_LOG` at a per-binary temp dir for the whole package.
-   Individual tests that set `t.Setenv` still override. Verified:
-   deleting the real log + re-running the full suite leaves it
-   uncreated. Existing pollution (`pid=999999`, `model=test-model`,
-   localhost 500s) stops after this lands.
+7. ~~Unit tests in `internal/cli` write to the real
+   `$XDG_STATE_HOME/heimdall/hooks.log`.~~ **✅ FIXED in PR #14**
+   (merged 2026-04-16). `internal/cli/testmain_test.go` redirects
+   `HEIMDALL_HOOK_LOG` to a per-binary temp dir for the whole package;
+   per-test `t.Setenv` still overrides.
+
+8. **Two skills too long for nomic-embed-text's 8192-token context.**
+   `~/.claude/skills/code-improvement-orchestrator/SKILL.md` and
+   `~/.claude/skills/deep-code-review/SKILL.md` both failed
+   `skills import` with `status 400: the input length exceeds the context
+   length`. Other 5 skills imported fine. See the "Known warn from hooks
+   doctor" note above. Not blocking.
+
+9. **Background-agent leakage into the main checkout.** Several of
+   today's parallel agents (#5, #6, #4) touched files in
+   `/home/noname/Code/heimdall-mcp/` despite being spawned in worktrees.
+   Root cause was `cd` drifting out of the worktree. Each agent cleaned
+   up after itself; no changes leaked into merged PRs. Mitigation in
+   future: prompts already include "never cd to main checkout — use
+   absolute paths rooted at the worktree." Still worth watching.
 
 ---
 
-## What's next — post phase 2
+## What's next — post Phase 3
 
-Phases 1a, 1b, and 2 are all **shipped**. TODO sections 2–5 are done.
+All numbered Phase 1/2/3 items and every TODO section follow-up that could
+be shipped without a live Claude Code session are now merged. 10 PRs landed
+today in a parallel push (#14–#23).
 
-**Immediate follow-ups (manual, need human):**
-- ~~Reopen Claude Code to trigger auto-upgrade~~ ✅ done 2026-04-16
-- **Dogfood Stop + SessionEnd live** — session closing now; next open
-  should run the tail commands in "First actions on resumption"
-- Push + PR `fix/hook-log-test-isolation` (caveat #7 fix, ready, needs approval)
-- Dogfood tiered retrieval — test `detail=summary` + `heimdall_expand`
-- With-vs-without comparison (T21 replacement)
+**Immediate follow-ups (manual, need a live session — NOT dispatchable):**
+- **Dogfood the 6-hook pipeline on reopen.** First-actions block at the top
+  of this file has the tail commands and expected output.
+- **Audit PreToolUse shadow-mode verdicts.** After a day or two of real
+  sessions: `hooks tail --event=pre-tool-use --since=24h | grep class=block`
+  — if every block is genuinely a destructive command you'd regret, promote
+  to `HEIMDALL_GUARDRAILS=warn`. If there are false positives, refine the
+  rules in `internal/heimdall/destructive_ops.go`.
+- **T21 with-vs-without comparison.** See next-steps item #17.
+- **Re-embed the two oversized skills** (item #18 above).
 
-**Open follow-ups (incremental, from TODO.md):**
-- Auto-surface skills in SessionStart/UserPromptSubmit hooks
-- Memory path auto-detect for `context_path`
-- Hook scope filtering by CWD subpath
-- Token-savings measurement for tiered retrieval
-- Two-way sync with `~/.claude/skills/` directory
+**Closed TODO follow-ups (all merged):**
+- ~~Auto-surface skills in SessionStart/UserPromptSubmit hooks~~ → PR #15
+- ~~Memory path auto-detect for `context_path`~~ → PR #17
+- ~~Hook scope filtering by CWD subpath~~ → PR #17
+- ~~Token-savings measurement for tiered retrieval~~ → PR #22
+- ~~Two-way sync with `~/.claude/skills/`~~ → PR #20
+- ~~Phase 3 guardrails (design + impl)~~ → PR #18 + PR #23
+- ~~T20 Layer 2 integration tests~~ → PR #16
+- ~~T23 Layer 3 e2e harness~~ → PR #16
+- ~~Ollama pre-warm on install~~ → PR #19
+- ~~Gitignore `.claude/settings.json`~~ → PR #21
 
-**Blocked:**
-- Phase 3 guardrails — needs a destructive-op judgment primitive
-
-**Deferred (testing infrastructure):**
-- T20 Layer 2 integration tests (os/exec + fake Ollama)
-- T23 Layer 3 e2e harness (needs real Claude CLI)
+**Post-Phase-3 ideas (not on TODO yet, flagged here for consideration):**
+- LLM-based classification fallback for PreToolUse when static rules can't
+  decide. Design doc `08-destructive-op-primitive.md` already reserves this
+  extension point.
+- Auto-scope the bench-retrieval binary to the currently-opened project
+  (currently hard-coded to the heimdall-mcp DB).
+- Chunk-at-import for oversized SKILL.md files — makes the embed model
+  choice irrelevant for skills sync.
 
 ---
 
 ## File layout quick reference
 
 ```
+cmd/
+  heimdall-mcp/
+    main.go                — CLI + MCP server entry
+  bench-retrieval/
+    main.go                — tiered-retrieval token-savings benchmark (PR #22)
+    bench_test.go          — `//go:build bench` smoke test
+
 internal/
   cli/
     cli.go                 — RunCLI dispatcher, wires every subcommand
-    hook.go                — DispatchHook (retrieval) + HookSessionStart
-    hook_test.go           — 15 tests for session-start
+    hook.go                — DispatchHook (retrieval) + HookSessionStart +
+                             auto-upgrade (PR #13). Injects skills (PR #15),
+                             passes scope (PR #17).
+    hook_skills.go         — surfaceRelevantSkills helper (PR #15)
+    hook_skills_test.go    — 16 tests for skills helper
+    hook_test.go           — tests for session-start (extended by PR #15, #17)
     hook_post_edit.go      — HookPostEdit (foreground + spawn wrapper)
     hook_post_edit_actor.go — runPostEditActor (pure testable actor core)
     hook_post_edit_test.go — 20 tests for post-edit + actor
-    hook_user_prompt.go    — HookUserPrompt (phase 1b, cache-first hot path)
-    hook_user_prompt_test.go — 16 tests for user-prompt hook
-    hook_stop.go           — HookStop (rolling buffer) + HookSessionEnd (ingest trigger)
+    hook_user_prompt.go    — HookUserPrompt (phase 1b, cache-first hot path,
+                             scope + skills integrated PR #15/#17)
+    hook_user_prompt_test.go — tests for user-prompt hook
+    hook_stop.go           — HookStop + HookSessionEnd
     hook_stop_test.go      — 12 tests for stop + session-end
+    hook_pre_tool_use.go   — HookPreToolUse (Phase 3 guardrail, PR #23)
+    hook_pre_tool_use_test.go — 18 tests for shadow/warn/block modes
+    hooks.go               — DispatchHooks (admin: tail/cache-clear/
+                             cache-stats/doctor/explain-command)
+    hooks_explain_test.go  — 7 tests for `hooks explain-command` CLI (PR #23)
+    hooks_test.go          — admin-commands tests
+    scope.go               — package-local wrappers for heimdall/scope.go (PR #17)
+    install.go             — CLIInstallHooks + Uninstall + prewarm (PR #19).
+                             Template now lists 6 hooks (envelope `wave2-phase3`).
+    install_test.go        — 35+ install/uninstall/doctor/prewarm tests
+    doctor.go              — HooksDoctor, 13 checks including guardrail
+                             classifier + skills-sync
+    testmain_test.go       — TestMain redirects HEIMDALL_HOOK_LOG (PR #14)
+    skills.go              — CLIImportSkills (PR #20)
+    skills_test.go         — 11 tests for skills CLI
+    recall.go              — CLIRecall
+    ingest_session.go      — CLIIngestSession
+    status.go              — CLIStatus
+    integration_test.go    — `//go:build integration` (PR #16)
+    e2e_test.go            — `//go:build e2e` (PR #16)
     eta_test.go            — 6 tests for computeETA (DES-010)
-    hooks.go               — DispatchHooks (admin: tail/cache-clear/cache-stats/doctor)
-    hooks_test.go          — Wave 1 hooks admin tests
-    install.go             — CLIInstallHooks + CLIUninstallHooks + hooksDetected
-    doctor.go              — HooksDoctor (11-check pipeline)
-    install_test.go        — 35+ tests for install/uninstall/doctor/hooksDetected
-    recall.go              — CLIRecall (top-level, shared core)
-    ingest_session.go      — CLIIngestSession (top-level)
-    status.go              — CLIStatus (top-level)
     testdata/
       hook_session_start.golden.md — SessionStart block template
       status.golden.json   — status --format=json golden
+      skills/              — skills-sync fixtures (PR #20)
 
   heimdall/
     verify.go              — VerifyHookIndex + sentinel errors (T9)
@@ -539,19 +723,39 @@ internal/
     hookgate.go            — HooksDisabled (T22)
     dbpath.go              — NormalizeModelName, ResolveUsableModelDB,
                              ModelDBDir, DiscoverSubRepos
+    scope.go               — FindRepoRoot + ComputeScope (PR #17)
+    scope_test.go          — 8 tests for scope helpers
+    destructive_ops.go     — ClassifyBashCommand + 19-rule ruleset (PR #23)
+    destructive_ops_test.go — 80 classifier assertions
+    skills_sync.go         — import + write-back primitives (PR #20)
+    skills_sync_test.go    — 17 tests for skills sync
     cli_core.go            — RunRecall, IngestSessionSummary,
-                             ReadLengthPrefixedBuffer (Wave 1 shared core)
+                             ReadLengthPrefixedBuffer. `RunRecall` accepts scope.
     cli_status.go          — GatherStatus (shared by CLI + MCP)
+    memory.go / memory_store.go — memory persistence, now with
+                             `Memory.ContextPath`, `MemoryFilter.ContextPath`
+                             prefix filter, `SearchMemoriesByIDPrefix`.
+
+  mcp/
+    server.go              — MCP server. `heimdall_remember` schema extended
+                             for skills write-back + context_path auto-detect.
+    memory_tools.go        — toolRemember + toolRecall + deriveMemoryContextPath
+    skills_writeback_test.go — 7 tests for outbound sync (PR #20)
+    types.go               — MCP input/output types. `rememberInput` has
+                             `context_path`, `skill_name`, `skill_description`,
+                             `write_file`, `write_file_overwrite`.
 
 docs/plans/hooks/
   00-consolidated-plan.md  — authoritative implementation plan
-  01-architecture.md       — hook event contracts
-  02-cli-surface.md        — CLI command design
+  01-architecture.md       — hook event contracts (phase-3 labels updated PR #21)
+  02-cli-surface.md        — CLI command design (phase-3 labels updated PR #21)
   03-latency.md            — measured latency budgets
   04-failure-modes.md      — Tier A/B/C failure matrix + install-time
-  05-testing-rollout.md    — test strategy + phased rollout
-  06-decisions.md          — OQ-1..OQ-5 locked answers
-  07-next-session-handoff.md — this file
+  05-testing-rollout.md    — test strategy + phased rollout + Layer 2/3 (PR #16)
+  06-decisions.md          — OQ-1..OQ-5 locked answers (OQ-5 extended PR #21)
+  07-next-session-handoff.md — THIS FILE
+  08-destructive-op-primitive.md — Phase 3 design doc (PR #18)
+  09-tiered-retrieval-benchmark.md — bench methodology + 62.4% result (PR #22)
 ```
 
 ---
@@ -574,39 +778,59 @@ docs/plans/hooks/
 
 ---
 
-## Final git state at session end (2026-04-16, post auto-upgrade merge)
+## Final git state at session end (2026-04-16 late, post Phase 3)
 
 ```
-$ git log --oneline -8
-00f8ec3 Merge pull request #13 from revprism-dev-bot/feat/auto-upgrade-hooks
-1edca55 feat(hooks): auto-upgrade installed hooks on SessionStart
-030c9b1 Merge pull request #12 from revprism-dev-bot/docs/handoff-post-phase2
-e92d23d docs(hooks): update handoff for phase 2 + sections 2-5 merge
-b05af92 Merge pull request #11 from revprism-dev-bot/docs/hooks-phase1b-post-merge-handoff
-8b3442b feat: tiered retrieval, path hierarchy, session learning, LOW fixes, perf
-7550aa3 docs(hooks): post phase 1b handoff + archive pre-wave1 reviews
-320c4bd Merge pull request #10 from revprism-dev-bot/feat/hooks-phase1b-wave2
+$ git log --oneline -14
+65a396b Merge pull request #23 from revprism-dev-bot/feat/hooks-phase3-guardrails
+fc39df0 feat(hooks): Phase 3 destructive-op guardrails (shadow mode by default)
+a642b2b Merge pull request #22 from revprism-dev-bot/bench/tiered-retrieval-token-savings
+d70f702 feat(bench): tiered-retrieval token-savings benchmark
+2db9485 Merge pull request #21 from revprism-dev-bot/chore/gitignore-stale-phase-wording
+4bd81b7 chore: gitignore .claude/+.idea/, fix stale phase-2 wording, extend OQ-5 for guardrails
+f35c566 Merge pull request #20 from revprism-dev-bot/feat/skills-twoway-sync
+a089864 feat(skills): two-way sync between Heimdall memory and ~/.claude/skills/
+aae14e7 Merge pull request #19 from revprism-dev-bot/feat/prewarm-ollama-on-install
+5e6d0c8 feat(install): pre-warm Ollama after install-hooks to remove first-turn cold start
+3e7f165 Merge pull request #18 from revprism-dev-bot/docs/hooks-phase3-destructive-op-design
+770b530 Merge pull request #17 from revprism-dev-bot/feat/cwd-scope-and-memory-path
+dcc2c25 docs(hooks): design for Phase 3 destructive-op judgment primitive
+ab7c629 feat(hooks): CWD scope filter + auto-detect memory path
 ```
 
-Main is **in sync with `origin/main`** at `00f8ec3`. Three stale
-`agent-*` worktrees from 2026-04-11 remain in `git worktree list` —
-harmless, excluded from indexing, prune manually.
+Main is **in sync with `origin/main`** at `65a396b`. All 10 today's PRs
+merged. Binary at `/home/noname/.local/bin/heimdall-mcp` rebuilt and
+reports `(65a396b)`. Hooks installed at
+`/home/noname/Code/heimdall-mcp/.claude/settings.json` (6 hooks, template
+envelope `wave2-phase3`).
+
+**Stale worktrees** — the three 2026-04-11 `agent-*` worktrees plus seven
+2026-04-16 `agent-*` worktrees from today's parallel push are all still in
+`git worktree list`. Harmless, excluded from indexing. Prune when you feel
+like it:
+```bash
+for d in .claude/worktrees/agent-*; do
+  git worktree remove --force "$d"
+done
+```
+(The seven from today each hold a merged branch with a local lock — may
+need `git worktree remove -f -f` for the locked ones.)
 
 **Open known-unknowns (ordered by urgency):**
 
-1. ~~SessionStart fires?~~ **✅ yes.**
-2. ~~PostToolUse fires + actor works?~~ **✅ yes.**
-3. ~~Stop event payload shape?~~ **✅ CONFIRMED from Claude Code docs.**
-4. **Do Stop + SessionEnd hooks work end-to-end in real sessions?**
-   Unit-tested but not yet dogfooded. Need to reinstall hooks (5 now,
-   was 3) and close a session to exercise both.
-5. **Does `UserPromptSubmit` cache-hit ratio improve over sessions?**
-   The hook fires on every turn — check `hooks tail --event=user-prompt`.
-6. **With-vs-without comparison (T21 replacement).** Not yet run.
-7. **Phase 3 guardrails design.** Needs a destructive-op judgment
-   primitive that doesn't exist. Design decision required.
-8. Is `.claude/settings.json` worth gitignoring? (Cosmetic.)
-9. Do unit-test hook-log artifacts need a temp-dir fix? (Follow-up.)
+1. ~~SessionStart, PostToolUse, Stop, SessionEnd fire?~~ **✅ verified.**
+2. **PreToolUse shadow-mode telemetry on real sessions.** Phase 3 just
+   shipped. Classifier is new code. Run `hooks tail --event=pre-tool-use`
+   after a day of use and audit verdicts.
+3. **UserPromptSubmit cache-hit ratio over sessions.** Not yet measured.
+   `hooks tail --event=user-prompt --since=24h` should show `stage=cache_hit`
+   vs `stage=ok` counts. Wire a one-liner to compute the ratio.
+4. **T21 with-vs-without comparison.** Still not run — same story.
+5. **Skills auto-import on install-hooks?** Currently `skills import` is a
+   separate CLI command. Could be folded into `install-hooks` as a best-effort
+   step alongside prewarm. Trivial to add if desired.
+6. **Oversized SKILL.md files** (see caveat #8). Not urgent but a real rough
+   edge for heavy skill users.
 10. ~~Should the post-edit actor pre-warm Ollama on install?~~ **✅ done.**
     `install-hooks` now does a best-effort `EmbedForHook` warm-up
     (5s timeout, `--no-prewarm` to skip) after a successful install or
