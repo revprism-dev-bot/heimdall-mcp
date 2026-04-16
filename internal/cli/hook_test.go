@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -840,5 +841,26 @@ func TestLogHookEventWithSession_NilKVStillStamps(t *testing.T) {
 	data, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
 	if !strings.Contains(string(data), "session=abc-123") {
 		t.Fatalf("expected session=abc-123 even when kv nil: %q", string(data))
+	}
+}
+
+func TestHookSessionStart_LogsSessionID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+	t.Setenv("HEIMDALL_HOOKS", "1")
+
+	// Force a non-happy path so the handler exits early but still logs.
+	// HEIMDALL_HOOKS=0 would short-circuit before session extraction; we
+	// want the resolve_root → ollama_ping path which always logs.
+	stdin := strings.NewReader(`{"session_id":"abc-xyz","cwd":"/tmp/does-not-exist"}`)
+	var out, errBuf bytes.Buffer
+	rc := HookSessionStart(config.Config{OllamaEndpoint: "http://127.0.0.1:1"}, stdin, &out, &errBuf, map[string]string{}, nil, HookSessionStartDeps{})
+	if rc != 0 {
+		t.Fatalf("expected exit 0, got %d", rc)
+	}
+
+	logData, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if !strings.Contains(string(logData), "session=abc-xyz") {
+		t.Fatalf("expected session=abc-xyz in hooks.log:\n%s", string(logData))
 	}
 }
