@@ -122,6 +122,11 @@ const sessionStartMaxRunes = 6000
 func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string, deps HookSessionStartDeps) int {
 	_ = stderr // never written to; kept for uniform §5.4 signature
 
+	// Auto-upgrade: if hooks are installed but behind the current binary's
+	// template (e.g., binary added Stop+SessionEnd), silently add the missing
+	// entries. Cheap (no Ollama, no embedding — just JSON read/write).
+	autoUpgradeHooks(env)
+
 	// --- flag parsing -------------------------------------------------------
 
 	fs := flag.NewFlagSet("hook session-start", flag.ContinueOnError)

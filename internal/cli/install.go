@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
 
 // heimdallHookVersion is the integer version stamped onto every hook entry
@@ -458,6 +459,16 @@ func marshalSettings(m map[string]any) ([]byte, error) {
 	return b, nil
 }
 
+// atomicWriteJSON marshals settings to indented JSON and atomically writes.
+func atomicWriteJSON(path string, settings map[string]any) error {
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return atomicWrite(path, data)
+}
+
 // atomicWrite writes data to a temp file in the same directory then renames
 // over the target. Parent dirs are created with 0o755.
 func atomicWrite(path string, data []byte) error {
@@ -885,6 +896,111 @@ func hooksDetected(env map[string]string) bool {
 		}
 	}
 	return false
+}
+
+// autoUpgradeHooks silently adds missing heimdall hook entries to an existing
+// install. Called on SessionStart so users never need to manually reinstall
+// after a binary upgrade that adds new hook events. Respects OQ-2: only
+// upgrades if hooks were already installed — never auto-installs from scratch.
+// Best-effort: all errors are logged and swallowed (OQ-5).
+func autoUpgradeHooks(env map[string]string) {
+	for _, scope := range []string{"project", "user"} {
+		_, path, err := resolveScope(scope, env)
+		if err != nil {
+			continue
+		}
+		settings, _, err := readSettings(path)
+		if err != nil {
+			continue
+		}
+		hooksAny, ok := settings["hooks"]
+		if !ok || hooksAny == nil {
+			continue
+		}
+		hooksMap, ok := hooksAny.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		// Check: does this scope have at least one heimdall entry?
+		hasHeimdall := false
+		for _, eventAny := range hooksMap {
+			list, ok := eventAny.([]any)
+			if !ok {
+				continue
+			}
+			for _, raw := range list {
+				obj, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if isHeimdallEntry(obj) {
+					hasHeimdall = true
+					break
+				}
+			}
+			if hasHeimdall {
+				break
+			}
+		}
+		if !hasHeimdall {
+			continue
+		}
+
+		// Find which hooks from the template are missing.
+		var missing []phase1aHook
+		for _, h := range phase1aHooks {
+			list, _ := hooksMap[h.event].([]any)
+			found := false
+			for _, raw := range list {
+				obj, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if isHeimdallEntry(obj) && sameMatcher(obj, h.matcher) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				missing = append(missing, h)
+			}
+		}
+
+		if len(missing) == 0 {
+			continue
+		}
+
+		// Add the missing entries.
+		for _, h := range missing {
+			entry := buildHookEntry(h)
+			list, _ := hooksMap[h.event].([]any)
+			list = append(list, entry)
+			hooksMap[h.event] = list
+		}
+		settings["hooks"] = hooksMap
+
+		// Atomic write with backup (same pattern as install-hooks).
+		if err := atomicWriteJSON(path, settings); err != nil {
+			heimdall.LogHookEvent("WARN", "auto-upgrade", map[string]any{
+				"err":   "write_failed",
+				"scope": scope,
+			})
+			continue
+		}
+
+		names := make([]string, len(missing))
+		for i, h := range missing {
+			names[i] = h.event
+		}
+		heimdall.LogHookEvent("INFO", "auto-upgrade", map[string]any{
+			"msg":     "hooks_upgraded",
+			"scope":   scope,
+			"added":   names,
+			"total":   len(phase1aHooks),
+			"path":    path,
+		})
+	}
 }
 
 // Compile-time sanity: both entry points match the HookHandler-ish shape we
