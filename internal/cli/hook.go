@@ -522,3 +522,23 @@ type hookEmbedder struct {
 func (h *hookEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	return h.client.EmbedForHook(ctx, h.model, text)
 }
+
+// logHookEventWithSession wraps heimdall.LogHookEvent, stamping session=<id>
+// onto the kv map when non-empty. All retrieval hook handlers route through
+// this helper so hooks.log can be filtered per session by the sessions-report
+// CLI (see internal/cli/sessions.go).
+//
+// Empty sessionID is the intentional signal for "no Claude Code payload"
+// (flag_parse errors, empty_stdin, dry-fires from `hooks doctor`), and those
+// lines deliberately do NOT carry a session key — a downstream "all events
+// without session=" filter catches them as pre-payload noise.
+func logHookEventWithSession(level, event, sessionID string, kv map[string]any) {
+	if sessionID != "" {
+		if kv == nil {
+			kv = map[string]any{"session": sessionID}
+		} else {
+			kv["session"] = sessionID
+		}
+	}
+	heimdall.LogHookEvent(level, event, kv)
+}
