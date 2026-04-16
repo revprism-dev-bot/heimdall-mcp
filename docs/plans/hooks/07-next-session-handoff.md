@@ -285,10 +285,9 @@ From `docs/plans/hooks/06-decisions.md`:
 2. ~~Soak gate.~~ **❌ KILLED.**
 3. ~~Phase 1b (T4 + T6).~~ **✅ SHIPPED** — PR #10.
 4. ~~Phase 2 (T8 + sections 2–5).~~ **✅ SHIPPED** — PR #11.
-
-5. **Reinstall hooks.** The install template now has 5 hooks (was 3).
-   Run `heimdall-mcp install-hooks --scope=project --force` to pick up
-   the Stop + SessionEnd entries, then `hooks doctor` to verify.
+5. ~~Auto-upgrade hooks on SessionStart.~~ **✅ SHIPPED** — PR #13.
+   Hooks auto-upgrade silently when the binary adds new events. No
+   manual `install-hooks --force` needed after binary upgrades.
 
 6. **Dogfood Stop + SessionEnd end-to-end.** Work a real session, then
    close Claude Code. Check:
@@ -438,7 +437,7 @@ heimdall-mcp hooks tail --event=post-edit --since=5m
 Phases 1a, 1b, and 2 are all **shipped**. TODO sections 2–5 are done.
 
 **Immediate follow-ups (manual, need human):**
-- Reinstall hooks (5 hooks now, was 3) — `install-hooks --scope=project --force`
+- Reopen Claude Code to trigger auto-upgrade (adds Stop + SessionEnd)
 - Dogfood Stop + SessionEnd live — close a real session, check hooks tail
 - Dogfood tiered retrieval — test `detail=summary` + `heimdall_expand`
 - With-vs-without comparison (T21 replacement)
@@ -531,19 +530,21 @@ docs/plans/hooks/
 
 ---
 
-## Final git state at session end (2026-04-16, post phase 2 + sections 2–5 merge)
+## Final git state at session end (2026-04-16, post auto-upgrade merge)
 
 ```
-$ git log --oneline -6
+$ git log --oneline -8
+00f8ec3 Merge pull request #13 from revprism-dev-bot/feat/auto-upgrade-hooks
+1edca55 feat(hooks): auto-upgrade installed hooks on SessionStart
+030c9b1 Merge pull request #12 from revprism-dev-bot/docs/handoff-post-phase2
+e92d23d docs(hooks): update handoff for phase 2 + sections 2-5 merge
 b05af92 Merge pull request #11 from revprism-dev-bot/docs/hooks-phase1b-post-merge-handoff
 8b3442b feat: tiered retrieval, path hierarchy, session learning, LOW fixes, perf
 7550aa3 docs(hooks): post phase 1b handoff + archive pre-wave1 reviews
 320c4bd Merge pull request #10 from revprism-dev-bot/feat/hooks-phase1b-wave2
-648a388 feat(hooks): Wave 2 phase 1b — T4 search --format=hook-md + T6 hook user-prompt
-d0fb79c Merge pull request #9 from revprism-dev-bot/docs/hooks-phase1a-fully-verified
 ```
 
-Main is **in sync with `origin/main`** at `b05af92`. Three stale
+Main is **in sync with `origin/main`** at `00f8ec3`. Three stale
 `agent-*` worktrees from 2026-04-11 remain in `git worktree list` —
 harmless, excluded from indexing, prune manually.
 
