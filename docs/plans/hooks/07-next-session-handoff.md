@@ -43,6 +43,42 @@ point at this file.
 
 ---
 
+## First actions on resumption (2026-04-16 session end)
+
+**Auto-upgrade check (if this is the first open after PR #13):**
+- ✅ **VERIFIED 2026-04-16.** Auto-upgrade fired on SessionStart, added
+  `[Stop SessionEnd]` at `2026-04-16T19:15:27Z scope=project`.
+  `hooks doctor` reports 11/11 green, 5 hooks installed.
+
+**Stop + SessionEnd dogfood (the reason this session was closed):**
+Run immediately after open:
+```bash
+heimdall-mcp hooks tail --event=stop        --since=2h
+heimdall-mcp hooks tail --event=session-end --since=2h
+ls /home/noname/Code/heimdall-mcp/.heimdall_db/hooks/sessions/
+```
+Expect:
+- ≥1 `event=stop msg=buffer_appended` line (one per assistant turn before close)
+- 1 `event=session-end msg=ingest_ok` **or** `msg=session_ended` line
+  (reason should be `clear` for `/exit`, `logout` for quit)
+- sessions/ dir empty (SessionEnd cleans up the rolling buffer after ingest)
+
+Red flags:
+- `event=stop` lines but no `session-end` → SessionEnd never fired.
+- `session-end err=ingest_failed` → transcript_path missing or bad JSONL.
+- sessions/*.jsonl leftover after `session-end ok` → cleanup path broken.
+
+**Pending branch to PR (implemented but not yet pushed):**
+- Branch: `fix/hook-log-test-isolation`
+- What: adds `internal/cli/testmain_test.go` that redirects
+  `HEIMDALL_HOOK_LOG` to a per-binary temp dir, fixing caveat #7
+  (test runs polluting the real `~/.local/state/heimdall/hooks.log`)
+- Verified: `go test ./... -race` green; deleting real hooks.log and
+  re-running tests leaves it uncreated.
+- TODO next session: confirm with user, then commit + push + open PR.
+
+---
+
 ## Ground truth — where everything lives
 
 | Artifact | Path |
@@ -422,13 +458,15 @@ heimdall-mcp hooks tail --event=post-edit --since=5m
    (`feat/hooks-integration-waves-0-2`) was deleted on the #5 merge.
    Same commit was resubmitted and merged as #7.
 
-7. **Unit tests in `internal/cli` write to the real
-   `$XDG_STATE_HOME/heimdall/hooks.log`** instead of `t.TempDir()`.
-   Dogfood's `hooks tail` showed test artifacts (timestamps with
-   `pid=999999` and fake `context deadline exceeded` errors) polluting
-   user state. Worth a follow-up PR — scoped out of PR #7 because it
-   touches many test files. Symptom on your end: `hooks tail` will
-   show occasional lines that don't match anything you actually did.
+7. **~~Unit tests in `internal/cli` write to the real
+   `$XDG_STATE_HOME/heimdall/hooks.log`~~** — **FIX IMPLEMENTED 2026-04-16**
+   on branch `fix/hook-log-test-isolation` (not yet pushed / PR'd).
+   Adds `internal/cli/testmain_test.go` whose `TestMain` points
+   `HEIMDALL_HOOK_LOG` at a per-binary temp dir for the whole package.
+   Individual tests that set `t.Setenv` still override. Verified:
+   deleting the real log + re-running the full suite leaves it
+   uncreated. Existing pollution (`pid=999999`, `model=test-model`,
+   localhost 500s) stops after this lands.
 
 ---
 
@@ -437,8 +475,10 @@ heimdall-mcp hooks tail --event=post-edit --since=5m
 Phases 1a, 1b, and 2 are all **shipped**. TODO sections 2–5 are done.
 
 **Immediate follow-ups (manual, need human):**
-- Reopen Claude Code to trigger auto-upgrade (adds Stop + SessionEnd)
-- Dogfood Stop + SessionEnd live — close a real session, check hooks tail
+- ~~Reopen Claude Code to trigger auto-upgrade~~ ✅ done 2026-04-16
+- **Dogfood Stop + SessionEnd live** — session closing now; next open
+  should run the tail commands in "First actions on resumption"
+- Push + PR `fix/hook-log-test-isolation` (caveat #7 fix, ready, needs approval)
 - Dogfood tiered retrieval — test `detail=summary` + `heimdall_expand`
 - With-vs-without comparison (T21 replacement)
 
