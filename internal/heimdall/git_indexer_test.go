@@ -161,7 +161,7 @@ func TestIndexGitCommits_Integration(t *testing.T) {
 	}
 
 	// Verify source_type filtering works
-	allResults := store.SearchFiltered(make([]float32, 3), 0, "commit", "", nil)
+	allResults := store.SearchFiltered(context.Background(), make([]float32, 3), 0, "commit", "", nil)
 	if len(allResults) != 3 {
 		t.Errorf("expected 3 commit results, got %d", len(allResults))
 	}

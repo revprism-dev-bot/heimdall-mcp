@@ -35,7 +35,7 @@ const heimdallHookVersion = 1
 // bag on installed hook entries. Distinct from heimdallHookVersion because the
 // binary can churn without changing the hook shape. Wave 2 Phase 1a ships
 // with this hard-coded; a later wave can plumb it from build flags.
-const heimdallBinaryVersion = "wave2-phase1a"
+const heimdallBinaryVersion = "wave2-phase1b"
 
 // phase1aHook describes one Claude Code hook entry heimdall owns. The list
 // below is the canonical Phase 1a install set; `--only` filters over it by
@@ -46,9 +46,12 @@ type phase1aHook struct {
 	command string // full command string including --source=heimdall
 }
 
-// phase1aHooks is the canonical install set. Keep in sync with the Stream D
-// and Stream E contracts: the command strings here are baked verbatim into
-// `settings.json`, so changes must be coordinated across streams.
+// phase1aHooks is the canonical install set as of Wave 2 phase 1b. The name
+// is preserved for call-site stability, but the list now includes the T6
+// UserPromptSubmit entry (phase 1b) alongside the original phase-1a
+// SessionStart + PostToolUse pair. Command strings here are baked verbatim
+// into `settings.json`; changes must be coordinated with the hook handlers
+// in `hook.go`, `hook_post_edit.go`, and `hook_user_prompt.go`.
 var phase1aHooks = []phase1aHook{
 	{
 		event:   "SessionStart",
@@ -59,6 +62,11 @@ var phase1aHooks = []phase1aHook{
 		event:   "PostToolUse",
 		matcher: "Edit|Write",
 		command: "heimdall-mcp hook post-edit --source=heimdall --version=1",
+	},
+	{
+		event:   "UserPromptSubmit",
+		matcher: "",
+		command: "heimdall-mcp hook user-prompt --source=heimdall --version=1",
 	},
 }
 

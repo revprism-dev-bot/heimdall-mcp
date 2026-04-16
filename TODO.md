@@ -3,7 +3,7 @@
 Tracking all outstanding work across the "steal ideas from OpenViking" roadmap.
 Tackled progressively — see status per item.
 
-## 1. Claude Code Hooks Integration (**WAVE 2 PHASE 1a VERIFIED END-TO-END** — soaking)
+## 1. Claude Code Hooks Integration (**WAVE 2 PHASE 1b LANDING** — hot-path UserPromptSubmit)
 
 **Goal:** make Claude actually use heimdall on every turn via Claude Code hooks,
 not via hopeful tool exposure. Highest-leverage item by a wide margin.
@@ -31,22 +31,22 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] OQ-1..OQ-5 locked in `docs/plans/hooks/06-decisions.md`
 - [x] Review gate: weighted 97.8/100 (Quality 98, Security 99, Performance 97, Tests 96, Design 98). 110 tests in internal/cli, all green under `-race`.
 
-**Dogfood ✅ complete (2026-04-16):**
-- [x] Run `heimdall-mcp index .` against this repo — 1758 chunks, `nomic-embed-text`
-- [x] Run `heimdall-mcp install-hooks --scope=project --dry-run`
-- [x] Run `heimdall-mcp install-hooks --scope=project`
-- [x] Run `heimdall-mcp hooks doctor` — 11/11 green
-- [x] Reopen Claude Code → `SessionStart` hook fires — `bullets=5 chunks=1758 model=nomic-embed-text stage=ok`
-- [x] Edit a file → `PostToolUse(Edit|Write)` → detached actor → `files=1 msg=reindex_ok`, no deadletter (first embed ~67 s cold Ollama)
+**Dogfood ✅ 2026-04-16 (PR #9):**
+- [x] `heimdall-mcp index .` — 1758 chunks, `nomic-embed-text`
+- [x] `install-hooks --scope=project`
+- [x] `hooks doctor` — 11/11 green, all three hooks dry-fire OK
+- [x] Reopen Claude Code → `SessionStart` fires, `## Heimdall context` block in first turn
+- [x] `Edit` tool call → `PostToolUse` → `fork+setsid` actor reached `files=1 msg=reindex_ok` (no deadletter, ~67 s first embed, Ollama cold)
 
-**Phase 1a soak (blocks phase 1b):**
-- [ ] Soak ≥ 1 day, ideally ≥ 1 week, before cutting phase 1b. Clock started 2026-04-16 00:19 local.
-
-**Wave 2 phase 1b (pending, hot path):**
-- [ ] T4 `--format=hook-md` on `search` + `--budget-ms` (breaking: adds ctx to `SearchFiltered`; removes the Wave 1 `TestSearchFiltered_BudgetTimeout` skip stub)
-- [ ] T6 `hook user-prompt` command (250ms p95 budget, cache lookup path, skip heuristic for trivial prompts)
-- [ ] T21 `BenchmarkUserPromptHook` regression baseline (must gate merge)
-- [ ] Phase 1b gate criteria: 1a stable ≥1 week; T21 benchmark green; model-mismatch Tier B path exercised end-to-end; cache-invalidation verified against concurrent edit
+**Wave 2 phase 1b ✅ landing (this PR):**
+- [x] T4 `--format=hook-md` on `search` + `--budget-ms` — breaking `SearchFiltered` signature (ctx first arg), 30+ call sites updated, real ctx cancellation in the row loop
+- [x] T4 side-effect: killed the `TestSearchFiltered_BudgetTimeout` skip stub, replaced with real pre-cancelled-ctx assertions + nil-ctx tolerance
+- [x] T6 `hook user-prompt` command — 250 ms default budget, skip heuristic (`len < 8`), cache lookup keyed on `(normalized_prompt, index_version, project)`, Tier B suppression on Ollama down / model mismatch, cache store on miss
+- [x] `install-hooks` template now installs `UserPromptSubmit` alongside `SessionStart` + `PostToolUse` (3 hooks total)
+- [x] Unit tests: 16 new cases in `hook_user_prompt_test.go` — skip, disabled, Ollama down (Tier B + suppressed), no index, model mismatch, happy path caches result, cache hit short-circuits, cache invalidation on index_version bump, budget timeout, normalization, empty stdin → CWD fallback, `--prompt` flag override, malformed JSON, dispatcher routing
+- [x] Version constants bumped to `wave2-phase1b` (doctor `--version` check + install envelope)
+- [~] **T21 benchmark skipped for now** — original plan called for a microbenchmark; replaced with a same-task with-vs-without-hooks comparison after merge (per user direction)
+- [~] **Soak gate killed** — wall-clock soak tests nothing for a solo local tool; phase 1b rides on the unit test suite + dogfood instead
 
 **Wave 2 phase 2 (pending, session learning):**
 - [ ] T8 `hook stop` command (rolling buffer → ingest-session handoff)

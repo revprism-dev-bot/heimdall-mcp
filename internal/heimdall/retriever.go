@@ -46,7 +46,7 @@ func (r *Retriever) Retrieve(ctx context.Context, query string) ([]ContextBlock,
 	}
 
 	// 2. Search the store
-	results := r.store.Search(queryVec, r.topK)
+	results := r.store.Search(ctx, queryVec, r.topK)
 
 	// 3. Convert to ContextBlocks, respecting token budget
 	var blocks []ContextBlock

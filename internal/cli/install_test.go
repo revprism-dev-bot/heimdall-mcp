@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,10 +71,12 @@ func TestInstallHooks_HappyPath_EmptySettings(t *testing.T) {
 	}
 	m := readJSON(t, settingsPath)
 	events := hookEvents(m)
-	if len(events) != 2 {
-		t.Errorf("expected 2 hook events, got %d: %v", len(events), events)
+	// Phase 1b adds UserPromptSubmit alongside the phase-1a SessionStart +
+	// PostToolUse. Keep the assertion in sync with len(phase1aHooks).
+	if len(events) != len(phase1aHooks) {
+		t.Errorf("expected %d hook events, got %d: %v", len(phase1aHooks), len(events), events)
 	}
-	if !strings.Contains(stdout.String(), "Installed 2 hooks") {
+	if !strings.Contains(stdout.String(), fmt.Sprintf("Installed %d hooks", len(phase1aHooks))) {
 		t.Errorf("missing success line in stdout: %s", stdout.String())
 	}
 }

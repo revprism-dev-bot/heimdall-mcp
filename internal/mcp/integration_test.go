@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -61,7 +62,7 @@ func TestToolSearch_EnrichedResults(t *testing.T) {
 	// The toolSearch requires Ollama which isn't available in tests.
 	// Instead, test the filtered search path directly by calling SearchFiltered.
 	_ = srv // srv is used for other tests
-	results := store.SearchFiltered([]float32{1.0, 0.0, 0.0}, 5, "", "", nil)
+	results := store.SearchFiltered(context.Background(), []float32{1.0, 0.0, 0.0}, 5, "", "", nil)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -92,7 +93,7 @@ func TestToolSearch_FilteredBySourceType(t *testing.T) {
 	}
 
 	// Filter by ticket
-	results := store.SearchFiltered([]float32{1.0, 0.0}, 10, "ticket", "", nil)
+	results := store.SearchFiltered(context.Background(), []float32{1.0, 0.0}, 10, "ticket", "", nil)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 ticket result, got %d", len(results))
 	}
@@ -117,7 +118,7 @@ func TestToolSearch_FilteredBySubProject(t *testing.T) {
 	}
 
 	// SearchFiltered signature: (query, limit, sourceType, subProject, metadataFilter)
-	results := store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "service-a", nil)
+	results := store.SearchFiltered(context.Background(), []float32{1.0, 0.0}, 10, "", "service-a", nil)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 service-a result, got %d", len(results))
 	}
@@ -126,13 +127,13 @@ func TestToolSearch_FilteredBySubProject(t *testing.T) {
 	}
 
 	// Filter on the other sub-project returns only its record.
-	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "service-b", nil)
+	results = store.SearchFiltered(context.Background(), []float32{1.0, 0.0}, 10, "", "service-b", nil)
 	if len(results) != 1 || results[0].Record.ID != "b1" {
 		t.Fatalf("expected only b1, got %+v", results)
 	}
 
 	// No sub-project filter returns all three.
-	results = store.SearchFiltered([]float32{1.0, 0.0}, 10, "", "", nil)
+	results = store.SearchFiltered(context.Background(), []float32{1.0, 0.0}, 10, "", "", nil)
 	if len(results) != 3 {
 		t.Fatalf("expected 3 unfiltered results, got %d", len(results))
 	}
@@ -150,7 +151,7 @@ func TestToolSearch_FilteredByMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	results := store.SearchFiltered([]float32{1.0}, 10, "ticket", "", map[string]any{"status": "open"})
+	results := store.SearchFiltered(context.Background(), []float32{1.0}, 10, "ticket", "", map[string]any{"status": "open"})
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -174,7 +175,7 @@ func TestToolExplain_ScoreDistribution(t *testing.T) {
 	}
 
 	// Search with topK=0 to get all
-	allResults := store.Search([]float32{1.0, 0.0}, 0)
+	allResults := store.Search(context.Background(), []float32{1.0, 0.0}, 0)
 	if len(allResults) != 3 {
 		t.Fatalf("expected 3 results, got %d", len(allResults))
 	}
@@ -216,7 +217,7 @@ func TestToolExplain_SourceCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	allResults := store.Search([]float32{1.0}, 0)
+	allResults := store.Search(context.Background(), []float32{1.0}, 0)
 	counts := SourceCounts{}
 	for _, r := range allResults {
 		switch classifySource(r.Record.Kind) {
