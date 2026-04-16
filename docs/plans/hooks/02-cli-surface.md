@@ -8,7 +8,7 @@
 
 Every hook in `01-architecture.md` is a shell script invoked by Claude Code. Those scripts need a scriptable, fast, non-interactive CLI on the `heimdall-mcp` binary. MCP (JSON-RPC over stdio) is unusable from a hook because hooks get event JSON on stdin and must emit free-form stdout. This doc specifies every new subcommand, flag, and stdin/stdout/stderr contract for phase 1.
 
-Phase 1 scope per architect: **SessionStart, UserPromptSubmit, PostToolUse(Edit|Write), Stop.** Only these four hook commands ship; `post-commit`, `pre-destructive`, `session-end` are deferred (architect: `post-commit` is already covered by `runIndex`'s built-in git indexing + stale check; `pre-destructive` defers to phase 2 when an `agent`-type hook is available; `SessionEnd` is less reliable than `Stop`).
+Phase 1 scope per architect: **SessionStart, UserPromptSubmit, PostToolUse(Edit|Write), Stop.** Only these four hook commands ship; `post-commit`, `pre-destructive`, `session-end` are deferred (architect: `post-commit` is already covered by `runIndex`'s built-in git indexing + stale check; `pre-destructive` defers to phase 3 when an `agent`-type hook is available — see `08-destructive-op-primitive.md`; `SessionEnd` is less reliable than `Stop`).
 
 The existing CLI (`index`, `search`, `status`, `projects`, `configure`/`config`, `paths`, `models`, `help`) is untouched in its current behavior. Hooks require **additive** surface: new top-level `hook` subcommand for the four hook entry points, plus new top-level `recall` / `ingest-session` subcommands (currently MCP-only), plus a new `--format=hook-md` output mode on `search` and `recall`, plus `--format=json` on `status`.
 

@@ -321,13 +321,14 @@ This is the *only* place in the heimdall hook surface where we use exit
 contract makes exit 2 the *only* mechanism to actually stop the tool —
 without it the hook is decorative.
 
-**Gap to flag (do not edit those files in this doc):**
-01-architecture.md §2 says "Reserve exit 2 for the phase-2 destructive-op
-hook only." That is now outdated terminology (it is phase 3, not
-phase 2) and the rule above should supersede it when Phase 3 ships.
-06-decisions.md OQ-5 should grow a sibling clause for guardrail hooks.
-Both edits are out of scope here; this doc is the authoritative
-reference until they catch up.
+**Cross-doc sync (closed):**
+01-architecture.md §2 previously said "Reserve exit 2 for the phase-2
+destructive-op hook only." That was stale terminology (it is phase 3,
+not phase 2) and has been updated to "phase-3" with a pointer back to
+this document. 06-decisions.md OQ-5 has been extended with a sibling
+clause for guardrail (PreToolUse) hooks that references this doc as the
+authoritative source. This doc remains the detailed reference for the
+destructive-op primitive; cross-references are now consistent.
 
 ---
 

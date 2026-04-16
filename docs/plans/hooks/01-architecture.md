@@ -17,7 +17,7 @@ Assessment is grounded in what heimdall can do *today* (per `internal/mcp/server
 | `PostToolUse(Edit\|Write)` | **USE (phase 1)**, fire-and-forget | `command`, background | Keeps the index fresh as Claude edits. Must never block — spawn detached process, always exit 0, stdout empty. Indexer must handle concurrent invocations safely (coordination ask to `failure-modes`). |
 | `PostToolUse(Bash(git commit *))` | **SKIP — already covered** | — | `runIndex` in `internal/mcp/server.go:328` already re-indexes git commits automatically after any `heimdall_index` run, and the stale-index check at `:435` triggers re-indexing on search. The marginal value of a dedicated commit hook is tiny; the incremental indexer + stale check already cover it. Revisit if the stale-check window proves too coarse. |
 | `Stop` / `SessionEnd` | **USE (phase 1)** on `Stop`, not `SessionEnd` | `command`, background | `heimdall_ingest_session` exists and wants a conversation summary. `Stop` fires at end of each assistant turn and gives us natural checkpoints. `SessionEnd` is less reliable (may not fire on crash). Fire-and-forget, never block. |
-| `PreToolUse(Bash(rm *\|git push --force*))` | **DEFER to phase 2** | `agent` (when adopted) | Valuable but complex: needs judgement, not retrieval. Today heimdall has no "is this destructive given prior memories?" primitive, and the `agent` hook type requires spawning a subagent — best done once the phase-1 pipeline is stable and `heimdall_recall` has meaningful data. |
+| `PreToolUse(Bash(rm *\|git push --force*))` | **DEFER to phase 3** | `agent` (when adopted) | Valuable but complex: needs judgement, not retrieval. Today heimdall has no "is this destructive given prior memories?" primitive, and the `agent` hook type requires spawning a subagent — best done once the phase-1 pipeline is stable and `heimdall_recall` has meaningful data. Design in `08-destructive-op-primitive.md`. |
 
 Phase 1 scope: **SessionStart, UserPromptSubmit, PostToolUse(Edit|Write), Stop.**
 
@@ -54,7 +54,7 @@ Phase 1 scope: **SessionStart, UserPromptSubmit, PostToolUse(Edit|Write), Stop.*
 - **Hook command:** `heimdall-mcp hook user-prompt` reading the JSON from stdin.
 - **Skip heuristic (inside the command):** read prompt, skip (exit 0 with empty stdout) if: prompt length < 12 chars, prompt is a pure slash command (`/…`), or prompt is all punctuation/emoji. Everything else runs retrieval.
 - **Stdout format:** Markdown, pre-formatted for direct injection. Header `## Heimdall suggests`, then up to 5 results from `heimdall search "<prompt>" --format=hook`. Each result is a 3-line block: `### file:line-range (score 0.NN)` then a fenced snippet truncated to ~400 chars. A trailing line `_retrieved via heimdall — use heimdall_search to fetch more or full content_` prompts Claude to fetch more if needed. Total output capped at ~2K tokens.
-- **Exit codes:** `0` always in phase 1 (never block the turn). Reserve exit 2 for the phase-2 destructive-op hook only.
+- **Exit codes:** `0` always in phase 1 (never block the turn). Reserve exit 2 for the phase-3 destructive-op hook only (see `08-destructive-op-primitive.md`).
 - **Timeout:** **250 ms p95 target, 500 ms hard** (per 03 §2, backed by measured 180–380 ms end-to-end on a 10k-chunk nomic index). On timeout the harness kills, turn proceeds with no injection. Empty stdout on timeout is strictly better than blocking.
 - **Stderr policy:** silent.
 
