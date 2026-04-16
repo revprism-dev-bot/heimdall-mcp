@@ -1,6 +1,7 @@
 package heimdall
 
 import (
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -31,5 +32,74 @@ func TestTranscriptPathForSession_WindowsPathIgnoredOnPosix(t *testing.T) {
 	got, _ := TranscriptPathForSession("/home/alice/Code/proj", "s", "/home/alice")
 	if filepath.Base(filepath.Dir(got)) != "-home-alice-Code-proj" {
 		t.Fatalf("unexpected slug dir: %s", got)
+	}
+}
+
+func TestParseTranscript_Basic(t *testing.T) {
+	sum, err := ParseTranscript("testdata/transcript_basic.jsonl")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if sum.SessionID != "bas-1" {
+		t.Errorf("session id: got %q", sum.SessionID)
+	}
+	if sum.UserMessages != 2 {
+		t.Errorf("user messages: got %d want 2", sum.UserMessages)
+	}
+	if sum.AssistantMessages != 2 {
+		t.Errorf("assistant messages: got %d want 2", sum.AssistantMessages)
+	}
+	if sum.TotalInputTokens != 14 {
+		t.Errorf("input tokens: got %d want 14", sum.TotalInputTokens)
+	}
+	if sum.TotalCacheCreationTokens != 100 {
+		t.Errorf("cache creation: got %d want 100", sum.TotalCacheCreationTokens)
+	}
+	if sum.TotalCacheReadTokens != 200 {
+		t.Errorf("cache read: got %d want 200", sum.TotalCacheReadTokens)
+	}
+	if sum.TotalOutputTokens != 13 {
+		t.Errorf("output: got %d want 13", sum.TotalOutputTokens)
+	}
+	if sum.ToolUseCount != 1 {
+		t.Errorf("tool use count: got %d want 1", sum.ToolUseCount)
+	}
+	if sum.ToolUseByName["Read"] != 1 {
+		t.Errorf("ToolUseByName[Read]: got %d want 1", sum.ToolUseByName["Read"])
+	}
+	if sum.HookSuccessCountByEvent["SessionStart"] != 1 {
+		t.Errorf("hook success count SessionStart: got %d want 1", sum.HookSuccessCountByEvent["SessionStart"])
+	}
+	wantBytes := int64(len("## Heimdall context\n\n> test bytes"))
+	if sum.HookSuccessBytesByEvent["SessionStart"] != wantBytes {
+		t.Errorf("hook bytes: got %d want %d", sum.HookSuccessBytesByEvent["SessionStart"], wantBytes)
+	}
+}
+
+func TestParseTranscript_FileMissing(t *testing.T) {
+	_, err := ParseTranscript("testdata/does-not-exist.jsonl")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func TestParseTranscript_MalformedLineCounted(t *testing.T) {
+	// Write a fixture with one valid line and one garbage line to a tempdir.
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "t.jsonl")
+	content := "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"ok\"},\"sessionId\":\"s\"}\n" +
+		"not json at all\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := ParseTranscript(p)
+	if err != nil {
+		t.Fatalf("parse returned error for tolerable malformed: %v", err)
+	}
+	if sum.ParseErrors != 1 {
+		t.Errorf("parse errors: got %d want 1", sum.ParseErrors)
+	}
+	if sum.UserMessages != 1 {
+		t.Errorf("user messages: got %d want 1", sum.UserMessages)
 	}
 }
