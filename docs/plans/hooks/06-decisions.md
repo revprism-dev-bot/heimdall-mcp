@@ -102,6 +102,20 @@ error detail belongs in the log file, not a shell exit code.
 `int 0` from its top-level function regardless of internal errors. Internal
 errors are captured via `LogHookEvent(level="ERROR", ...)`.
 
+**Guardrail hooks (phase 3 — PreToolUse) extension:** retrieval hooks
+(`SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`, `PostToolUse`)
+**always exit 0, never write to stderr** — the rule above is unchanged.
+Guardrail hooks (`PreToolUse`) **may exit 2 plus one stderr line**, but
+*only* when the hook is configured with `mode=block` AND the classifier
+returns `classification=block`. In every other case — `shadow`, `warn`,
+`off`, `allow`, `timeout`, internal `error` — guardrail hooks behave like
+retrieval hooks (exit 0, silent stderr, log via `LogHookEvent`). This is
+the only place in the heimdall hook surface where exit 2 or stderr output
+from a hook is permitted, and it is justified because `PreToolUse`'s
+contract makes exit 2 the only mechanism to actually stop a tool
+invocation. See `docs/plans/hooks/08-destructive-op-primitive.md` for the
+authoritative design and the full mode/classification matrix.
+
 ---
 
 ## Cross-cutting notes for Wave 2 agents

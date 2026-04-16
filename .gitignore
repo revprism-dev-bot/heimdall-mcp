@@ -2,3 +2,7 @@
 .heimdall_db/
 *.log
 dist/
+
+# IDE / editor
+.claude/
+.idea/
