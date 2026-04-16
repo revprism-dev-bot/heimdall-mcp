@@ -435,7 +435,11 @@ heimdall-mcp hooks tail --event=post-edit --since=5m
    emit a Tier B "unavailable" note on its first occurrence** and then
    suppress for 5 minutes per `(project, failure_code)`. If Ollama is
    starting slow and you reopen Claude Code before it's ready, the first
-   turn won't get heimdall context. Restart once Ollama is up.
+   turn won't get heimdall context. Restart once Ollama is up. Note:
+   `install-hooks` now fires a 5s-bounded `EmbedForHook` warm-up against
+   the configured model after a successful install (and on `--force`),
+   removing the ~67 s first-turn cold start observed in the dogfood. Pass
+   `--no-prewarm` to skip.
 
 4. **`VerifyHookIndex` will fail if the index was built with a different
    model than your current `heimdall-mcp config`.** The gate is strict by
@@ -603,4 +607,9 @@ harmless, excluded from indexing, prune manually.
    primitive that doesn't exist. Design decision required.
 8. Is `.claude/settings.json` worth gitignoring? (Cosmetic.)
 9. Do unit-test hook-log artifacts need a temp-dir fix? (Follow-up.)
-10. Should the post-edit actor pre-warm Ollama on install?
+10. ~~Should the post-edit actor pre-warm Ollama on install?~~ **✅ done.**
+    `install-hooks` now does a best-effort `EmbedForHook` warm-up
+    (5s timeout, `--no-prewarm` to skip) after a successful install or
+    `--force` re-install. Auto-upgrade SessionStart intentionally skips
+    its own prewarm — the recall step that runs immediately after warms
+    the model anyway, and a redundant call would eat the 2s budget.

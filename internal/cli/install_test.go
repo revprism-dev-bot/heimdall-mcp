@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
 )
@@ -990,4 +991,267 @@ func TestAutoUpgrade_SkipsWhenNoSettings(t *testing.T) {
 	// No settings.json — should be a no-op.
 	autoUpgradeHooks(env)
 	// No crash = pass.
+}
+
+// ----- pre-warm Ollama on install-hooks -----
+
+// prewarmCall records one invocation of the stubbed prewarm so tests can
+// assert what was passed and whether the caller honored the timeout
+// contract. Recording only what we need keeps the assertions tight.
+type prewarmCall struct {
+	endpoint string
+	model    string
+	deadline time.Time
+	hadCtx   bool
+}
+
+// stubPrewarm swaps prewarmFn for a recording fake during a single test.
+// The supplied function drives the fake's behavior — pass a stub that
+// returns success, error, or simulates a timeout outcome as needed per
+// test. The Cleanup hook restores the original prewarmFn so tests don't
+// leak state into each other when run with -count=N or under -race.
+func stubPrewarm(t *testing.T, fn func(ctx context.Context, endpoint, model string) prewarmResult) *[]prewarmCall {
+	t.Helper()
+	calls := &[]prewarmCall{}
+	prev := prewarmFn
+	prewarmFn = func(ctx context.Context, endpoint, model string) prewarmResult {
+		dl, ok := ctx.Deadline()
+		*calls = append(*calls, prewarmCall{
+			endpoint: endpoint,
+			model:    model,
+			deadline: dl,
+			hadCtx:   ok,
+		})
+		return fn(ctx, endpoint, model)
+	}
+	t.Cleanup(func() { prewarmFn = prev })
+	return calls
+}
+
+// TestPrewarm_CalledOnceWithExpectedInput verifies that a successful install
+// fires exactly one EmbedForHook against the configured endpoint and model,
+// and renders the expected progress + success status lines on stdout.
+func TestPrewarm_CalledOnceWithExpectedInput(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{
+		OllamaEndpoint: "http://stub:11434",
+		Model:          "test-model",
+	}
+	calls := stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		return prewarmResult{model: model, duration: 12 * time.Millisecond}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user"})
+	if code != 0 {
+		t.Fatalf("install exit=%d stderr=%s", code, stderr.String())
+	}
+	if got := len(*calls); got != 1 {
+		t.Fatalf("expected exactly 1 prewarm call, got %d: %+v", got, *calls)
+	}
+	c := (*calls)[0]
+	if c.endpoint != cfg.OllamaEndpoint {
+		t.Errorf("prewarm endpoint = %q, want %q", c.endpoint, cfg.OllamaEndpoint)
+	}
+	if c.model != cfg.Model {
+		t.Errorf("prewarm model = %q, want %q", c.model, cfg.Model)
+	}
+	if !c.hadCtx {
+		t.Errorf("prewarm context should carry a deadline (got none)")
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Pre-warming Ollama...") {
+		t.Errorf("missing pre-warm progress line in stdout: %s", out)
+	}
+	if !strings.Contains(out, "Pre-warmed model=test-model") {
+		t.Errorf("missing success line in stdout: %s", out)
+	}
+}
+
+// TestPrewarm_TimeoutBounded asserts that the install side passes a real
+// deadline ≤ prewarmTimeout, and that simulating a timeout-exceeded result
+// from the embedder still returns 0 promptly. We verify the deadline budget
+// instead of actually sleeping 5s — that keeps the test fast and
+// deterministic, while still proving the contract.
+func TestPrewarm_TimeoutBounded(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{Model: "slow-model", OllamaEndpoint: "http://stub:11434"}
+
+	stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		dl, ok := ctx.Deadline()
+		if !ok {
+			t.Errorf("prewarm: caller did not set a deadline")
+			return prewarmResult{model: model, err: errors.New("no deadline")}
+		}
+		if remaining := time.Until(dl); remaining > prewarmTimeout+250*time.Millisecond {
+			t.Errorf("prewarm deadline too far in future: remaining=%v want <= %v", remaining, prewarmTimeout)
+		}
+		// Simulate timeout outcome without actually blocking the test.
+		return prewarmResult{model: model, err: context.DeadlineExceeded, duration: prewarmTimeout}
+	})
+
+	start := time.Now()
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user"})
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("install must not fail on prewarm timeout: exit=%d stderr=%s", code, stderr.String())
+	}
+	// Generous safety net: the stub returns immediately, so the install
+	// should finish in well under a second. We assert under 10s to catch
+	// accidental real Ollama calls or a forgotten sleep.
+	if elapsed > 10*time.Second {
+		t.Errorf("install took too long: %v (prewarm should be bounded by %v)", elapsed, prewarmTimeout)
+	}
+	if !strings.Contains(stdout.String(), "Pre-warm skipped") {
+		t.Errorf("expected skipped status on timeout, got: %s", stdout.String())
+	}
+}
+
+// TestPrewarm_FailureDoesNotFailInstall checks that an erroring embedder
+// surfaces a one-line skip message but lets the install succeed.
+func TestPrewarm_FailureDoesNotFailInstall(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{Model: "broken-model", OllamaEndpoint: "http://stub:11434"}
+
+	stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		return prewarmResult{model: model, err: errors.New("ollama embed: dial: connection refused")}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user"})
+	if code != 0 {
+		t.Fatalf("install must not fail on prewarm error: exit=%d stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Pre-warm skipped") {
+		t.Errorf("expected skipped status on error, got: %s", out)
+	}
+	if !strings.Contains(out, "connection refused") {
+		t.Errorf("expected error reason in skip line, got: %s", out)
+	}
+	// Hooks must still be installed.
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if _, err := os.Stat(settingsPath); err != nil {
+		t.Errorf("settings.json should be created even when prewarm fails: %v", err)
+	}
+}
+
+// TestPrewarm_NoPrewarmFlagSkips verifies that --no-prewarm bypasses the
+// embedder entirely (no calls recorded) and prints the disabled status line.
+func TestPrewarm_NoPrewarmFlagSkips(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{Model: "any-model", OllamaEndpoint: "http://stub:11434"}
+
+	calls := stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		t.Errorf("prewarm must not be called when --no-prewarm is set")
+		return prewarmResult{}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user", "--no-prewarm"})
+	if code != 0 {
+		t.Fatalf("install exit=%d stderr=%s", code, stderr.String())
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("expected zero prewarm calls under --no-prewarm, got %d", len(*calls))
+	}
+	if !strings.Contains(stdout.String(), "Pre-warm skipped (--no-prewarm)") {
+		t.Errorf("expected --no-prewarm skip line in stdout: %s", stdout.String())
+	}
+}
+
+// TestPrewarm_DryRunSkips verifies --dry-run doesn't fire the embedder
+// (we never wrote settings.json, so warming makes no sense).
+func TestPrewarm_DryRunSkips(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{Model: "any-model", OllamaEndpoint: "http://stub:11434"}
+
+	calls := stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		t.Errorf("prewarm must not be called in --dry-run mode")
+		return prewarmResult{}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("dry-run install exit=%d stderr=%s", code, stderr.String())
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("expected zero prewarm calls in --dry-run, got %d", len(*calls))
+	}
+	// Dry-run must not print a Pre-warm status (it didn't run one).
+	out := stdout.String()
+	if strings.Contains(out, "Pre-warm") {
+		t.Errorf("dry-run should not print a Pre-warm line, got: %s", out)
+	}
+}
+
+// TestPrewarm_NoModelConfiguredSkips verifies that an empty cfg.Model is
+// treated as a soft skip with no embedder call. Belt-and-braces: the install
+// should still succeed, since there's no useful model to warm.
+func TestPrewarm_NoModelConfiguredSkips(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{} // Model intentionally empty
+
+	calls := stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		t.Errorf("prewarm must not be called when cfg.Model is empty")
+		return prewarmResult{}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user"})
+	if code != 0 {
+		t.Fatalf("install exit=%d stderr=%s", code, stderr.String())
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("expected zero prewarm calls when no model configured, got %d", len(*calls))
+	}
+	if !strings.Contains(stdout.String(), "Pre-warm skipped (no model configured)") {
+		t.Errorf("expected no-model skip line in stdout: %s", stdout.String())
+	}
+}
+
+// TestPrewarm_FiresOnForce verifies the prewarm path runs under --force,
+// matching the spec: re-installing should always end with a warm model.
+func TestPrewarm_FiresOnForce(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(settingsPath), 0o755)
+
+	// Pre-existing foreign hook so --force has something to replace.
+	conflicting := map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "/usr/local/bin/other-tool"},
+					},
+				},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(conflicting, "", "  ")
+	os.WriteFile(settingsPath, b, 0o600)
+
+	cfg := config.Config{Model: "test-model", OllamaEndpoint: "http://stub:11434"}
+	calls := stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		return prewarmResult{model: model, duration: 5 * time.Millisecond}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user", "--force"})
+	if code != 0 {
+		t.Fatalf("install --force exit=%d stderr=%s", code, stderr.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("--force should still trigger one prewarm call, got %d", len(*calls))
+	}
 }
