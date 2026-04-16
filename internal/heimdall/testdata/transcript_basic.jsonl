@@ -1,0 +1,6 @@
+{"type":"user","message":{"role":"user","content":"hello world"},"sessionId":"bas-1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"output_tokens":5}},"sessionId":"bas-1","timestamp":"2026-01-01T00:00:01Z"}
+{"type":"user","message":{"role":"user","content":"do thing"},"sessionId":"bas-1","timestamp":"2026-01-01T00:00:02Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x"}}],"usage":{"input_tokens":4,"cache_creation_input_tokens":0,"cache_read_input_tokens":200,"output_tokens":8}},"sessionId":"bas-1","timestamp":"2026-01-01T00:00:03Z"}
+{"type":"attachment","attachment":{"type":"hook_success","hookEvent":"SessionStart","stdout":"## Heimdall context\n\n> test bytes"},"sessionId":"bas-1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"stop_hook_summary","sessionId":"bas-1"}
