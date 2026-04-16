@@ -23,13 +23,33 @@ type runUPOpts struct {
 	// seedRecords, if non-nil, are upserted into the DB before the hook runs
 	// so a real search can return them.
 	seedRecords []heimdall.VectorRecord
+	// memoryStore, if non-nil, is returned by OpenMemoryStore. If nil, a
+	// fresh empty in-tempdir memory store is provided so tests never hit
+	// the real ~/.local memory DB.
+	memoryStore *heimdall.MemoryStore
 }
 
 func runHookUserPrompt(t *testing.T, opts runUPOpts) (stdout, stderr string, code int) {
 	t.Helper()
 	var out, errBuf strings.Builder
+	// Every test gets an isolated memory store. Without this, the hook's
+	// skill-surfacing path would fall through to config.ResolveMemoryDBPath
+	// and read/write the user's real ~/.local/state/heimdall memory DB
+	// under `go test`.
+	mem := opts.memoryStore
+	if mem == nil {
+		var err error
+		mem, err = heimdall.OpenMemoryStore(filepath.Join(t.TempDir(), "memories.db"))
+		if err != nil {
+			t.Fatalf("open empty memory store: %v", err)
+		}
+		t.Cleanup(func() { mem.Close() })
+	}
 	deps := HookUserPromptDeps{
 		Suppress: opts.suppress,
+		OpenMemoryStore: func() (*heimdall.MemoryStore, error) {
+			return mem, nil
+		},
 	}
 	if deps.Suppress == nil {
 		deps.Suppress = func(string, string, time.Duration) bool { return true }

@@ -282,6 +282,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 	status := heimdall.GatherStatus(ctx, cfg.OllamaEndpoint, resolvedModel, baseDir, cfg.ExcludePatterns, client)
 
 	var bullets []string
+	var skillBullets []string
 	if memStore, err := openMemoryStore(); err == nil && memStore != nil {
 		// Defensive: caller might reuse the store across calls (tests do),
 		// so we only Close if we opened it ourselves. The simplest heuristic
@@ -310,6 +311,12 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 				bullets = append(bullets, singleLine(h.Content))
 			}
 		}
+
+		// Skills are additive: surface the top-N skill memories most
+		// relevant to the project. Failure (timeout, no matches, embed
+		// error) returns nil and the "### Relevant skills" section is
+		// omitted — we never block the main block on this.
+		skillBullets = surfaceRelevantSkills(ctx, query, skillsTopNDefault, embedder, memStore)
 	} else if err != nil {
 		heimdall.LogHookEvent("INFO", "session-start", map[string]any{
 			"stage": "open_memory",
@@ -331,15 +338,16 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 
 	// --- format + write ------------------------------------------------------
 
-	body := formatSessionStartBlock(status, resolvedModel, projectRoot, bullets, now())
+	body := formatSessionStartBlock(status, resolvedModel, projectRoot, bullets, skillBullets, now())
 	body = capRunes(body, sessionStartMaxRunes)
 	_, _ = io.WriteString(stdout, body)
 
 	heimdall.LogHookEvent("INFO", "session-start", map[string]any{
-		"stage":      "ok",
-		"bullets":    len(bullets),
-		"chunks":     status.TotalChunks,
-		"model":      resolvedModel,
+		"stage":   "ok",
+		"bullets": len(bullets),
+		"skills":  len(skillBullets),
+		"chunks":  status.TotalChunks,
+		"model":   resolvedModel,
 	})
 	return 0
 }
@@ -377,10 +385,12 @@ func emitEmpty(w io.Writer) {
 
 // formatSessionStartBlock builds the happy-path markdown block. An empty
 // bullets slice still renders the header (with no "Recent memories"
-// subsection) so the user sees the project is indexed.
-func formatSessionStartBlock(status heimdall.StatusInfo, model, projectRoot string, bullets []string, now time.Time) string {
+// subsection) so the user sees the project is indexed. skillBullets are
+// rendered as a separate "### Relevant skills" section below memories;
+// omitted entirely when empty.
+func formatSessionStartBlock(status heimdall.StatusInfo, model, projectRoot string, bullets, skillBullets []string, now time.Time) string {
 	var b strings.Builder
-	b.Grow(256 + 80*len(bullets))
+	b.Grow(256 + 80*len(bullets) + 80*len(skillBullets))
 
 	projectName := filepath.Base(projectRoot)
 	lastIndexed := status.LastIndexed
@@ -401,6 +411,8 @@ func formatSessionStartBlock(status heimdall.StatusInfo, model, projectRoot stri
 			fmt.Fprintf(&b, "- %s\n", m)
 		}
 	}
+
+	appendSkillsSection(&b, skillBullets)
 
 	b.WriteString("\n_retrieved via heimdall-mcp_\n")
 	return b.String()
