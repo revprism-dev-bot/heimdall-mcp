@@ -13,6 +13,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,12 +84,58 @@ var phase1aHooks = []phase1aHook{
 
 // installFlags captures the parsed flags for install-hooks.
 type installFlags struct {
-	scope    string // "user" | "project" | "" (auto-detect)
-	dryRun   bool
-	merge    bool
-	force    bool
-	only     []string // subset of phase1aHooks event names; empty = all
-	hasOnly  bool
+	scope     string // "user" | "project" | "" (auto-detect)
+	dryRun    bool
+	merge     bool
+	force     bool
+	only      []string // subset of phase1aHooks event names; empty = all
+	hasOnly   bool
+	noPrewarm bool // --no-prewarm: skip the post-install Ollama warm-up
+}
+
+// prewarmTimeout caps how long the post-install Ollama warm-up may run.
+// Best-effort: if Ollama is cold or absent we do not want to keep the user
+// waiting on `install-hooks`. Five seconds is plenty for a hot model and a
+// soft ceiling for a cold one (model load can blow past this; that is fine,
+// the prewarm just bails and the install still succeeds).
+const prewarmTimeout = 5 * time.Second
+
+// prewarmInput is the tiny fixed text we ask Ollama to embed during the
+// install-time warm-up. The contents do not matter beyond being short and
+// stable — we discard the resulting vector. Stable text means a hot model
+// can serve it from internal caches with sub-100ms latency.
+const prewarmInput = "heimdall prewarm"
+
+// prewarmResult holds the outcome of a single prewarm attempt so the install
+// handler can render a one-line status to the user.
+type prewarmResult struct {
+	model    string        // model that was warmed (echoed in the success line)
+	duration time.Duration // wall-clock time the prewarm took
+	err      error         // nil on success; non-nil descriptions are surfaced verbatim
+}
+
+// prewarmFunc is the dependency-injected shape used by CLIInstallHooks.
+// Production wires it to runPrewarmOllama; tests swap it for a stub that
+// records the call (or simulates timeouts/failures) without touching a real
+// Ollama process. The function MUST NOT panic — it is best-effort and any
+// error is logged and ignored.
+type prewarmFunc func(ctx context.Context, endpoint, model string) prewarmResult
+
+// prewarmFn is the live indirection point. Tests reset this via the small
+// stubPrewarm test helper to inject stubs.
+var prewarmFn prewarmFunc = runPrewarmOllama
+
+// runPrewarmOllama is the production prewarm implementation: open an Ollama
+// client, fire one EmbedForHook call against the given model with the tiny
+// fixed input, discard the result. Caller is responsible for the timeout.
+func runPrewarmOllama(ctx context.Context, endpoint, model string) prewarmResult {
+	res := prewarmResult{model: model}
+	start := time.Now()
+	client := heimdall.NewOllamaClient(endpoint)
+	_, err := client.EmbedForHook(ctx, model, prewarmInput)
+	res.duration = time.Since(start)
+	res.err = err
+	return res
 }
 
 // uninstallFlags captures the parsed flags for uninstall-hooks.
@@ -101,7 +148,6 @@ type uninstallFlags struct {
 // handler shape. Never calls os.Exit; returns 0 on success, 1 on runtime
 // error, 2 on usage error.
 func CLIInstallHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
-	_ = cfg
 	_ = stdin
 	flags, err := parseInstallFlags(args)
 	if err != nil {
@@ -179,8 +225,78 @@ func CLIInstallHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Write
 		fmt.Fprintf(stdout, "Replaced %d conflicting entries.\n", len(report.replaced))
 	}
 	fmt.Fprintf(stdout, "Installed %d hooks (scope=%s, file=%s).\n", len(desired), scope, settingsPath)
+
+	// Pre-warm Ollama so the very first SessionStart / PostToolUse the user
+	// hits doesn't pay the cold-load tax (see docs/plans/hooks/07 caveat —
+	// first real PostToolUse(Edit) measured at ~67s with a cold model).
+	// Best-effort: timeout-bounded, gated by --no-prewarm, never fails the
+	// install. --dry-run skips entirely (we never wrote settings.json).
+	doPrewarm(stdout, cfg, flags.noPrewarm, "install-hooks")
+
 	fmt.Fprintln(stdout, "Run 'heimdall-mcp hooks doctor' to verify.")
 	return 0
+}
+
+// doPrewarm renders the install-time Ollama warm-up. Single status line on
+// stdout regardless of outcome:
+//
+//	Pre-warming Ollama...
+//	Pre-warmed model=<name> in <ms>ms        (success)
+//	Pre-warm skipped (<reason>)              (failure / disabled / no model)
+//
+// Caller passes `source` so the LogHookEvent payload distinguishes
+// install-hooks vs auto-upgrade. Never returns an error — the install must
+// succeed even if Ollama is down or the model is missing.
+func doPrewarm(stdout io.Writer, cfg config.Config, disabled bool, source string) {
+	if disabled {
+		fmt.Fprintln(stdout, "Pre-warm skipped (--no-prewarm)")
+		heimdall.LogHookEvent("INFO", source, map[string]any{
+			"stage":  "prewarm",
+			"reason": "disabled",
+		})
+		return
+	}
+	if cfg.Model == "" {
+		// No configured model means we have nothing to warm. This is the
+		// degraded case where the user runs install-hooks before configuring
+		// or indexing — skip cleanly rather than guess at a default.
+		fmt.Fprintln(stdout, "Pre-warm skipped (no model configured)")
+		heimdall.LogHookEvent("INFO", source, map[string]any{
+			"stage":  "prewarm",
+			"reason": "no_model",
+		})
+		return
+	}
+
+	fmt.Fprintln(stdout, "Pre-warming Ollama...")
+	ctx, cancel := context.WithTimeout(context.Background(), prewarmTimeout)
+	defer cancel()
+	res := prewarmFn(ctx, cfg.OllamaEndpoint, cfg.Model)
+	if res.err != nil {
+		// Trim any leading/trailing whitespace from the error so the one-line
+		// status stays compact — Ollama errors are typically already tidy.
+		reason := strings.TrimSpace(res.err.Error())
+		if reason == "" {
+			reason = "unknown"
+		}
+		fmt.Fprintf(stdout, "Pre-warm skipped (%s)\n", reason)
+		heimdall.LogHookEvent("INFO", source, map[string]any{
+			"stage":     "prewarm",
+			"err":       res.err.Error(),
+			"model":     res.model,
+			"duration":  res.duration.String(),
+			"timeoutMs": prewarmTimeout.Milliseconds(),
+		})
+		return
+	}
+	ms := res.duration.Milliseconds()
+	fmt.Fprintf(stdout, "Pre-warmed model=%s in %dms\n", res.model, ms)
+	heimdall.LogHookEvent("INFO", source, map[string]any{
+		"stage":      "prewarm",
+		"msg":        "ok",
+		"model":      res.model,
+		"durationMs": ms,
+	})
 }
 
 // CLIUninstallHooks implements `heimdall-mcp uninstall-hooks` per §5.4.
@@ -277,8 +393,10 @@ func parseInstallFlags(args []string) (installFlags, error) {
 		case strings.HasPrefix(a, "--only="):
 			f.only = splitCSV(strings.TrimPrefix(a, "--only="))
 			f.hasOnly = true
+		case a == "--no-prewarm":
+			f.noPrewarm = true
 		case a == "-h" || a == "--help":
-			return f, errors.New("usage: install-hooks [--scope=user|project] [--dry-run] [--merge] [--force] [--only=<events>]")
+			return f, errors.New("usage: install-hooks [--scope=user|project] [--dry-run] [--merge] [--force] [--only=<events>] [--no-prewarm]")
 		default:
 			return f, fmt.Errorf("unknown flag %q", a)
 		}
@@ -994,12 +1112,22 @@ func autoUpgradeHooks(env map[string]string) {
 			names[i] = h.event
 		}
 		heimdall.LogHookEvent("INFO", "auto-upgrade", map[string]any{
-			"msg":     "hooks_upgraded",
-			"scope":   scope,
-			"added":   names,
-			"total":   len(phase1aHooks),
-			"path":    path,
+			"msg":   "hooks_upgraded",
+			"scope": scope,
+			"added": names,
+			"total": len(phase1aHooks),
+			"path":  path,
 		})
+
+		// Prewarm note: install-hooks fires a 5s EmbedForHook to remove the
+		// first-turn cold start (see docs/plans/hooks/07 caveat). Auto-upgrade
+		// runs inside HookSessionStart, which already issues an EmbedForHook
+		// against the same model for its recall step a few milliseconds later
+		// (see hook.go HookSessionStart → newHookEmbedder.Embed). That call
+		// is what actually warms Ollama; adding a second EmbedForHook here
+		// would just double the latency on the already-tight 2s SessionStart
+		// budget for zero benefit. So the auto-upgrade path intentionally
+		// does NOT call doPrewarm — the next recall does the warm-up for us.
 	}
 }
 
