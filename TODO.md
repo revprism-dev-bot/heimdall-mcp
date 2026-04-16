@@ -65,8 +65,8 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [ ] `PreToolUse(Bash(rm *|git push --force*))` as `agent`-type hook — needs a destructive-op judgment primitive heimdall does not have today
 
 **Carried over / not yet in scope:**
-- [ ] T20 Layer 2 integration tests (`os/exec` + fake Ollama) — deferred, unit tests cover 130+ cases; Layer 2 is for future hardening
-- [ ] T23 Layer 3 opt-in e2e harness (`-tags e2e`, `HEIMDALL_E2E_CLAUDE=1`)
+- [x] T20 Layer 2 integration tests (`os/exec` + fake Ollama) — `internal/cli/integration_test.go`, build-tag `integration`, 4 tests (session-start, user-prompt cache-hit, post-edit actor, stop→session-end). Run via `make test-integration`.
+- [x] T23 Layer 3 opt-in e2e harness (`-tags e2e`, `HEIMDALL_E2E_CLAUDE=1`) — `internal/cli/e2e_test.go`, cleanly skips without env var or `claude` binary. Run via `make test-e2e`.
 - [x] T24 Windows path redaction — verified correct, 12 test cases in `hooklog_test.go` cover all required patterns
 - [x] PERF-002 `bumpIndexVersionTx` — single atomic `INSERT ... ON CONFLICT DO UPDATE` SQL statement
 - [x] PERF-003 hook_cache eviction — incremental row-count tracking via lazy-init counter, no more O(n) COUNT per insert
