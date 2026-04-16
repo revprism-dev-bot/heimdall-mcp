@@ -50,7 +50,7 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 
 **Wave 2 phase 1b follow-ups (post-merge):**
 - [ ] Live dogfood `UserPromptSubmit` — watch `hooks tail --event=user-prompt` for cache-hit/miss ratio, Tier B paths, any stage=err lines
-- [ ] With-vs-without comparison (T21 replacement): pick a real task, run twice — `HEIMDALL_HOOKS=0` control vs defaults — compare quality, token spend, tool-call count
+- [x] ~~With-vs-without comparison (T21 replacement)~~ **SHIPPED as `heimdall-mcp sessions report`** (PR #28, Wave D of `docs/plans/hooks/10-per-session-savings-report.md`). Joins transcript JSONL (tokens, tool calls, hook_success bytes) with `hooks.log` (cache hits, guardrail verdicts, reindex counts) per `session_id`. Runs post-hoc on every real session — no need for dedicated control runs.
 
 **Wave 2 phase 2 ✅ shipped (session learning):**
 - [x] T8 `hook stop` command — rolling buffer appends `last_assistant_message` per turn, keyed by `session_id`, capped at 2 MB per buffer file

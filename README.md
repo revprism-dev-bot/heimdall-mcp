@@ -185,6 +185,17 @@ heimdall-mcp uninstall-hooks --scope=project
 
 Toggle guardrails with `HEIMDALL_GUARDRAILS=shadow|warn|block|off` (default: `shadow` — logs verdicts, never blocks). Disable all hooks with `HEIMDALL_HOOKS=0` or drop a `.heimdall/hooks.disabled` marker in your project.
 
+### Per-session savings
+
+After a Claude Code session, run:
+
+```bash
+heimdall-mcp sessions list
+heimdall-mcp sessions report --session-id=<id>
+```
+
+The `report` command joins the session transcript (tokens, tool calls, `hook_success` attachment bytes) with `hooks.log` (cache hits, guardrail verdicts, reindex events) and prints a per-session summary. `--format=json` is available for scripting.
+
 ## Skills
 
 Heimdall indexes [Claude Code skills](https://docs.anthropic.com/claude/claude-code/skills) as a searchable memory type so top-N relevant skills surface in the `SessionStart` and `UserPromptSubmit` hooks:
