@@ -83,6 +83,25 @@ func TestParseTranscript_FileMissing(t *testing.T) {
 	}
 }
 
+func TestParseTranscript_HeimdallToolsCounted(t *testing.T) {
+	sum, err := ParseTranscript("testdata/transcript_heimdall.jsonl")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if sum.ToolUseCount != 3 {
+		t.Errorf("ToolUseCount: got %d want 3", sum.ToolUseCount)
+	}
+	if sum.HeimdallToolCalls != 2 {
+		t.Errorf("HeimdallToolCalls: got %d want 2", sum.HeimdallToolCalls)
+	}
+	if sum.ToolUseByName["mcp__heimdall__heimdall_search"] != 1 {
+		t.Errorf("heimdall_search: got %d", sum.ToolUseByName["mcp__heimdall__heimdall_search"])
+	}
+	if sum.HookSuccessBytesByEvent["UserPromptSubmit"] == 0 {
+		t.Errorf("expected non-zero UserPromptSubmit bytes")
+	}
+}
+
 func TestParseTranscript_MalformedLineCounted(t *testing.T) {
 	// Write a fixture with one valid line and one garbage line to a tempdir.
 	tmp := t.TempDir()
