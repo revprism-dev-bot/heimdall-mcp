@@ -258,9 +258,9 @@ func TestLogHookEvent_FileDeletedMidStream(t *testing.T) {
 	}
 }
 
-// TEST-C-002: ReadHookLog must tolerate a malformed trailing line (no
+// TEST-C-002: OpenHookLog must tolerate a malformed trailing line (no
 // terminating newline, or garbled UTF-8) without panic.
-func TestReadHookLog_HandlesPartialLastLine(t *testing.T) {
+func TestOpenHookLog_HandlesPartialLastLine(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hooks.log")
 	t.Setenv("HEIMDALL_HOOK_LOG", path)
@@ -276,9 +276,9 @@ func TestReadHookLog_HandlesPartialLastLine(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rc, err := ReadHookLog(0, false)
+	rc, err := OpenHookLog(0, false)
 	if err != nil {
-		t.Fatalf("ReadHookLog: %v", err)
+		t.Fatalf("OpenHookLog: %v", err)
 	}
 	defer rc.Close()
 	b, err := io.ReadAll(rc)
@@ -291,9 +291,9 @@ func TestReadHookLog_HandlesPartialLastLine(t *testing.T) {
 	}
 
 	// Subsequent reads still work (reopen).
-	rc2, err := ReadHookLog(0, false)
+	rc2, err := OpenHookLog(0, false)
 	if err != nil {
-		t.Fatalf("second ReadHookLog: %v", err)
+		t.Fatalf("second OpenHookLog: %v", err)
 	}
 	defer rc2.Close()
 	if _, err := io.ReadAll(rc2); err != nil {
@@ -492,12 +492,12 @@ func TestHookLogPath_NoHomeReturnsEmpty(t *testing.T) {
 	}
 }
 
-func TestReadHookLog_OneShot(t *testing.T) {
+func TestOpenHookLog_OneShot(t *testing.T) {
 	path := setupTmpHookLog(t)
 	LogHookEvent("INFO", "e1", nil)
 	LogHookEvent("INFO", "e2", nil)
 
-	rc, err := ReadHookLog(0, false)
+	rc, err := OpenHookLog(0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,10 +513,10 @@ func TestReadHookLog_OneShot(t *testing.T) {
 	_ = path
 }
 
-func TestReadHookLog_MissingFile(t *testing.T) {
+func TestOpenHookLog_MissingFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(dir, "does-not-exist.log"))
-	_, err := ReadHookLog(0, false)
+	_, err := OpenHookLog(0, false)
 	if err == nil {
 		t.Error("expected error on missing log")
 	}

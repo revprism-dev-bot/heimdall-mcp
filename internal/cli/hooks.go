@@ -119,7 +119,7 @@ func HooksTail(stdin io.Reader, stdout, stderr io.Writer, env map[string]string,
 		return 2
 	}
 
-	rc, err := heimdall.ReadHookLog(0, flags.follow)
+	rc, err := heimdall.OpenHookLog(0, flags.follow)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// Empty log — one-shot returns 0 (no content). Follow mode

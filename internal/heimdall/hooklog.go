@@ -238,15 +238,20 @@ func redactLogString(s string) string {
 	return s
 }
 
-// ReadHookLog opens the hook log for reading. The caller MUST close the
-// returned io.ReadCloser. If follow is true, the reader blocks at EOF and
-// polls every 200ms for appended lines until closed. Used by `hooks tail`.
+// OpenHookLog opens the hook log for streaming reads. The caller MUST close
+// the returned io.ReadCloser. If follow is true, the reader blocks at EOF
+// and polls every 200ms for appended lines until closed. Used by `hooks
+// tail`.
 //
 // One-shot (follow=false) returns a ReadCloser that yields all current
 // contents and then EOF. Never panics; returns a concrete error if the log
 // file does not exist or cannot be opened (callers render that error as
 // "no log yet" or similar).
-func ReadHookLog(offset int64, follow bool) (io.ReadCloser, error) {
+//
+// For structured per-entry reads with filtering, see ReadHookLog in
+// hooklog_reader.go — that is the parser-level API used by the sessions
+// report CLI.
+func OpenHookLog(offset int64, follow bool) (io.ReadCloser, error) {
 	path := HookLogPath()
 	if path == "" {
 		return nil, fmt.Errorf("hook log path unresolved (set XDG_STATE_HOME or HOME)")
