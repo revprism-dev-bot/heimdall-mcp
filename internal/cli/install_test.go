@@ -527,8 +527,8 @@ func TestDoctorChecks_GreenWhenAllOK(t *testing.T) {
 	}
 	cfg := config.Config{Model: "bge-m3"}
 	checks := runDoctorChecks(cfg, env, deps)
-	if len(checks) != 12 {
-		t.Fatalf("expected 12 checks, got %d", len(checks))
+	if len(checks) != 13 {
+		t.Fatalf("expected 13 checks, got %d", len(checks))
 	}
 	for _, c := range checks {
 		if c.status == statusFail {

@@ -25,7 +25,7 @@ type HookHandler func(stdin io.Reader, stdout, stderr io.Writer, env map[string]
 // exit code to surface to the shell. Called by RunCLI via a tiny wrapper.
 func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "Usage: heimdall-mcp hooks <tail|cache-clear|cache-stats|doctor>")
+		fmt.Fprintln(stderr, "Usage: heimdall-mcp hooks <tail|cache-clear|cache-stats|doctor|explain-command>")
 		return 2
 	}
 	sub := args[0]
@@ -39,18 +39,56 @@ func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer,
 		return HooksCacheStats(cfg, stdin, stdout, stderr, env, rest)
 	case "doctor":
 		return HooksDoctor(cfg, stdin, stdout, stderr, env, rest)
+	case "explain-command":
+		return HooksExplainCommand(stdin, stdout, stderr, env, rest)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "heimdall-mcp hooks — operate on the Claude Code hooks subsystem")
 		fmt.Fprintln(stdout)
-		fmt.Fprintln(stdout, "  hooks tail [flags]           Tail the hook log file with filters")
+		fmt.Fprintln(stdout, "  hooks tail [flags]                     Tail the hook log file with filters")
 		fmt.Fprintln(stdout, "  hooks cache-clear [--project <path>] [--all-models]")
 		fmt.Fprintln(stdout, "  hooks cache-stats [--project <path>] [--format text|json] [--all-models]")
-		fmt.Fprintln(stdout, "  hooks doctor [--scope=user|project]   Diagnose hooks installation")
+		fmt.Fprintln(stdout, "  hooks doctor [--scope=user|project]    Diagnose hooks installation")
+		fmt.Fprintln(stdout, "  hooks explain-command \"<cmd>\"          Classify a Bash command (allow/warn/block)")
 		return 0
 	default:
 		fmt.Fprintf(stderr, "Unknown hooks subcommand: %s\n", sub)
 		return 2
 	}
+}
+
+// HooksExplainCommand is the `hooks explain-command "<cmd>"` admin entry.
+// Classifies the given Bash command without executing anything and prints
+// a one-line summary `class=<allow|warn|block>  rule=<id>  reason=<text>`.
+//
+// Exit code: 0 unconditionally. This command is purely informational — a
+// shell script wanting to gate on classification should parse the printed
+// `class=` token itself. Per design doc §4 this is the interactive dry-run
+// surface; the hot-path hook lives in HookPreToolUse.
+func HooksExplainCommand(stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
+	_ = stdin
+	_ = env
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "Usage: heimdall-mcp hooks explain-command \"<bash command>\"")
+		// Still return 0 — this command is informational; a missing arg
+		// just prints usage and moves on. (Matches the task spec: "Exits 0
+		// regardless.")
+		return 0
+	}
+	// Join all positional args so users can write the command without quoting
+	// each whitespace-separated token. `hooks explain-command rm -rf /` works
+	// the same as `hooks explain-command "rm -rf /"`.
+	cmd := strings.Join(args, " ")
+	class, reason, ruleID := heimdall.ClassifyBashCommand(cmd)
+	ruleOut := ruleID
+	if ruleOut == "" {
+		ruleOut = "-"
+	}
+	reasonOut := reason
+	if reasonOut == "" {
+		reasonOut = "-"
+	}
+	fmt.Fprintf(stdout, "class=%s  rule=%s  reason=%s\n", class.String(), ruleOut, reasonOut)
+	return 0
 }
 
 // ----- T17: hooks tail -----

@@ -43,16 +43,16 @@ func computeETA(chunksSoFar, filesCurrent, filesTotal int, elapsed time.Duration
 // buildVersion returns a short version string suitable for `--version` output.
 // Reads the module version and vcs.revision from the Go build info so local
 // `go build` and `go install` both produce something meaningful without needing
-// -ldflags injection. Falls back to "wave2-phase1b" (matching the installed hook
+// -ldflags injection. Falls back to "wave2-phase3" (matching the installed hook
 // envelope's heimdall_version) when build info is unavailable.
 func buildVersion() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
-		return "heimdall-mcp wave2-phase1b"
+		return "heimdall-mcp wave2-phase3"
 	}
 	version := info.Main.Version
 	if version == "" || version == "(devel)" {
-		version = "wave2-phase1b"
+		version = "wave2-phase3"
 	}
 	var rev string
 	for _, s := range info.Settings {

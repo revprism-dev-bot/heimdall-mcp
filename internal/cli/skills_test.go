@@ -351,12 +351,18 @@ func TestDoctor_SkillsSyncRollupReportsDrift(t *testing.T) {
 		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	checks := runDoctorChecks(config.Config{Model: "x"}, env, deps)
-	last := checks[len(checks)-1]
-	if last.name != "skills sync" {
-		t.Fatalf("last check = %q, want skills sync", last.name)
+	var skills *doctorCheck
+	for i := range checks {
+		if checks[i].name == "skills sync" {
+			skills = &checks[i]
+			break
+		}
 	}
-	if !strings.Contains(last.message, "0/2") {
-		t.Errorf("expected 0/2 drift report, got %q", last.message)
+	if skills == nil {
+		t.Fatalf("skills sync check missing; got %d checks", len(checks))
+	}
+	if !strings.Contains(skills.message, "0/2") {
+		t.Errorf("expected 0/2 drift report, got %q", skills.message)
 	}
 }
 

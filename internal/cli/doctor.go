@@ -1,6 +1,6 @@
 // doctor.go — implements T16 `heimdall-mcp hooks doctor`.
 //
-// Twelve checks are run in a fixed order and rendered as a small ASCII table.
+// Thirteen checks are run in a fixed order and rendered as a small ASCII table.
 // Each check returns a status (pass/warn/fail) plus a short message. Any
 // `fail` row makes the overall command exit 1; `warn`-only or all-pass rows
 // exit 0. ASCII markers are used unconditionally — `NO_COLOR` is honored by
@@ -152,12 +152,12 @@ func renderDoctorTable(w io.Writer, checks []doctorCheck) {
 	}
 }
 
-// runDoctorChecks executes all 11 checks in order. Pure-ish: the only side
+// runDoctorChecks executes all 13 checks in order. Pure-ish: the only side
 // effects are file reads on the chosen settings.json path, exec calls via
 // deps, and HTTP calls via deps. Tests inject doctorDeps to bypass exec/net.
 func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) []doctorCheck {
 	deps = fillDoctorDeps(cfg, deps)
-	checks := make([]doctorCheck, 0, 12)
+	checks := make([]doctorCheck, 0, 13)
 
 	// 1 — settings.json exists at the chosen scope?
 	settingsBytes, settingsErr := os.ReadFile(deps.settingsPath)
@@ -455,6 +455,30 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 					})
 				}
 			}
+		}
+	}
+
+	// 13 — PreToolUse guardrail dry-fire (in-process). Classifies a benign
+	// allow-case Bash command (`ls`) via the exact same classifier the
+	// installed hook uses. Confirms the guardrail pipeline is wired without
+	// shelling out (the generic hook dry-fire at check #10 already exec's
+	// every installed entry, but the payload it sends is event-agnostic;
+	// for PreToolUse that means `tool_name` is missing and the handler exits
+	// silently without actually classifying. This check runs the classifier
+	// in-process so we verify the table compiled and the handler wiring is
+	// intact.)
+	{
+		class, _, _ := heimdall.ClassifyBashCommand("ls -la")
+		if class != heimdall.ClassAllow {
+			checks = append(checks, doctorCheck{
+				name: "guardrail classifier", status: statusFail,
+				message: fmt.Sprintf("benign `ls -la` classified as %s (expected allow)", class),
+			})
+		} else {
+			checks = append(checks, doctorCheck{
+				name: "guardrail classifier", status: statusPass,
+				message: fmt.Sprintf("%d rules loaded", heimdall.DestructiveRuleCount()),
+			})
 		}
 	}
 

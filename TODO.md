@@ -61,9 +61,16 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] Install template updated to 5 hooks: SessionStart + PostToolUse + UserPromptSubmit + Stop + SessionEnd
 - [x] 12 unit tests in `hook_stop_test.go` — buffer append, multi-append, cleanup, empty/malformed, disabled, transcript summary extraction
 
-**Wave 2 phase 3 (pending, guardrails):**
-- [ ] `PreToolUse(Bash(rm *|git push --force*))` as `agent`-type hook — needs a destructive-op judgment primitive heimdall does not have today
-- [ ] Phase 3 guardrails — design doc: docs/plans/hooks/08-destructive-op-primitive.md
+**Wave 2 phase 3 ✅ shipped (destructive-op guardrails):**
+- [x] Classifier primitive at `internal/heimdall/destructive_ops.go` — 19 static rules (allow/warn/block), allowlist-first precedence, deterministic and I/O-free
+- [x] `internal/cli/hook_pre_tool_use.go` — PreToolUse hook gated on `HEIMDALL_GUARDRAILS` (shadow default, warn, block, off); exits 2 with stderr ONLY when mode=block AND class=block; every other path exits 0
+- [x] `heimdall-mcp hooks explain-command "<cmd>"` admin CLI — informational classification, exits 0 always
+- [x] `install-hooks` template grew from 5 → 6 hooks (added PreToolUse(Bash)); envelope version bumped to `wave2-phase3`
+- [x] Auto-upgrade path picks up the new PreToolUse entry on SessionStart for users on the 5-hook build
+- [x] OQ-5 Phase 3 addendum in `docs/plans/hooks/06-decisions.md` documents the exit-2+stderr exception; retrieval hooks still follow always-0
+- [x] Stale "phase-2 destructive-op hook" reference in `docs/plans/hooks/01-architecture.md` §2 corrected to phase-3
+- [x] Tests: 24 classifier cases (table-driven) + 18 PreToolUse hook cases + 7 explain-command cases, all green under `-race`
+- [x] Design doc: `docs/plans/hooks/08-destructive-op-primitive.md`
 
 **Carried over / not yet in scope:**
 - [x] T20 Layer 2 integration tests (`os/exec` + fake Ollama) — `internal/cli/integration_test.go`, build-tag `integration`, 4 tests (session-start, user-prompt cache-hit, post-edit actor, stop→session-end). Run via `make test-integration`.
