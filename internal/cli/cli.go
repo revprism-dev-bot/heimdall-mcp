@@ -142,6 +142,12 @@ func RunCLI(cfg config.Config, args []string) {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "sessions":
+		env := envMap()
+		code := DispatchSessions(cfg, os.Stdin, os.Stdout, os.Stderr, env, cleanArgs)
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "install-hooks":
 		os.Exit(CLIInstallHooks(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), args[1:]))
 	case "uninstall-hooks":
@@ -172,6 +178,7 @@ func RunCLI(cfg config.Config, args []string) {
 		fmt.Println("  heimdall-mcp hooks tail [flags]            Tail the hook log with filters")
 		fmt.Println("  heimdall-mcp hooks cache-clear [flags]     Drop hook_cache contents")
 		fmt.Println("  heimdall-mcp hooks cache-stats [flags]     Show hook_cache stats")
+		fmt.Println("  heimdall-mcp sessions list|report          Per-session savings metrics")
 		fmt.Println("  heimdall-mcp version                       Print the binary version")
 		fmt.Println()
 		fmt.Println("Options:")
