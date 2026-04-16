@@ -60,6 +60,9 @@ type HookUserPromptDeps struct {
 	NewOllamaClient func(endpoint string) *heimdall.OllamaClient
 	OpenStore       func(dbDir string) (*heimdall.VectorStore, error)
 	NewHookEmbedder func(client *heimdall.OllamaClient, model string) heimdall.Embedder
+	// OpenMemoryStore opens the global memory store for skill surfacing.
+	// Nil → real one at config.ResolveMemoryDBPath().
+	OpenMemoryStore func() (*heimdall.MemoryStore, error)
 	Suppress        func(project, failureCode string, window time.Duration) bool
 	Now             func() time.Time
 }
@@ -112,6 +115,12 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	if newHookEmbedder == nil {
 		newHookEmbedder = func(client *heimdall.OllamaClient, model string) heimdall.Embedder {
 			return &hookEmbedder{client: client, model: model}
+		}
+	}
+	openMemoryStore := deps.OpenMemoryStore
+	if openMemoryStore == nil {
+		openMemoryStore = func() (*heimdall.MemoryStore, error) {
+			return heimdall.OpenMemoryStore(config.ResolveMemoryDBPath())
 		}
 	}
 	suppress := deps.Suppress
@@ -266,8 +275,26 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 		return 0
 	}
 
+	// --- surface relevant skills (additive) --------------------------------
+	// Best-effort: memory store missing / empty / slow returns nil bullets
+	// and the "### Relevant skills" section is simply omitted. Runs inside
+	// the same ctx deadline as the search — if the prompt was embedded and
+	// searched successfully there's usually ample slack to do a cheap
+	// memory-DB scan keyed by type=skill.
+	var skillBullets []string
+	if memStore, merr := openMemoryStore(); merr == nil && memStore != nil {
+		skillBullets = surfaceRelevantSkills(ctx, trimmed, skillsTopNDefault, embedder, memStore)
+		memStore.Close()
+	} else if merr != nil {
+		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
+			"stage": "open_memory",
+			"err":   merr.Error(),
+		})
+	}
+
 	// --- render + cache store ----------------------------------------------
 	body := formatSearchHookMD(trimmed, resolvedModel, filepath.Base(projectRoot), results)
+	body = insertSkillsSection(body, skillBullets)
 	body = capRunes(body, userPromptMaxRunes)
 
 	if perr := store.HookCachePut(cacheKey, []byte(body), userPromptCacheTTL, userPromptCacheRowCap); perr != nil {
@@ -279,10 +306,11 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	_, _ = io.WriteString(stdout, body)
 
 	heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
-		"stage": "ok",
-		"hits":  len(results),
-		"bytes": len(body),
-		"model": resolvedModel,
+		"stage":  "ok",
+		"hits":   len(results),
+		"skills": len(skillBullets),
+		"bytes":  len(body),
+		"model":  resolvedModel,
 	})
 	return 0
 }
