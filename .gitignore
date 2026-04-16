@@ -1,4 +1,5 @@
 /heimdall-mcp
+/bench-retrieval
 .heimdall_db/
 *.log
 dist/
