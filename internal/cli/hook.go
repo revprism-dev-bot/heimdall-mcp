@@ -196,9 +196,9 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 	// via MemoryFilter.ContextPath. When CWD == repoRoot or CWD is outside
 	// any repo, scope stays empty and nothing changes.
 
-	rawCWD := resolveProjectRoot(stdin, projectFlag)
+	rawCWD, sessionID := resolveProjectRoot(stdin, projectFlag)
 	if rawCWD == "" {
-		heimdall.LogHookEvent("INFO", "session-start", map[string]any{
+		logHookEventWithSession("INFO", "session-start", sessionID, map[string]any{
 			"stage":  "resolve_root",
 			"reason": "no cwd resolvable",
 		})
@@ -213,7 +213,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 	// --- disable gate (§5.7) -------------------------------------------------
 
 	if heimdall.HooksDisabled(projectRoot, env) {
-		heimdall.LogHookEvent("INFO", "session-start", map[string]any{
+		logHookEventWithSession("INFO", "session-start", sessionID, map[string]any{
 			"stage": "disabled",
 		})
 		return 0
@@ -236,7 +236,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 	pingErr := client.Ping(pingCtx)
 	pingCancel()
 	if pingErr != nil {
-		heimdall.LogHookEvent("INFO", "session-start", map[string]any{
+		logHookEventWithSession("INFO", "session-start", sessionID, map[string]any{
 			"stage": "ollama_ping",
 			"err":   pingErr.Error(),
 		})
@@ -259,7 +259,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 	dbDir, resolvedModel := heimdall.ResolveUsableModelDB(ctx, client, baseDir, cfg.Model)
 	if dbDir == "" || resolvedModel == "" {
 		// No index yet, or the model isn't pulled in Ollama.
-		heimdall.LogHookEvent("INFO", "session-start", map[string]any{
+		logHookEventWithSession("INFO", "session-start", sessionID, map[string]any{
 			"stage":  "resolve_model",
 			"reason": "no usable index",
 		})
@@ -269,7 +269,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
-		heimdall.LogHookEvent("ERROR", "session-start", map[string]any{
+		logHookEventWithSession("ERROR", "session-start", sessionID, map[string]any{
 			"stage": "open_store",
 			"err":   err.Error(),
 		})
@@ -281,7 +281,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 
 	if verr := heimdall.VerifyHookIndex(store, resolvedModel); verr != nil {
 		code := classifyVerifyErr(verr)
-		heimdall.LogHookEvent("WARN", "session-start", map[string]any{
+		logHookEventWithSession("WARN", "session-start", sessionID, map[string]any{
 			"stage": "verify_hook_index",
 			"code":  code,
 			"err":   verr.Error(),
@@ -317,7 +317,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 			Scope: scope,
 		}, embedder, memStore)
 		if rerr != nil {
-			heimdall.LogHookEvent("WARN", "session-start", map[string]any{
+			logHookEventWithSession("WARN", "session-start", sessionID, map[string]any{
 				"stage": "recall",
 				"err":   rerr.Error(),
 			})
@@ -333,7 +333,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 		// omitted — we never block the main block on this.
 		skillBullets = surfaceRelevantSkills(ctx, query, skillsTopNDefault, embedder, memStore)
 	} else if err != nil {
-		heimdall.LogHookEvent("INFO", "session-start", map[string]any{
+		logHookEventWithSession("INFO", "session-start", sessionID, map[string]any{
 			"stage": "open_memory",
 			"err":   err.Error(),
 		})
@@ -344,7 +344,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		// Budget fired. Emit empty stdout — Claude gets no context this
 		// turn, which is strictly better than a half-rendered block.
-		heimdall.LogHookEvent("WARN", "session-start", map[string]any{
+		logHookEventWithSession("WARN", "session-start", sessionID, map[string]any{
 			"stage": "budget",
 			"err":   ctxErr.Error(),
 		})
@@ -357,7 +357,7 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 	body = capRunes(body, sessionStartMaxRunes)
 	_, _ = io.WriteString(stdout, body)
 
-	heimdall.LogHookEvent("INFO", "session-start", map[string]any{
+	logHookEventWithSession("INFO", "session-start", sessionID, map[string]any{
 		"stage":   "ok",
 		"bullets": len(bullets),
 		"skills":  len(skillBullets),
@@ -453,18 +453,20 @@ func capRunes(s string, n int) string {
 //  2. stdin JSON `cwd` field (absolutized)
 //  3. os.Getwd()
 //
-// Returns empty string on total failure. Unknown JSON fields are ignored.
-// Empty stdin is tolerated (io.EOF).
-func resolveProjectRoot(stdin io.Reader, projectFlag string) string {
+// Also extracts `session_id` from the same stdin payload when present, so
+// callers can thread it into LogHookEvent. SessionID is empty when the flag
+// path is taken (no stdin consumed) or stdin is empty/malformed.
+func resolveProjectRoot(stdin io.Reader, projectFlag string) (cwd, sessionID string) {
 	if projectFlag != "" {
 		if abs, err := filepath.Abs(projectFlag); err == nil {
-			return abs
+			return abs, ""
 		}
-		return projectFlag
+		return projectFlag, ""
 	}
 	if stdin != nil {
 		var evt struct {
-			CWD string `json:"cwd"`
+			CWD       string `json:"cwd"`
+			SessionID string `json:"session_id"`
 		}
 		// Use a size-bounded reader so a pathological stdin can't balloon
 		// memory. SessionStart event JSON is tiny — 64 KB is generous.
@@ -473,19 +475,20 @@ func resolveProjectRoot(stdin io.Reader, projectFlag string) string {
 		if len(bytesTrimSpace(data)) > 0 {
 			// Best-effort decode; malformed JSON → fall through.
 			_ = json.Unmarshal(data, &evt)
+			sessionID = evt.SessionID
 			if evt.CWD != "" {
 				if abs, err := filepath.Abs(evt.CWD); err == nil {
-					return abs
+					return abs, sessionID
 				}
-				return evt.CWD
+				return evt.CWD, sessionID
 			}
 		}
 	}
-	cwd, err := os.Getwd()
+	wd, err := os.Getwd()
 	if err != nil {
-		return ""
+		return "", sessionID
 	}
-	return cwd
+	return wd, sessionID
 }
 
 // bytesTrimSpace is a cheap byte-level TrimSpace — avoids importing
@@ -521,4 +524,24 @@ type hookEmbedder struct {
 
 func (h *hookEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	return h.client.EmbedForHook(ctx, h.model, text)
+}
+
+// logHookEventWithSession wraps heimdall.LogHookEvent, stamping session=<id>
+// onto the kv map when non-empty. All retrieval hook handlers route through
+// this helper so hooks.log can be filtered per session by the sessions-report
+// CLI (see internal/cli/sessions.go).
+//
+// Empty sessionID is the intentional signal for "no Claude Code payload"
+// (flag_parse errors, empty_stdin, dry-fires from `hooks doctor`), and those
+// lines deliberately do NOT carry a session key — a downstream "all events
+// without session=" filter catches them as pre-payload noise.
+func logHookEventWithSession(level, event, sessionID string, kv map[string]any) {
+	if sessionID != "" {
+		if kv == nil {
+			kv = map[string]any{"session": sessionID}
+		} else {
+			kv["session"] = sessionID
+		}
+	}
+	heimdall.LogHookEvent(level, event, kv)
 }

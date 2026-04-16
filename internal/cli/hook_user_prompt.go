@@ -129,7 +129,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	}
 
 	// --- read prompt + project root from stdin JSON -------------------------
-	prompt, stdinProject := readUserPromptStdin(stdin, promptFlag)
+	prompt, stdinProject, sessionID := readUserPromptStdin(stdin, promptFlag)
 
 	rawCWD := ""
 	if projectFlag != "" {
@@ -144,7 +144,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 		rawCWD = cwd
 	}
 	if rawCWD == "" {
-		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
+		logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
 			"stage":  "resolve_root",
 			"reason": "no cwd resolvable",
 		})
@@ -162,7 +162,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	// --- skip heuristic: trivial prompt ------------------------------------
 	trimmed := strings.TrimSpace(prompt)
 	if len([]rune(trimmed)) < userPromptMinPromptLen {
-		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
+		logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
 			"stage":  "skip",
 			"reason": "prompt_too_short",
 		})
@@ -171,7 +171,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 
 	// --- disable gate (§5.7) ------------------------------------------------
 	if heimdall.HooksDisabled(projectRoot, env) {
-		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{"stage": "disabled"})
+		logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{"stage": "disabled"})
 		return 0
 	}
 
@@ -195,7 +195,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	pingErr := client.Ping(pingCtx)
 	pingCancel()
 	if pingErr != nil {
-		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
+		logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
 			"stage": "ollama_ping",
 			"err":   pingErr.Error(),
 		})
@@ -206,7 +206,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	// --- model resolution ---------------------------------------------------
 	dbDir, resolvedModel := heimdall.ResolveUsableModelDB(ctx, client, baseDir, cfg.Model)
 	if dbDir == "" || resolvedModel == "" {
-		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
+		logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
 			"stage":  "resolve_model",
 			"reason": "no usable index",
 		})
@@ -215,7 +215,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 
 	store, err := openStore(dbDir)
 	if err != nil {
-		heimdall.LogHookEvent("ERROR", "user-prompt", map[string]any{
+		logHookEventWithSession("ERROR", "user-prompt", sessionID, map[string]any{
 			"stage": "open_store",
 			"err":   err.Error(),
 		})
@@ -226,7 +226,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	// --- VerifyHookIndex gate ----------------------------------------------
 	if verr := heimdall.VerifyHookIndex(store, resolvedModel); verr != nil {
 		code := classifyVerifyErr(verr)
-		heimdall.LogHookEvent("WARN", "user-prompt", map[string]any{
+		logHookEventWithSession("WARN", "user-prompt", sessionID, map[string]any{
 			"stage": "verify_hook_index",
 			"code":  code,
 			"err":   verr.Error(),
@@ -245,14 +245,14 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	cacheKey := userPromptCacheKey(trimmed, store.GetIndexVersion(), cacheScope)
 	if cached, cerr := store.HookCacheGet(cacheKey, userPromptCacheTTL); cerr == nil {
 		_, _ = stdout.Write(cached)
-		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
+		logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
 			"stage": "cache_hit",
 			"bytes": len(cached),
 			"model": resolvedModel,
 		})
 		return 0
 	} else if !errors.Is(cerr, heimdall.ErrHookCacheMiss) {
-		heimdall.LogHookEvent("WARN", "user-prompt", map[string]any{
+		logHookEventWithSession("WARN", "user-prompt", sessionID, map[string]any{
 			"stage": "cache_get",
 			"err":   cerr.Error(),
 		})
@@ -263,7 +263,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	embedder := newHookEmbedder(client, resolvedModel)
 	queryVec, eerr := embedder.Embed(ctx, trimmed)
 	if eerr != nil {
-		heimdall.LogHookEvent("WARN", "user-prompt", map[string]any{
+		logHookEventWithSession("WARN", "user-prompt", sessionID, map[string]any{
 			"stage": "embed",
 			"err":   eerr.Error(),
 		})
@@ -271,7 +271,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	}
 
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		heimdall.LogHookEvent("WARN", "user-prompt", map[string]any{
+		logHookEventWithSession("WARN", "user-prompt", sessionID, map[string]any{
 			"stage": "budget_after_embed",
 			"err":   ctxErr.Error(),
 		})
@@ -286,7 +286,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	results := store.SearchFiltered(ctx, queryVec, 5, "", "", nil, searchOpts...)
 
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		heimdall.LogHookEvent("WARN", "user-prompt", map[string]any{
+		logHookEventWithSession("WARN", "user-prompt", sessionID, map[string]any{
 			"stage": "budget_after_search",
 			"err":   ctxErr.Error(),
 		})
@@ -304,7 +304,7 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 		skillBullets = surfaceRelevantSkills(ctx, trimmed, skillsTopNDefault, embedder, memStore)
 		memStore.Close()
 	} else if merr != nil {
-		heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
+		logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
 			"stage": "open_memory",
 			"err":   merr.Error(),
 		})
@@ -316,14 +316,14 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	body = capRunes(body, userPromptMaxRunes)
 
 	if perr := store.HookCachePut(cacheKey, []byte(body), userPromptCacheTTL, userPromptCacheRowCap); perr != nil {
-		heimdall.LogHookEvent("WARN", "user-prompt", map[string]any{
+		logHookEventWithSession("WARN", "user-prompt", sessionID, map[string]any{
 			"stage": "cache_put",
 			"err":   perr.Error(),
 		})
 	}
 	_, _ = io.WriteString(stdout, body)
 
-	heimdall.LogHookEvent("INFO", "user-prompt", map[string]any{
+	logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
 		"stage":  "ok",
 		"hits":   len(results),
 		"skills": len(skillBullets),
@@ -334,30 +334,27 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	return 0
 }
 
-// readUserPromptStdin extracts (prompt, absProjectFromCWD) from a
+// readUserPromptStdin extracts (prompt, absProjectFromCWD, sessionID) from a
 // UserPromptSubmit event JSON on stdin. Empty stdin, malformed JSON, or
 // missing fields all degrade gracefully — the caller decides what to do
-// with empty returns. If promptOverride is non-empty it is used verbatim
-// and stdin is not consulted (debug path).
-func readUserPromptStdin(stdin io.Reader, promptOverride string) (prompt, projectFromCWD string) {
-	if promptOverride != "" {
-		return promptOverride, ""
-	}
+// with empty returns. If promptOverride is non-empty it is used verbatim;
+// stdin is still read to extract sessionID (debug dry-fires supply session
+// via stdin payload even when prompt comes from flag).
+func readUserPromptStdin(stdin io.Reader, promptOverride string) (prompt, projectFromCWD, sessionID string) {
 	if stdin == nil {
-		return "", ""
+		return promptOverride, "", ""
 	}
 	limited := io.LimitReader(stdin, 256*1024)
 	data, _ := io.ReadAll(limited)
-	if len(data) == 0 {
-		return "", ""
-	}
 	var evt struct {
-		Prompt string `json:"prompt"`
-		CWD    string `json:"cwd"`
+		Prompt    string `json:"prompt"`
+		CWD       string `json:"cwd"`
+		SessionID string `json:"session_id"`
 	}
-	if err := json.Unmarshal(data, &evt); err != nil {
-		return "", ""
+	if len(data) > 0 {
+		_ = json.Unmarshal(data, &evt)
 	}
+	sessionID = evt.SessionID
 	if evt.CWD != "" {
 		if abs, err := filepath.Abs(evt.CWD); err == nil {
 			projectFromCWD = abs
@@ -365,7 +362,10 @@ func readUserPromptStdin(stdin io.Reader, promptOverride string) (prompt, projec
 			projectFromCWD = evt.CWD
 		}
 	}
-	return evt.Prompt, projectFromCWD
+	if promptOverride != "" {
+		return promptOverride, projectFromCWD, sessionID
+	}
+	return evt.Prompt, projectFromCWD, sessionID
 }
 
 // userPromptCacheKey builds the stable hex SHA-256 key that indexes a

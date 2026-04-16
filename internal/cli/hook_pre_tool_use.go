@@ -40,6 +40,7 @@ const (
 // preToolUseEvent is the slice of the Claude Code PreToolUse payload we
 // actually consume. Unknown fields are ignored.
 type preToolUseEvent struct {
+	SessionID string `json:"session_id"`
 	ToolName  string `json:"tool_name"`
 	ToolInput struct {
 		Command string `json:"command"`
@@ -141,7 +142,7 @@ func HookPreToolUse(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	var evt preToolUseEvent
 	if err := json.Unmarshal(data, &evt); err != nil {
 		// Malformed JSON → fail-open (design §5 F2). Log and exit 0.
-		heimdall.LogHookEvent("WARN", "pre-tool-use", map[string]any{
+		logHookEventWithSession("WARN", "pre-tool-use", evt.SessionID, map[string]any{
 			"stage": "bad_stdin",
 			"err":   err.Error(),
 		})
@@ -163,7 +164,7 @@ func HookPreToolUse(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 
 	cmd := evt.ToolInput.Command
 	if cmd == "" {
-		heimdall.LogHookEvent("INFO", "pre-tool-use", map[string]any{
+		logHookEventWithSession("INFO", "pre-tool-use", evt.SessionID, map[string]any{
 			"stage":  "skip",
 			"reason": "empty_command",
 			"mode":   modeString(mode),
@@ -180,7 +181,7 @@ func HookPreToolUse(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	if class == ClassBlockAlias {
 		logLevel = "WARN"
 	}
-	heimdall.LogHookEvent(logLevel, "pre-tool-use", map[string]any{
+	logHookEventWithSession(logLevel, "pre-tool-use", evt.SessionID, map[string]any{
 		"stage":   "classify",
 		"mode":    modeString(mode),
 		"class":   class.String(),

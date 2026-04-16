@@ -99,10 +99,10 @@ func hookPostEditWithDeps(cfg config.Config, stdin io.Reader, stdout, stderr io.
 
 	// Parse stdin (best-effort — malformed JSON is Tier A silent).
 	raw, _ := io.ReadAll(io.LimitReader(stdin, 256*1024))
-	editedPath := extractEditedFilePath(raw)
+	editedPath, sessionID := extractPostEditStdin(raw)
 	if editedPath == "" {
 		// Nothing to enqueue. Log at DEBUG, exit 0.
-		heimdall.LogHookEvent("DEBUG", "post-edit", map[string]any{"err": "no_file_path"})
+		logHookEventWithSession("DEBUG", "post-edit", sessionID, map[string]any{"err": "no_file_path"})
 		return 0
 	}
 	if !filepath.IsAbs(editedPath) {
@@ -112,13 +112,13 @@ func hookPostEditWithDeps(cfg config.Config, stdin io.Reader, stdout, stderr io.
 
 	hooksDir := filepath.Join(projectRoot, ".heimdall_db", "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
-		heimdall.LogHookEvent("WARN", "post-edit", map[string]any{"err": "mkdir_hooks"})
+		logHookEventWithSession("WARN", "post-edit", sessionID, map[string]any{"err": "mkdir_hooks"})
 		return 0
 	}
 
 	pendingPath := filepath.Join(hooksDir, "reindex.pending")
 	if err := appendPending(pendingPath, editedPath, postEditPendingCap); err != nil {
-		heimdall.LogHookEvent("WARN", "post-edit", map[string]any{"err": "append_pending"})
+		logHookEventWithSession("WARN", "post-edit", sessionID, map[string]any{"err": "append_pending"})
 		// Keep going — the lock path below may still hand off a cleanup to
 		// an actor and enqueue on the next fire.
 	}
@@ -129,7 +129,7 @@ func hookPostEditWithDeps(cfg config.Config, stdin io.Reader, stdout, stderr io.
 	lockPath := filepath.Join(hooksDir, "reindex.lock")
 	rel, acquired, err := acquirePostEditLock(lockPath, deps)
 	if err != nil {
-		heimdall.LogHookEvent("WARN", "post-edit", map[string]any{"err": "lock_err"})
+		logHookEventWithSession("WARN", "post-edit", sessionID, map[string]any{"err": "lock_err"})
 		return 0
 	}
 	if !acquired {
@@ -150,7 +150,7 @@ func hookPostEditWithDeps(cfg config.Config, stdin io.Reader, stdout, stderr io.
 		}
 		// Orphaned — previous actor died. Clear state and take over.
 		_ = os.Remove(inflightPath)
-		heimdall.LogHookEvent("INFO", "post-edit", map[string]any{"msg": "orphan_reaped", "pid": pid})
+		logHookEventWithSession("INFO", "post-edit", sessionID, map[string]any{"msg": "orphan_reaped", "pid": pid})
 	}
 
 	lastRun := readLastRun(filepath.Join(hooksDir, "reindex.last_run"))
@@ -164,11 +164,11 @@ func hookPostEditWithDeps(cfg config.Config, stdin io.Reader, stdout, stderr io.
 	// lockfile lifecycle — we still release *our* in-process flock handle,
 	// but the actor races to write its own PID into inflight.pid.
 	if err := deps.Spawn(projectRoot); err != nil {
-		heimdall.LogHookEvent("WARN", "post-edit", map[string]any{"err": "spawn_failed", "detail": err.Error()})
+		logHookEventWithSession("WARN", "post-edit", sessionID, map[string]any{"err": "spawn_failed", "detail": err.Error()})
 		rel()
 		return 0
 	}
-	heimdall.LogHookEvent("INFO", "post-edit", map[string]any{"msg": "actor_spawned"})
+	logHookEventWithSession("INFO", "post-edit", sessionID, map[string]any{"msg": "actor_spawned"})
 	rel()
 	return 0
 }
@@ -230,23 +230,26 @@ func parsePostEditFlags(args []string) (postEditFlags, error) {
 // ----- stdin parsing -----
 
 type postEditEvent struct {
+	SessionID string `json:"session_id"`
 	ToolName  string `json:"tool_name"`
 	ToolInput struct {
 		FilePath string `json:"file_path"`
 	} `json:"tool_input"`
 }
 
-// extractEditedFilePath parses the PostToolUse event JSON and returns the
-// edited file path. Empty on any parse error or missing field.
-func extractEditedFilePath(raw []byte) string {
+// extractPostEditStdin parses the PostToolUse event JSON and returns
+// (absolute edited file path, session_id). Either return can be empty when
+// the payload is missing the corresponding field. Kept as a single call so
+// stdin is consumed once.
+func extractPostEditStdin(raw []byte) (filePath, sessionID string) {
 	if len(raw) == 0 {
-		return ""
+		return "", ""
 	}
 	var ev postEditEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		return ""
+		return "", ""
 	}
-	return strings.TrimSpace(ev.ToolInput.FilePath)
+	return strings.TrimSpace(ev.ToolInput.FilePath), strings.TrimSpace(ev.SessionID)
 }
 
 // ----- pending file I/O -----

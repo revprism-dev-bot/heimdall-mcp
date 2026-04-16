@@ -406,3 +406,29 @@ func TestHookPreToolUse_EndToEnd_RealClassifier_Block(t *testing.T) {
 		t.Errorf("stderr missing RM_RF_ROOT rule id, got %q", errOut)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 19 — Session-id threading (Wave A).
+// ---------------------------------------------------------------------------
+
+func TestHookPreToolUse_LogsSessionID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	payload := `{"session_id":"sess-abc","tool_name":"Bash","tool_input":{"command":"ls -la"},"cwd":"/tmp"}`
+	stdin := strings.NewReader(payload)
+	var out, errBuf bytes.Buffer
+
+	rc := HookPreToolUse(config.Config{}, stdin, &out, &errBuf, map[string]string{"HEIMDALL_GUARDRAILS": "shadow"}, nil, HookPreToolUseDeps{})
+	if rc != 0 {
+		t.Fatalf("expected exit 0 in shadow mode, got %d", rc)
+	}
+
+	data, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if !strings.Contains(string(data), "session=sess-abc") {
+		t.Fatalf("expected session=sess-abc:\n%s", string(data))
+	}
+	if !strings.Contains(string(data), "class=allow") {
+		t.Fatalf("expected class=allow:\n%s", string(data))
+	}
+}
