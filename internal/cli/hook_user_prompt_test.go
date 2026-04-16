@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -639,5 +640,45 @@ func TestHookUserPrompt_ScopeCacheKeyDiffers(t *testing.T) {
 	}
 	if strings.Contains(out, "ROOT-PAYLOAD") {
 		t.Errorf("subpath call served root-scoped cache entry:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Session-id threading (Wave A).
+// ---------------------------------------------------------------------------
+
+func TestHookUserPrompt_LogsSessionID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+	t.Setenv("HEIMDALL_HOOKS", "1")
+
+	stdin := strings.NewReader(`{"session_id":"sess-777","cwd":"/tmp/does-not-exist","prompt":"this is a long enough prompt to pass"}`)
+	var out, errBuf bytes.Buffer
+	rc := HookUserPrompt(config.Config{OllamaEndpoint: "http://127.0.0.1:1"}, stdin, &out, &errBuf, map[string]string{}, nil, HookUserPromptDeps{})
+	if rc != 0 {
+		t.Fatalf("expected exit 0, got %d", rc)
+	}
+
+	data, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if !strings.Contains(string(data), "session=sess-777") {
+		t.Fatalf("expected session=sess-777 in hooks.log:\n%s", string(data))
+	}
+}
+
+func TestHookUserPrompt_SkipPromptTooShortStillLogsSession(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+	t.Setenv("HEIMDALL_HOOKS", "1")
+
+	stdin := strings.NewReader(`{"session_id":"sess-short","cwd":"/tmp","prompt":"ok"}`)
+	var out, errBuf bytes.Buffer
+	_ = HookUserPrompt(config.Config{}, stdin, &out, &errBuf, map[string]string{}, nil, HookUserPromptDeps{})
+
+	data, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if !strings.Contains(string(data), "session=sess-short") {
+		t.Fatalf("expected session=sess-short in log even on skip:\n%s", string(data))
+	}
+	if !strings.Contains(string(data), "reason=prompt_too_short") {
+		t.Fatalf("expected reason=prompt_too_short in log:\n%s", string(data))
 	}
 }
