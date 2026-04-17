@@ -99,13 +99,14 @@ var phase1aHooks = []phase1aHook{
 
 // installFlags captures the parsed flags for install-hooks.
 type installFlags struct {
-	scope     string // "user" | "project" | "" (auto-detect)
-	dryRun    bool
-	merge     bool
-	force     bool
-	only      []string // subset of phase1aHooks event names; empty = all
-	hasOnly   bool
-	noPrewarm bool // --no-prewarm: skip the post-install Ollama warm-up
+	scope          string // "user" | "project" | "" (auto-detect)
+	dryRun         bool
+	merge          bool
+	force          bool
+	only           []string // subset of phase1aHooks event names; empty = all
+	hasOnly        bool
+	noPrewarm      bool // --no-prewarm: skip the post-install Ollama warm-up
+	noSkillsImport bool // --no-skills-import: skip the post-install skills import
 }
 
 // prewarmTimeout caps how long the post-install Ollama warm-up may run.
@@ -151,6 +152,77 @@ func runPrewarmOllama(ctx context.Context, endpoint, model string) prewarmResult
 	res.duration = time.Since(start)
 	res.err = err
 	return res
+}
+
+// skillsImportResult holds the outcome of a single best-effort skills import
+// attempt so the install handler can render a one-line status. Mirrors the
+// prewarm result shape: a one-line success/skip/failure summary is enough;
+// any deeper diagnostics land in the hook log.
+type skillsImportResult struct {
+	dir      string              // resolved skills dir (echoed in the status line)
+	result   heimdall.SkillImportResult
+	duration time.Duration // wall-clock time the import took
+	err      error         // nil on success; non-nil reasons are surfaced verbatim
+}
+
+// skillsImportFunc is the dependency-injected shape used by CLIInstallHooks.
+// Production wires it to runSkillsImport; tests swap it for a stub that
+// records the call (or simulates failures) without touching a real memory
+// store or Ollama. The function MUST NOT panic — it is best-effort and any
+// error is logged and ignored.
+type skillsImportFunc func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult
+
+// skillsImportFn is the live indirection point. Tests reset this via the
+// small stubSkillsImport test helper to inject stubs.
+var skillsImportFn skillsImportFunc = runSkillsImport
+
+// runSkillsImport is the production skills-import implementation: resolve
+// the skills directory, open the global memory store, construct an Ollama
+// embedder, and delegate to heimdall.ImportSkillsFromDir. This is the same
+// code path as `heimdall-mcp skills import` (see cliSkillsImport) but with
+// no flag parsing and no stdout emission — the install handler renders the
+// status. Errors are surfaced in the returned result; caller decides.
+//
+// Named return value (`res`) lets the single trailing defer stamp duration
+// onto every code path uniformly — assigning to a local then `return res`
+// would copy-before-defer and leave duration at zero on the happy path.
+func runSkillsImport(ctx context.Context, cfg config.Config, env map[string]string) (res skillsImportResult) {
+	start := time.Now()
+	defer func() {
+		res.duration = time.Since(start)
+	}()
+
+	dir := heimdall.ResolveClaudeSkillsDir("", env)
+	if dir == "" {
+		res.err = errors.New("could not resolve skills directory (set HEIMDALL_CLAUDE_SKILLS_DIR or HOME)")
+		return
+	}
+	res.dir = dir
+
+	store, err := heimdall.OpenMemoryStore(config.ResolveMemoryDBPath())
+	if err != nil {
+		res.err = fmt.Errorf("open memory store: %w", err)
+		return
+	}
+	defer store.Close()
+
+	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	if err := client.Ping(ctx); err != nil {
+		res.err = fmt.Errorf("ollama not reachable at %s: %w", cfg.OllamaEndpoint, err)
+		return
+	}
+	emb := heimdall.NewOllamaEmbedder(client, cfg.Model)
+	embedFn := func(content string) ([]float32, error) {
+		return emb.Embed(ctx, content)
+	}
+
+	out, importErr := heimdall.ImportSkillsFromDir(store, heimdall.SkillImportOpts{
+		Dir:   dir,
+		Embed: embedFn,
+	})
+	res.result = out
+	res.err = importErr
+	return
 }
 
 // uninstallFlags captures the parsed flags for uninstall-hooks.
@@ -217,6 +289,19 @@ func CLIInstallHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Write
 		if report.upgraded {
 			fmt.Fprintln(stdout, "Would upgrade heimdall hooks to current version.")
 		}
+		// Mirror prewarm's contract: dry-run doesn't fire either post-install
+		// step, but we DO announce the skills-import intent so the user can
+		// preview it (unlike prewarm, skills import has a visible side-effect
+		// on the global memory store and is worth surfacing). --no-skills-import
+		// suppresses the announcement too.
+		if !flags.noSkillsImport {
+			dir := heimdall.ResolveClaudeSkillsDir("", env)
+			if dir == "" {
+				fmt.Fprintln(stdout, "Would run skills import (skills directory unresolved — set HEIMDALL_CLAUDE_SKILLS_DIR or HOME)")
+			} else {
+				fmt.Fprintf(stdout, "Would run skills import from %s\n", dir)
+			}
+		}
 		return 0
 	}
 
@@ -247,6 +332,14 @@ func CLIInstallHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Write
 	// Best-effort: timeout-bounded, gated by --no-prewarm, never fails the
 	// install. --dry-run skips entirely (we never wrote settings.json).
 	doPrewarm(stdout, cfg, flags.noPrewarm, "install-hooks")
+
+	// Run `skills import` as a best-effort post-install step so that the
+	// very first SessionStart / UserPromptSubmit hits can surface any
+	// `type=skill` memories without the user having to remember to run
+	// `heimdall-mcp skills import` manually. Mirrors the prewarm shape:
+	// gated by --no-skills-import, never fails the install, --dry-run
+	// skips entirely (we never wrote settings.json).
+	doSkillsImport(stdout, cfg, env, flags.noSkillsImport, "install-hooks")
 
 	fmt.Fprintln(stdout, "Run 'heimdall-mcp hooks doctor' to verify.")
 	return 0
@@ -311,6 +404,82 @@ func doPrewarm(stdout io.Writer, cfg config.Config, disabled bool, source string
 		"msg":        "ok",
 		"model":      res.model,
 		"durationMs": ms,
+	})
+}
+
+// doSkillsImport renders the install-time skills-import step. Single status
+// line on stdout regardless of outcome:
+//
+//	skills import: imported N skills in Xms (created=… updated=… unchanged=… errors=…)  (success; empty skills dir hits this too with zero counts)
+//	skills import: <err> (non-fatal)                  (failure)
+//	skills import: skipped (--no-skills-import)       (disabled)
+//	skills import: skipped (no model configured)     (cfg.Model == "")
+//
+// `source` distinguishes install-hooks vs future auto-upgrade callers in
+// the hook log. Never returns an error — the install must succeed even if
+// the skills directory is empty, Ollama is down, or the memory store is
+// unwritable. A failed skills import just means the user's first
+// UserPromptSubmit won't have `type=skill` context injection on the very
+// first turn; they can always run `heimdall-mcp skills import` manually.
+func doSkillsImport(stdout io.Writer, cfg config.Config, env map[string]string, disabled bool, source string) {
+	if disabled {
+		fmt.Fprintln(stdout, "skills import: skipped (--no-skills-import)")
+		heimdall.LogHookEvent("INFO", source, map[string]any{
+			"stage":  "skills_import",
+			"reason": "disabled",
+		})
+		return
+	}
+	if cfg.Model == "" {
+		// No configured model means we cannot embed, and ImportSkillsFromDir
+		// will refuse without an Embed func. Skip cleanly with the same
+		// degraded-install message the prewarm uses.
+		fmt.Fprintln(stdout, "skills import: skipped (no model configured)")
+		heimdall.LogHookEvent("INFO", source, map[string]any{
+			"stage":  "skills_import",
+			"reason": "no_model",
+		})
+		return
+	}
+
+	// ImportSkillsFromDir has its own internal Ollama client with default
+	// HTTP timeouts; we do NOT wrap it in a 5s context like prewarm because
+	// a real skill corpus can legitimately take longer than that to embed
+	// end-to-end (each SKILL.md is one Embed call, and chunked skills are
+	// several). The outer `context.Background()` lets the embedder's per-
+	// call timeout govern.
+	ctx := context.Background()
+	res := skillsImportFn(ctx, cfg, env)
+	ms := res.duration.Milliseconds()
+	if res.err != nil {
+		reason := strings.TrimSpace(res.err.Error())
+		if reason == "" {
+			reason = "unknown"
+		}
+		fmt.Fprintf(stdout, "skills import: %s (non-fatal)\n", reason)
+		heimdall.LogHookEvent("WARN", source, map[string]any{
+			"stage":      "skills_import",
+			"err":        res.err.Error(),
+			"dir":        res.dir,
+			"durationMs": ms,
+		})
+		return
+	}
+
+	// Success: summarize created + updated + unchanged in one line.
+	imported := res.result.Created + res.result.Updated
+	fmt.Fprintf(stdout, "skills import: imported %d skills in %dms (created=%d updated=%d unchanged=%d errors=%d)\n",
+		imported, ms, res.result.Created, res.result.Updated, res.result.Unchanged, len(res.result.Errors))
+	heimdall.LogHookEvent("INFO", source, map[string]any{
+		"stage":      "skills_import",
+		"msg":        "ok",
+		"dir":        res.dir,
+		"durationMs": ms,
+		"created":    res.result.Created,
+		"updated":    res.result.Updated,
+		"unchanged":  res.result.Unchanged,
+		"skipped":    res.result.Skipped,
+		"errors":     len(res.result.Errors),
 	})
 }
 
@@ -410,8 +579,10 @@ func parseInstallFlags(args []string) (installFlags, error) {
 			f.hasOnly = true
 		case a == "--no-prewarm":
 			f.noPrewarm = true
+		case a == "--no-skills-import":
+			f.noSkillsImport = true
 		case a == "-h" || a == "--help":
-			return f, errors.New("usage: install-hooks [--scope=user|project] [--dry-run] [--merge] [--force] [--only=<events>] [--no-prewarm]")
+			return f, errors.New("usage: install-hooks [--scope=user|project] [--dry-run] [--merge] [--force] [--only=<events>] [--no-prewarm] [--no-skills-import]")
 		default:
 			return f, fmt.Errorf("unknown flag %q", a)
 		}
