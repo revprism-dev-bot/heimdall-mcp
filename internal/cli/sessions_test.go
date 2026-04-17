@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
 )
@@ -92,6 +93,149 @@ func TestSessionsReport_TextFormat(t *testing.T) {
 		if !strings.Contains(s, needle) {
 			t.Errorf("expected %q in report:\n%s", needle, s)
 		}
+	}
+}
+
+func TestSessionsList_SinceFilter(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+
+	// `OLD` session's last event is 48h before now; `NEW` is 30m before now.
+	now := time.Now().UTC()
+	oldTS := now.Add(-48 * time.Hour).Format(time.RFC3339)
+	newTS := now.Add(-30 * time.Minute).Format(time.RFC3339)
+	lines := strings.Join([]string{
+		oldTS + " INFO event=session-start session=OLD stage=ok",
+		oldTS + " INFO event=user-prompt session=OLD stage=ok",
+		newTS + " INFO event=session-start session=NEW stage=ok",
+		newTS + " INFO event=user-prompt session=NEW stage=ok",
+		"",
+	}, "\n")
+	if err := os.WriteFile(logPath, []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// --since=24h must keep only NEW.
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"list", "--since=24h"})
+	if rc != 0 {
+		t.Fatalf("rc: %d stderr: %s", rc, errBuf.String())
+	}
+	if strings.Contains(out.String(), "OLD") {
+		t.Errorf("--since=24h should have excluded OLD:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "NEW") {
+		t.Errorf("--since=24h should have kept NEW:\n%s", out.String())
+	}
+
+	// --since=1m must keep nothing and print the empty-window message.
+	out.Reset()
+	errBuf.Reset()
+	rc = DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"list", "--since=1m"})
+	if rc != 0 {
+		t.Fatalf("rc: %d stderr: %s", rc, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "--since=1m window") {
+		t.Errorf("expected empty-window hint, got: %q", out.String())
+	}
+}
+
+func TestSessionsList_SinceInvalid(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"list", "--since=not-a-duration"})
+	if rc != 2 {
+		t.Fatalf("expected rc=2 on bad duration, got %d", rc)
+	}
+	if !strings.Contains(errBuf.String(), "invalid --since") {
+		t.Errorf("expected 'invalid --since' in stderr, got: %q", errBuf.String())
+	}
+}
+
+func TestSessionsList_JSONSchemaVersion(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	_ = os.WriteFile(logPath,
+		[]byte("2026-04-16T20:00:00Z INFO event=user-prompt session=X stage=ok\n"), 0o600)
+
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"list", "--format=json"})
+	if rc != 0 {
+		t.Fatalf("rc: %d stderr: %s", rc, errBuf.String())
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	if parsed["schema_version"] != SessionsReportSchemaVersion {
+		t.Errorf("schema_version: got %v, want %s", parsed["schema_version"], SessionsReportSchemaVersion)
+	}
+	sessions, ok := parsed["sessions"].([]interface{})
+	if !ok {
+		t.Fatalf("sessions key missing or wrong type: %v", parsed["sessions"])
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session row, got %d", len(sessions))
+	}
+	row := sessions[0].(map[string]interface{})
+	if row["session_id"] != "X" {
+		t.Errorf("session_id: %v", row["session_id"])
+	}
+	if row["first_seen"] == "" || row["last_seen"] == "" {
+		t.Errorf("expected first_seen/last_seen populated: %v", row)
+	}
+}
+
+func TestSessionsList_JSONEmpty(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"list", "--format=json"})
+	if rc != 0 {
+		t.Fatalf("rc: %d", rc)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	if parsed["schema_version"] != SessionsReportSchemaVersion {
+		t.Errorf("schema_version: %v", parsed["schema_version"])
+	}
+}
+
+func TestSessionsReport_JSONSchemaVersion(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	_ = os.WriteFile(logPath,
+		[]byte("2026-04-16T20:00:01Z INFO event=user-prompt session=V stage=ok bytes=1\n"), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-tmp-proj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	_ = os.WriteFile(filepath.Join(slugDir, "V.jsonl"),
+		[]byte(`{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"V"}`+"\n"), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=V", "--cwd=/tmp/proj", "--format=json"})
+	if rc != 0 {
+		t.Fatalf("rc: %d stderr: %s", rc, errBuf.String())
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	if parsed["schema_version"] != SessionsReportSchemaVersion {
+		t.Errorf("schema_version: got %v, want %s", parsed["schema_version"], SessionsReportSchemaVersion)
 	}
 }
 
