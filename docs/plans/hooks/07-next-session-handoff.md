@@ -9,16 +9,72 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> **Status at `ff01aef` + uncommitted polish pass (2026-04-17 late):** 10
-> files modified on disk, not yet committed. Full suite green under
-> `go test ./... -race -count=1` (35s cli / 49s heimdall / 10s mcp /
-> 1s config). `go vet ./...` clean. Binary rebuilt to
-> `ff01aef+dirty` at `/home/noname/Code/heimdall-mcp/heimdall-mcp`
-> — the `~/.local/bin/heimdall-mcp` symlink picks it up
-> automatically. **First action: commit the polish pass + PR it; the
-> installed binary should be on a named commit, not `+dirty`.** Diff
-> stats: 846 insertions / 56 deletions across 10 files. See the
-> "2026-04-17 polish pass" section below for what shipped.
+> **Status at `main` @ commit `11366e9` (2026-04-17 evening):** clean
+> tree, 5 PRs merged this session (#33–#37 on heimdall-mcp + #89 on
+> payments-analyzer). Full suite green under
+> `go test ./... -race -count=1` (~23s cli / ~32s heimdall / ~7s mcp /
+> 1s config). `go vet ./...` clean. **First action: rebuild the binary
+> and run the Wave F punch list below — three promoted must-implement
+> items that were deferred from earlier phases.**
+>
+> **Wave F — next-session must-implement (promoted from "optional post-Phase-3 ideas"):**
+> 1. **Dedup `part-*` skill chunks in `surfaceRelevantSkills`** — SHIPPED
+>    this session as PR #36 (merge pending review). If already merged,
+>    rebuild and verify via the UserPromptSubmit context: each skill
+>    should now appear ≤ 1 time. Helper: `baseSkillID` in
+>    `internal/cli/hook_skills.go`.
+> 2. **Post-edit actor session attribution** — SHIPPED as PR #37. Before
+>    this fix, `sessions report --current` showed `reindex_ok=0` even
+>    when the actor succeeded (actor logs had no `session=` field).
+>    Verify after merge: any PostToolUse(Edit) should yield matching
+>    `post_edit_events` and `reindex_ok` counts per session.
+> 3. **Tool-use tracking instrumentation** — NOT YET SHIPPED. Two
+>    signals to instrument:
+>    - **(A) Missed tool-call opportunity.** For each UserPromptSubmit
+>      with hits, score the drift between the injected chunks and the
+>      assistant's subsequent heimdall tool calls that turn. If hits
+>      already covered the answer but the model called heimdall again,
+>      log `redundant_call`. If the model didn't call heimdall but the
+>      prompt was semantically close to indexed content (search-hit
+>      similarity above a threshold), log `missed_call`.
+>    - **(B) Redundant tool call.** Already derivable from
+>      `sessions report` (`total` vs `heimdall` tool-call counts), but
+>      expose it as a first-class metric in `SessionReport` JSON.
+>    Start with (B) — cheap, queryable today. Defer (A) until we have
+>    a semantic-drift score design.
+>
+> **Other remaining work (no blocking, pick from "Next steps" below):**
+> - Shadow-mode PreToolUse guardrail audit (wait ≥1 week of real
+>   traffic, then grep `hooks tail --event=pre-tool-use --since=168h`
+>   for false `class=block`; promote default `shadow → warn` if zero).
+> - `bench-retrieval` binary: auto-scope to the currently-opened
+>   project (today hard-coded to heimdall-mcp's DB).
+> - LLM-based classification fallback for PreToolUse when static rules
+>   can't decide (extension point reserved in
+>   `docs/plans/hooks/08-destructive-op-primitive.md`).
+> - Fold `skills import` into `install-hooks` as a best-effort step
+>   alongside Ollama pre-warm.
+>
+> **This session's shipped PRs (for reference — already merged unless noted):**
+> - PR #33 — Wave-E polish pass (sessions `--since`, JSON `schema_version`,
+>   doctor check #14, skill-body chunking).
+> - PR #34 — `sessions report --current` (auto-pick most-recent session).
+> - PR #35 — README factual audit (27 edits across 9 blocks: default model,
+>   Network Interactions section, MCP tools table, hook log paths, etc.
+>   Final orchestrator score 99.67/100).
+> - PR #36 — dedup `part-*` skill chunks in hook context (open — may need merge).
+> - PR #37 — post-edit actor session attribution (open — may need merge).
+> - payments-analyzer PR #89 — reduced orchestrator reviewer count 10 → 3.
+> - `~/.claude/CLAUDE.md` + `code-improvement-orchestrator` skill: agent counts
+>   lowered 5 → 3 and 30 → 3 for cost. Not git-managed; applied in-place.
+>
+> **Pre-polish-pass history (reference only, don't re-litigate):** PRs #25–#29
+> shipped the per-session savings feature
+> (`docs/plans/hooks/10-per-session-savings-report.md`) — Wave A session_id
+> on hook logs, Wave B transcript parser, Wave C hooklog reader+aggregator,
+> Wave D `sessions list` / `sessions report` CLI, Wave E docs. PR #31
+> bumped the first-turn `UserPromptSubmit` budget 250→450ms. PR #32 was
+> the handoff refresh.
 >
 > **Prior merged work (reference only, don't re-litigate):** PRs #25–#29
 > shipped the per-session savings feature
