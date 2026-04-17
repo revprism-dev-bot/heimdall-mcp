@@ -37,9 +37,11 @@ test-all: test test-integration
 # Runs the 18 built-in queries against the local .heimdall_db/ with Ollama
 # embeddings, prints a per-query + aggregate table, and reports the
 # summary-then-expand saving vs full-detail output.
+# The DB path is auto-detected from CWD (FindRepoRoot → .heimdall_db/<model>/).
+# Override with DB=<path> to pin a specific index, e.g. `make bench DB=/tmp/foo`.
 # See docs/plans/hooks/09-tiered-retrieval-benchmark.md for methodology.
 bench:
-	go run ./cmd/bench-retrieval --db=.heimdall_db/nomic-embed-text --top-k=10 --expand-rate=0.2
+	go run ./cmd/bench-retrieval $(if $(DB),--db=$(DB)) --top-k=10 --expand-rate=0.2
 
 # Smoke test for the bench harness — build-tag gated so `make test` stays
 # focused on product code. Runs the bench against a fixture index with
