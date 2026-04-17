@@ -283,7 +283,8 @@ func renderSessionReportText(w io.Writer, r SessionReport) {
 	fmt.Fprintf(w, "  cache_read=%d\n", r.Transcript.TotalCacheReadTokens)
 	fmt.Fprintf(w, "  output_tokens=%d\n", r.Transcript.TotalOutputTokens)
 	fmt.Fprintf(w, "\n## Tool use\n")
-	fmt.Fprintf(w, "  total=%d heimdall=%d\n", r.Transcript.ToolUseCount, r.Transcript.HeimdallToolCalls)
+	fmt.Fprintf(w, "  total=%d heimdall=%d redundant_heimdall_calls=%d\n",
+		r.Transcript.ToolUseCount, r.Transcript.HeimdallToolCalls, r.Transcript.RedundantHeimdallCalls)
 	names := make([]string, 0, len(r.Transcript.ToolUseByName))
 	for n := range r.Transcript.ToolUseByName {
 		names = append(names, n)
@@ -324,9 +325,10 @@ func (r SessionReport) toJSON() map[string]interface{} {
 			"output":         r.Transcript.TotalOutputTokens,
 		},
 		"tool_use": map[string]interface{}{
-			"total":    r.Transcript.ToolUseCount,
-			"heimdall": r.Transcript.HeimdallToolCalls,
-			"by_name":  r.Transcript.ToolUseByName,
+			"total":                    r.Transcript.ToolUseCount,
+			"heimdall":                 r.Transcript.HeimdallToolCalls,
+			"redundant_heimdall_calls": r.Transcript.RedundantHeimdallCalls,
+			"by_name":                  r.Transcript.ToolUseByName,
 		},
 		"heimdall_contribution": map[string]interface{}{
 			"session_start_bytes":  r.Transcript.HookSuccessBytesByEvent["SessionStart"],

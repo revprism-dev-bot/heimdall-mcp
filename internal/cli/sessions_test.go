@@ -330,6 +330,88 @@ func TestSessionsReport_CurrentOnEmptyLog(t *testing.T) {
 	}
 }
 
+func TestSessionsReport_JSONIncludesRedundantHeimdallCalls(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	_ = os.WriteFile(logPath,
+		[]byte("2026-04-16T20:00:01Z INFO event=user-prompt session=RH stage=cache_hit bytes=100\n"), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-tmp-proj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	// Transcript: user -> UserPromptSubmit hook_success (hits) -> assistant
+	// with 2 heimdall tool calls + 1 non-heimdall tool call. Expect
+	// redundant_heimdall_calls=2 in the JSON output.
+	tdata := strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"q"},"sessionId":"RH","timestamp":"2026-04-16T20:00:00Z"}`,
+		`{"type":"attachment","attachment":{"type":"hook_success","hookEvent":"UserPromptSubmit","stdout":"## Heimdall context\n\nhits"},"sessionId":"RH","timestamp":"2026-04-16T20:00:00Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[` +
+			`{"type":"tool_use","id":"a","name":"mcp__heimdall__heimdall_search","input":{"q":"x"}},` +
+			`{"type":"tool_use","id":"b","name":"mcp__heimdall__heimdall_recall","input":{"q":"y"}},` +
+			`{"type":"tool_use","id":"c","name":"Read","input":{"file_path":"/x"}}` +
+			`],"usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":10}},"sessionId":"RH","timestamp":"2026-04-16T20:00:01Z"}`,
+	}, "\n")
+	_ = os.WriteFile(filepath.Join(slugDir, "RH.jsonl"), []byte(tdata), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=RH", "--cwd=/tmp/proj", "--format=json"})
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, errBuf.String())
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	// Additive-field rule: schema_version MUST still be "v1".
+	if parsed["schema_version"] != SessionsReportSchemaVersion {
+		t.Errorf("schema_version: got %v, want %s", parsed["schema_version"], SessionsReportSchemaVersion)
+	}
+	toolUse, ok := parsed["tool_use"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("tool_use missing or wrong type: %v", parsed["tool_use"])
+	}
+	// json.Unmarshal returns numeric fields as float64.
+	got, ok := toolUse["redundant_heimdall_calls"].(float64)
+	if !ok {
+		t.Fatalf("redundant_heimdall_calls missing or wrong type: %T %v", toolUse["redundant_heimdall_calls"], toolUse["redundant_heimdall_calls"])
+	}
+	if int(got) != 2 {
+		t.Errorf("redundant_heimdall_calls: got %v want 2", got)
+	}
+}
+
+func TestSessionsReport_TextFormat_IncludesRedundantHeimdallCalls(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	_ = os.WriteFile(logPath,
+		[]byte("2026-04-16T20:00:01Z INFO event=user-prompt session=TX stage=cache_hit\n"), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-tmp-proj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	tdata := strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"q"},"sessionId":"TX","timestamp":"2026-04-16T20:00:00Z"}`,
+		`{"type":"attachment","attachment":{"type":"hook_success","hookEvent":"UserPromptSubmit","stdout":"## Heimdall context\n\nhits"},"sessionId":"TX","timestamp":"2026-04-16T20:00:00Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"mcp__heimdall__heimdall_search","input":{"q":"x"}}],"usage":{"input_tokens":5,"output_tokens":5}},"sessionId":"TX","timestamp":"2026-04-16T20:00:01Z"}`,
+	}, "\n")
+	_ = os.WriteFile(filepath.Join(slugDir, "TX.jsonl"), []byte(tdata), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=TX", "--cwd=/tmp/proj", "--format=text"})
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "redundant_heimdall_calls=1") {
+		t.Errorf("expected redundant_heimdall_calls=1 in text output:\n%s", out.String())
+	}
+}
+
 func TestSessionsReport_NeitherFlagFails(t *testing.T) {
 	var out, errBuf bytes.Buffer
 	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
