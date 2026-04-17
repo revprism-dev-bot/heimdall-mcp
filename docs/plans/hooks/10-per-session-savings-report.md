@@ -103,7 +103,7 @@ Read these before touching code:
 | `internal/cli/hook_pre_tool_use.go` | Add `SessionID` field to `preToolUseEvent`. Thread `sessionID` through every `LogHookEvent` call in `HookPreToolUse`. |
 | `internal/cli/hook_post_edit.go` | Refactor `extractEditedFilePath` → `extractPostEditStdin` returning `(filePath, sessionID)`. Thread `sessionID` through every `LogHookEvent` call in `HookPostEdit`. |
 | `internal/cli/cli.go` | Add `sessions` subcommand dispatch to `RunCLI`. One switch case. |
-| `internal/cli/doctor.go` | Optional: add 14th check `sessions report --self-check` for most-recent session — DEFERRED (won't ship in this plan, add to TODO follow-ups). |
+| `internal/cli/doctor.go` | ✅ SHIPPED post-Wave-E: 14th check `sessions pipeline` reads `hooks.log`, aggregates by session, warns if empty (fresh install), passes with session count otherwise. |
 | `README.md` | Add a short "Per-session savings" subsection pointing at `heimdall-mcp sessions report`. |
 | `TODO.md` | Strike the per-session tracking follow-up. |
 | `docs/plans/hooks/07-next-session-handoff.md` | Mark this feature shipped; note new dogfood workflow (`heimdall-mcp sessions report`). |
@@ -2104,11 +2104,11 @@ If Wave C is done in parallel by another agent, wait for both to merge before cl
 | # | Decision | Recommendation | Why |
 |---|---|---|---|
 | 1 | Transcript path resolution fallback when `--cwd` is absent | Use `os.Getwd()` | Matches existing hook convention; users are expected to run `sessions report` from the project directory. |
-| 2 | JSON schema stability | Not guaranteed in v1 | The report is primarily for human reading. If scripting matures, we lock the schema in a follow-up with a version field. |
+| 2 | JSON schema stability | ✅ SHIPPED | `schema_version: "v1"` emitted on both `sessions list --format=json` and `sessions report --format=json`. See `SessionsReportSchemaVersion` in `internal/cli/sessions.go`. Bump on breaking change only. |
 | 3 | Handling rotated `hooks.log.1` | Ignore in v1 | 5 MB cap + rotation means only recent sessions live in the active file. Multi-session history can be a follow-up. |
-| 4 | `sessions list` time window | Unbounded (whole log) | Simple for v1. `--since=24h` is a trivial follow-up if needed. |
+| 4 | `sessions list` time window | ✅ SHIPPED | `--since=<duration>` filter implemented; keeps sessions whose `LastSeen` falls inside the window. Session aggregates now track `FirstSeen` / `LastSeen`. |
 | 5 | Auto-detecting "current" session | Not in v1 | `sessions list` lets the user pick; auto-detect needs ambiguity handling (multiple parallel sessions). |
-| 6 | Doctor check #14 | Deferred | Report is post-hoc — a doctor dry-fire against a synthetic fixture would pass even when real transcripts are missing. Low value. |
+| 6 | Doctor check #14 | ✅ SHIPPED | Lightweight readability check — reads `hooks.log`, aggregates by session, pass/warn only. Deliberately does not try to render a full report (transcripts may be absent on fresh installs). |
 
 ---
 
