@@ -42,8 +42,9 @@ func DispatchSessions(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 		fmt.Fprintln(stdout, "                List recent sessions seen in hooks.log. --since")
 		fmt.Fprintln(stdout, "                accepts a Go duration (24h, 30m, etc.) and keeps")
 		fmt.Fprintln(stdout, "                only sessions whose last event falls inside the window.")
-		fmt.Fprintln(stdout, "  sessions report --session-id=<id> [--format=text|json]")
+		fmt.Fprintln(stdout, "  sessions report (--session-id=<id> | --current) [--format=text|json]")
 		fmt.Fprintln(stdout, "                [--cwd=<project-root>] (defaults to current dir)")
+		fmt.Fprintln(stdout, "                --current auto-picks the most-recent session from hooks.log.")
 		return 0
 	default:
 		fmt.Fprintf(stderr, "Unknown sessions subcommand: %s\n", sub)
@@ -170,8 +171,10 @@ func sessionsReport(cfg config.Config, stdout, stderr io.Writer, args []string) 
 		format    string
 		cwd       string
 		home      string
+		current   bool
 	)
-	fs.StringVar(&sessionID, "session-id", "", "target Claude Code session id (required)")
+	fs.StringVar(&sessionID, "session-id", "", "target Claude Code session id")
+	fs.BoolVar(&current, "current", false, "auto-pick the most-recent session from hooks.log")
 	fs.StringVar(&format, "format", "text", "output format: text|json")
 	fs.StringVar(&cwd, "cwd", "", "project cwd for transcript lookup (default: os.Getwd)")
 	fs.StringVar(&home, "home", "", "override home dir for transcript lookup (debug/tests)")
@@ -179,9 +182,26 @@ func sessionsReport(cfg config.Config, stdout, stderr io.Writer, args []string) 
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	if sessionID == "" {
-		fmt.Fprintln(stderr, "--session-id is required")
+	if sessionID != "" && current {
+		fmt.Fprintln(stderr, "--session-id and --current are mutually exclusive")
 		return 2
+	}
+	if sessionID == "" && !current {
+		fmt.Fprintln(stderr, "--session-id or --current is required")
+		return 2
+	}
+	if current {
+		allEntries, err := heimdall.ReadHookLog(heimdall.ReadHookLogOpts{})
+		if err != nil {
+			fmt.Fprintf(stderr, "read hooks.log: %v\n", err)
+			return 1
+		}
+		sessionID = heimdall.MostRecentSessionID(heimdall.AggregateHookLogBySession(allEntries))
+		if sessionID == "" {
+			fmt.Fprintln(stderr, "--current: no sessions in hooks.log yet")
+			return 1
+		}
+		fmt.Fprintf(stderr, "resolved --current to session %s\n", sessionID)
 	}
 	if cwd == "" {
 		if c, err := os.Getwd(); err == nil {

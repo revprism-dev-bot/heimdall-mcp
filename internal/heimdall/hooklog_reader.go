@@ -225,6 +225,21 @@ func SortedSessionIDs(agg map[string]SessionHookAggregate) []string {
 	return ids
 }
 
+// MostRecentSessionID returns the session id with the latest LastSeen in the
+// aggregate map, or "" if the map is empty. Ties break on lexicographically
+// greater id for stability.
+func MostRecentSessionID(agg map[string]SessionHookAggregate) string {
+	var bestID string
+	var bestSeen time.Time
+	for id, a := range agg {
+		if a.LastSeen.After(bestSeen) || (a.LastSeen.Equal(bestSeen) && id > bestID) {
+			bestID = id
+			bestSeen = a.LastSeen
+		}
+	}
+	return bestID
+}
+
 func parseInt64Field(s string) int64 {
 	if s == "" {
 		return 0
