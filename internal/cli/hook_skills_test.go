@@ -73,6 +73,36 @@ func seedMixedMemories(t *testing.T, facts, skills int, vec []float32) *heimdall
 	return store
 }
 
+// seedChunkedSkill inserts one "head" skill id plus N-1 `:part-<n>` chunk
+// rows for the same logical skill, mirroring what
+// internal/heimdall/skills_sync.go ChunkSkillBody produces when a SKILL.md
+// exceeds SkillBodyChunkThreshold.
+func seedChunkedSkill(t *testing.T, slug string, parts int, vec []float32) *heimdall.MemoryStore {
+	t.Helper()
+	dir := t.TempDir()
+	store, err := heimdall.OpenMemoryStore(filepath.Join(dir, "chunked.db"))
+	if err != nil {
+		t.Fatalf("open mem: %v", err)
+	}
+	now := time.Now().Unix()
+	head := fmt.Sprintf("skill: %s\ndescription: chunked skill\n\nbody part 1", slug)
+	_ = store.UpsertMemory(heimdall.Memory{
+		ID: fmt.Sprintf("mem:skill:disk:%s", slug), Content: head, Type: heimdall.MemoryTypeSkill,
+		Vector: vec, CreatedAt: now, UpdatedAt: now,
+		Source: heimdall.MemorySourceExplicit, ContentHash: heimdall.ContentHash(head),
+	})
+	for i := 2; i <= parts; i++ {
+		c := fmt.Sprintf("skill: %s\ndescription: chunked skill\n\nbody part %d", slug, i)
+		_ = store.UpsertMemory(heimdall.Memory{
+			ID: fmt.Sprintf("mem:skill:disk:%s:part-%d", slug, i), Content: c, Type: heimdall.MemoryTypeSkill,
+			Vector: vec, CreatedAt: now, UpdatedAt: now,
+			Source: heimdall.MemorySourceExplicit, ContentHash: heimdall.ContentHash(c),
+		})
+	}
+	t.Cleanup(func() { store.Close() })
+	return store
+}
+
 // stubSkillEmbedder returns a fixed vector for every Embed call. Used so
 // the skills helper doesn't need a real Ollama to score similarity.
 type stubSkillEmbedder struct {
@@ -472,5 +502,73 @@ func TestHookUserPrompt_SkillsSkippedOnBudgetTimeout(t *testing.T) {
 	}
 	if strings.Contains(out, "### Relevant skills") {
 		t.Errorf("skills section must not render after budget timeout: %q", out)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Chunked-skill dedup (part-* rows from ChunkSkillBody).
+// -----------------------------------------------------------------------------
+
+func TestBaseSkillID(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"mem:skill:disk:deep-code-review", "mem:skill:disk:deep-code-review"},
+		{"mem:skill:disk:deep-code-review:part-2", "mem:skill:disk:deep-code-review"},
+		{"mem:skill:disk:deep-code-review:part-10", "mem:skill:disk:deep-code-review"},
+		{"mem:skill:disk:foo:part-", "mem:skill:disk:foo:part-"},          // empty suffix — not a chunk
+		{"mem:skill:disk:foo:part-abc", "mem:skill:disk:foo:part-abc"},    // non-digit suffix
+		{"mem:skill:disk:foo:part-2a", "mem:skill:disk:foo:part-2a"},      // mixed → not a chunk
+		{"mem:fact:part-1", "mem:fact"},                                   // suffix match works anywhere
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := baseSkillID(c.in); got != c.want {
+			t.Errorf("baseSkillID(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSurfaceRelevantSkills_DedupsPartChunks(t *testing.T) {
+	store := seedChunkedSkill(t, "deep-code-review", 4, []float32{1, 0, 0})
+	got := surfaceRelevantSkills(context.Background(), "review quality", 3,
+		&stubSkillEmbedder{vec: []float32{1, 0, 0}}, store)
+	if len(got) != 1 {
+		t.Fatalf("want 1 bullet (4 chunks of 1 skill collapse), got %d: %v", len(got), got)
+	}
+	// All chunks share the same `skill: deep-code-review` header first line,
+	// so the single surviving bullet should reference the slug.
+	if !strings.Contains(got[0], "deep-code-review") {
+		t.Errorf("dedup bullet missing skill slug: %q", got[0])
+	}
+}
+
+func TestSurfaceRelevantSkills_DedupAcrossMultipleChunkedSkills(t *testing.T) {
+	dir := t.TempDir()
+	store, err := heimdall.OpenMemoryStore(filepath.Join(dir, "multi.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	vec := []float32{1, 0, 0}
+	now := time.Now().Unix()
+	for _, slug := range []string{"skill-a", "skill-b"} {
+		for part := 1; part <= 3; part++ {
+			id := fmt.Sprintf("mem:skill:disk:%s", slug)
+			if part > 1 {
+				id = fmt.Sprintf("%s:part-%d", id, part)
+			}
+			c := fmt.Sprintf("skill: %s\ndescription: bullet-%s\n\npart %d", slug, slug, part)
+			_ = store.UpsertMemory(heimdall.Memory{
+				ID: id, Content: c, Type: heimdall.MemoryTypeSkill, Vector: vec,
+				CreatedAt: now, UpdatedAt: now,
+				Source: heimdall.MemorySourceExplicit, ContentHash: heimdall.ContentHash(c),
+			})
+		}
+	}
+	got := surfaceRelevantSkills(context.Background(), "x", 3,
+		&stubSkillEmbedder{vec: vec}, store)
+	if len(got) != 2 {
+		t.Fatalf("want 2 deduped bullets, got %d: %v", len(got), got)
 	}
 }
