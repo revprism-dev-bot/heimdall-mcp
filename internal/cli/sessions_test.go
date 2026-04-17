@@ -266,3 +266,78 @@ func TestSessionsReport_JSONFormat(t *testing.T) {
 		t.Errorf("json session id: %v", parsed["session_id"])
 	}
 }
+
+func TestSessionsReport_CurrentPicksLatest(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+
+	old := time.Now().UTC().Add(-6 * time.Hour).Format(time.RFC3339)
+	mid := time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339)
+	newest := time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339)
+	lines := strings.Join([]string{
+		old + " INFO event=session-start session=OLD stage=ok",
+		mid + " INFO event=session-start session=MID stage=ok",
+		newest + " INFO event=session-start session=LATEST stage=ok",
+		"",
+	}, "\n")
+	_ = os.WriteFile(logPath, []byte(lines), 0o600)
+
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--current", "--cwd=/tmp/proj", "--format=json"})
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, errBuf.String())
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	if parsed["session_id"] != "LATEST" {
+		t.Errorf("--current should resolve to LATEST, got %v", parsed["session_id"])
+	}
+	if !strings.Contains(errBuf.String(), "resolved --current to session LATEST") {
+		t.Errorf("expected resolution notice in stderr, got: %s", errBuf.String())
+	}
+}
+
+func TestSessionsReport_CurrentAndSessionIDMutuallyExclusive(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--current", "--session-id=X"})
+	if rc != 2 {
+		t.Fatalf("expected rc=2, got %d", rc)
+	}
+	if !strings.Contains(errBuf.String(), "mutually exclusive") {
+		t.Errorf("expected mutually-exclusive error, got: %s", errBuf.String())
+	}
+}
+
+func TestSessionsReport_CurrentOnEmptyLog(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	_ = os.WriteFile(logPath, []byte(""), 0o600)
+
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--current"})
+	if rc != 1 {
+		t.Fatalf("expected rc=1, got %d", rc)
+	}
+	if !strings.Contains(errBuf.String(), "no sessions in hooks.log") {
+		t.Errorf("expected empty-log hint, got: %s", errBuf.String())
+	}
+}
+
+func TestSessionsReport_NeitherFlagFails(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report"})
+	if rc != 2 {
+		t.Fatalf("expected rc=2, got %d", rc)
+	}
+	if !strings.Contains(errBuf.String(), "--session-id or --current is required") {
+		t.Errorf("expected required-flag error, got: %s", errBuf.String())
+	}
+}
