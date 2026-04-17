@@ -51,25 +51,62 @@ func surfaceRelevantSkills(ctx context.Context, query string, topN int, embedder
 		return nil
 	}
 
+	// Over-fetch by a factor to compensate for part-* chunks of the same
+	// skill collapsing to one bullet below. 5× topN covers skills split into
+	// up to ~5 chunks (deep-code-review currently splits into 4), with
+	// headroom. The memory store is bounded so over-fetch is cheap.
 	hits, err := heimdall.RunRecall(ctx, heimdall.RecallParams{
 		Query: query,
 		Type:  string(heimdall.MemoryTypeSkill),
-		Limit: topN,
+		Limit: topN * 5,
 	}, embedder, memStore)
 	if err != nil || len(hits) == 0 {
 		return nil
 	}
 
-	bullets := make([]string, 0, len(hits))
+	bullets := make([]string, 0, topN)
+	seen := make(map[string]struct{}, topN)
 	for _, h := range hits {
+		base := baseSkillID(h.ID)
+		if _, dup := seen[base]; dup {
+			continue
+		}
+		seen[base] = struct{}{}
 		line := singleLine(h.Content)
 		if line == "" {
 			continue
 		}
 		line = capRunes(line, skillsMaxBulletRunes)
 		bullets = append(bullets, line)
+		if len(bullets) >= topN {
+			break
+		}
 	}
 	return bullets
+}
+
+// baseSkillID strips a trailing `:part-<digits>` suffix from a chunked skill
+// memory id so that every chunk of the same disk-sourced skill collapses to
+// one dedup key. Ids without the suffix (non-chunked skills, unrelated
+// memories) are returned unchanged. A suffix with non-digit content (e.g.
+// `:part-a`) is treated as not-a-chunk and left intact — the importer only
+// produces numeric suffixes (see ChunkSkillBody in internal/heimdall/skills_sync.go).
+func baseSkillID(id string) string {
+	const marker = ":part-"
+	idx := strings.LastIndex(id, marker)
+	if idx < 0 {
+		return id
+	}
+	suffix := id[idx+len(marker):]
+	if suffix == "" {
+		return id
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return id
+		}
+	}
+	return id[:idx]
 }
 
 // appendSkillsSection writes the "### Relevant skills" markdown block to b
