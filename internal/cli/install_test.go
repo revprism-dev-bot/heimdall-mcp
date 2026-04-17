@@ -527,8 +527,8 @@ func TestDoctorChecks_GreenWhenAllOK(t *testing.T) {
 	}
 	cfg := config.Config{Model: "bge-m3"}
 	checks := runDoctorChecks(cfg, env, deps)
-	if len(checks) != 13 {
-		t.Fatalf("expected 13 checks, got %d", len(checks))
+	if len(checks) != 14 {
+		t.Fatalf("expected 14 checks, got %d", len(checks))
 	}
 	for _, c := range checks {
 		if c.status == statusFail {
@@ -708,6 +708,69 @@ func TestDoctorChecks_SkipsInternalPostEditActor(t *testing.T) {
 	runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
 	if called != 0 {
 		t.Errorf("dryFire should not have been called for post-edit-actor; called=%d", called)
+	}
+}
+
+func TestDoctorChecks_SessionsPipeline_NoLogWarns(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, "settings.json")
+	os.WriteFile(settingsPath, []byte(`{}`), 0o600)
+	deps := doctorDeps{
+		settingsPath: settingsPath,
+		lookupPath:   func(name string) (string, error) { return "/fake/" + name, nil },
+		runVersion:   func(bin string) error { return nil },
+		pingOllama:   func(ctx context.Context, ep string) error { return nil },
+		listModels:   func(ctx context.Context, ep string) ([]string, error) { return []string{"bge-m3"}, nil },
+		dryFire:      func(cmd string) error { return nil },
+		hookLogPath:  filepath.Join(home, "does-not-exist.log"),
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
+	}
+	checks := runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
+	if len(checks) < 14 {
+		t.Fatalf("expected >=14 checks, got %d", len(checks))
+	}
+	last := checks[13]
+	if last.name != "sessions pipeline" {
+		t.Fatalf("expected sessions pipeline check at index 13, got %q", last.name)
+	}
+	if last.status != statusWarn {
+		t.Errorf("expected warn on missing hooks.log, got %v: %s", last.status, last.message)
+	}
+}
+
+func TestDoctorChecks_SessionsPipeline_ReadsSessions(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, "settings.json")
+	os.WriteFile(settingsPath, []byte(`{}`), 0o600)
+
+	hookLog := filepath.Join(home, "hooks.log")
+	_ = os.WriteFile(hookLog,
+		[]byte("2026-04-17T10:00:00Z INFO event=user-prompt session=FOO stage=ok bytes=123\n"), 0o600)
+
+	deps := doctorDeps{
+		settingsPath: settingsPath,
+		lookupPath:   func(name string) (string, error) { return "/fake/" + name, nil },
+		runVersion:   func(bin string) error { return nil },
+		pingOllama:   func(ctx context.Context, ep string) error { return nil },
+		listModels:   func(ctx context.Context, ep string) ([]string, error) { return []string{"bge-m3"}, nil },
+		dryFire:      func(cmd string) error { return nil },
+		hookLogPath:  hookLog,
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
+	}
+	checks := runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
+	last := checks[len(checks)-1]
+	if last.name != "sessions pipeline" {
+		t.Fatalf("expected last check to be sessions pipeline, got %q", last.name)
+	}
+	if last.status != statusPass {
+		t.Errorf("expected pass with session in log, got %v: %s", last.status, last.message)
+	}
+	if !strings.Contains(last.message, "1 session") {
+		t.Errorf("expected session count in message, got: %s", last.message)
 	}
 }
 

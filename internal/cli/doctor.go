@@ -1,6 +1,6 @@
 // doctor.go — implements T16 `heimdall-mcp hooks doctor`.
 //
-// Thirteen checks are run in a fixed order and rendered as a small ASCII table.
+// Fourteen checks are run in a fixed order and rendered as a small ASCII table.
 // Each check returns a status (pass/warn/fail) plus a short message. Any
 // `fail` row makes the overall command exit 1; `warn`-only or all-pass rows
 // exit 0. ASCII markers are used unconditionally — `NO_COLOR` is honored by
@@ -152,12 +152,12 @@ func renderDoctorTable(w io.Writer, checks []doctorCheck) {
 	}
 }
 
-// runDoctorChecks executes all 13 checks in order. Pure-ish: the only side
+// runDoctorChecks executes all 14 checks in order. Pure-ish: the only side
 // effects are file reads on the chosen settings.json path, exec calls via
 // deps, and HTTP calls via deps. Tests inject doctorDeps to bypass exec/net.
 func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) []doctorCheck {
 	deps = fillDoctorDeps(cfg, deps)
-	checks := make([]doctorCheck, 0, 13)
+	checks := make([]doctorCheck, 0, 14)
 
 	// 1 — settings.json exists at the chosen scope?
 	settingsBytes, settingsErr := os.ReadFile(deps.settingsPath)
@@ -479,6 +479,40 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 				name: "guardrail classifier", status: statusPass,
 				message: fmt.Sprintf("%d rules loaded", heimdall.DestructiveRuleCount()),
 			})
+		}
+	}
+
+	// 14 — sessions report pipeline self-check. Reads hooks.log, folds it
+	// into per-session aggregates, and confirms that `heimdall-mcp sessions
+	// list` / `sessions report` can see at least one session. A missing or
+	// empty log warns (system is fresh, nothing to report yet); a read
+	// error fails. We deliberately do not try to render a full report —
+	// that requires an actual Claude Code transcript on disk, which would
+	// false-fail on any machine that hasn't run a session yet. See
+	// docs/plans/hooks/10-per-session-savings-report.md §Open decisions #6.
+	{
+		entries, err := heimdall.ReadHookLog(heimdall.ReadHookLogOpts{Path: logPath})
+		switch {
+		case err != nil:
+			checks = append(checks, doctorCheck{
+				name: "sessions pipeline", status: statusFail,
+				message: fmt.Sprintf("hooks.log unreadable: %v", err),
+			})
+		default:
+			agg := heimdall.AggregateHookLogBySession(entries)
+			n := len(agg)
+			switch {
+			case n == 0:
+				checks = append(checks, doctorCheck{
+					name: "sessions pipeline", status: statusWarn,
+					message: "no sessions in hooks.log yet (expected on fresh install)",
+				})
+			default:
+				checks = append(checks, doctorCheck{
+					name: "sessions pipeline", status: statusPass,
+					message: fmt.Sprintf("%d session(s) available for `sessions list`", n),
+				})
+			}
 		}
 	}
 
