@@ -9,20 +9,22 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> **Status at `a405b24` (2026-04-17):** main is clean, tests green, nothing in
+> **Status at `6b7d8c4` (2026-04-17):** main is clean, tests green, nothing in
 > flight. The per-session savings feature (`docs/plans/hooks/10-per-session-savings-report.md`)
 > shipped today as 5 squash-merged PRs — #25 Wave A (session_id on hook logs),
 > #26 Wave B (transcript parser), #27 Wave C (hooklog reader+aggregator),
 > #28 Wave D (`sessions list` / `sessions report` CLI), #29 Wave E (docs).
+> **PR #31** landed later the same day: the first-turn `UserPromptSubmit`
+> budget was bumped 250→450ms after `sessions report` surfaced
+> `UserPromptSubmit bytes=0 events=0` for every first prompt — a fresh CLI
+> process's first embed against CPU-Ollama reliably exceeded 250ms even on
+> an already-loaded model. Budget stays under the 500ms hard cap.
 > No open work.
 >
 > **Binary state at restart:** `/home/noname/.local/bin/heimdall-mcp` is a
 > symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`. The file on disk
-> is `a405b24` (post-Wave-E) — verified via `heimdall-mcp --version`. Hook
-> subprocesses already pick this up (prior session's hooks.log shows
-> `session=aa271028-...` starting at `2026-04-17T18:31:53Z` — the exact
-> moment the new binary rename took effect). Restarting Claude Code launches
-> a fresh MCP server bound to the new binary too.
+> is `6b7d8c4` (post-PR-#31) — verified via `heimdall-mcp --version`.
+> Restarting Claude Code launches a fresh MCP server bound to the new binary too.
 >
 > **Heimdall installs 6 hooks**: `SessionStart`, `PostToolUse(Edit|Write)`,
 > `UserPromptSubmit`, `Stop`, `SessionEnd`, `PreToolUse(Bash)`. Every
@@ -65,14 +67,14 @@ point at this file.
 
 **Binary state at session close:**
 - `/home/noname/.local/bin/heimdall-mcp` → symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`.
-- File on disk is `a405b24` (sessions report feature live).
-  `heimdall-mcp --version` → `v0.0.2-0.20260416232905-a405b2490ba0 (a405b24)`.
+- File on disk is `6b7d8c4` (sessions report + user-prompt budget bump live).
+  `heimdall-mcp --version` → `(6b7d8c4)`.
 - 6 hooks remain installed at `/home/noname/Code/heimdall-mcp/.claude/settings.json`.
 
 **Step 1 — confirm the restart picked up the new binary:**
 ```bash
 heimdall-mcp --version
-# expect: ...(a405b24) or newer
+# expect: ...(6b7d8c4) or newer
 
 heimdall-mcp hooks tail --event=session-start --since=5m
 # expect: one line with session=<uuid-of-this-new-session>, stage=ok,
@@ -94,6 +96,10 @@ heimdall-mcp sessions report --session-id=<that id>
 #   - Tool use total + breakdown
 #   - Heimdall contribution: SessionStart bytes>0 events=1
 #   - UserPromptSubmit bytes>0 events=N (one per real prompt ≥8 runes)
+#     — PR #31 bumped the default budget 250→450ms specifically so the
+#     first uncached prompt of a session clears the Ollama first-embed
+#     latency on CPU. If you see `bytes=0 events=0` for the first-turn
+#     prompt, either Ollama is genuinely down or the budget regressed.
 #   - prompts=N cache_hits=0..N on hook side (cache hits land on repeat queries)
 #   - Guardrail verdicts map[allow:N] (N = Bash tool calls)
 ```
