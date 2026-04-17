@@ -9,74 +9,97 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> **Status at `65a396b` (2026-04-16 late):** Waves 1–2 plus the late-session
-> parallel push are all merged to `origin/main`. Phase 3 destructive-op
-> guardrails **shipped in shadow mode by default** in PR #23. 10 PRs landed
-> today in parallel (#14–#23). See "What shipped" for the roll-up.
+> **Status at `a405b24` (2026-04-17):** main is clean, tests green, nothing in
+> flight. The per-session savings feature (`docs/plans/hooks/10-per-session-savings-report.md`)
+> shipped today as 5 squash-merged PRs — #25 Wave A (session_id on hook logs),
+> #26 Wave B (transcript parser), #27 Wave C (hooklog reader+aggregator),
+> #28 Wave D (`sessions list` / `sessions report` CLI), #29 Wave E (docs).
+> No open work.
+>
+> **Binary state at restart:** `/home/noname/.local/bin/heimdall-mcp` is a
+> symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`. The file on disk
+> is `a405b24` (post-Wave-E) — verified via `heimdall-mcp --version`. Hook
+> subprocesses already pick this up (prior session's hooks.log shows
+> `session=aa271028-...` starting at `2026-04-17T18:31:53Z` — the exact
+> moment the new binary rename took effect). Restarting Claude Code launches
+> a fresh MCP server bound to the new binary too.
 >
 > **Heimdall installs 6 hooks**: `SessionStart`, `PostToolUse(Edit|Write)`,
-> `UserPromptSubmit`, `Stop`, `SessionEnd`, and **`PreToolUse(Bash)`**
-> (new — Phase 3 guardrail). The PreToolUse hook runs a 19-rule classifier
-> against every Bash tool invocation and logs `class=allow|warn|block` via
-> `LogHookEvent`. Default mode is **shadow** — classifier runs but never
-> blocks. Toggle via `HEIMDALL_GUARDRAILS=shadow|warn|block|off`.
+> `UserPromptSubmit`, `Stop`, `SessionEnd`, `PreToolUse(Bash)`. Every
+> retrieval-hook fire carries `session=<uuid>` in `hooks.log` (Wave A).
+> PreToolUse guardrail default is **shadow** — classifier runs, never blocks.
+> Toggle via `HEIMDALL_GUARDRAILS=shadow|warn|block|off`.
 >
-> **MCP tool surface:** `heimdall_search` (`detail`, `scope`), `heimdall_expand`,
-> `heimdall_ls`, `heimdall_remember` (now with `context_path` auto-derive from
-> CWD and optional `write_file=true` for skills → disk), `heimdall_recall`.
-> New CLI commands: `heimdall-mcp skills import` (sync `~/.claude/skills/` →
-> heimdall memory), `heimdall-mcp hooks explain-command "<cmd>"` (dry-run the
-> guardrail classifier).
+> **Measured wins already on the table:**
+> - 62.4% token savings from tiered retrieval at 20% expand rate
+>   (`docs/plans/hooks/09-tiered-retrieval-benchmark.md`, `make bench`).
+> - Per-session savings are now queryable post-hoc: `heimdall-mcp sessions
+>   report --session-id=<id>` joins transcript (tokens, tool calls,
+>   hook_success bytes) with hooks.log (cache hits, guardrail verdicts,
+>   reindex counts).
 >
-> **Measured win:** tiered retrieval bench shows **62.4% token savings** at
-> a 20% expand rate vs `detail=full`. See `docs/plans/hooks/09-tiered-retrieval-benchmark.md`
-> and run `make bench` to re-measure.
+> **What's next** (pick one, none urgent):
+> 1. Validate the new binary end-to-end on this fresh session — see "First
+>    actions on resumption" below.
+> 2. Let guardrails accumulate a week of shadow-mode traffic, then audit
+>    `hooks tail --event=pre-tool-use --since=168h` for false `class=block`
+>    verdicts. If zero, promote default to `warn`.
+> 3. Three plan-deferred polish items: `sessions list --since=24h`, doctor
+>    check #14 (`sessions report --self-check`), JSON schema versioning.
+>    See `docs/plans/hooks/10-per-session-savings-report.md` §Open decisions.
+> 4. Re-embed the two oversized skills (`code-improvement-orchestrator`,
+>    `deep-code-review`) that exceed `nomic-embed-text`'s context length —
+>    chunk at import, switch model, or leave disk-only.
 >
-> **What's actually live now:**
-> - CWD-subpath scope filtering in SessionStart + UserPromptSubmit (PR #17)
-> - Top-N skill memories surfaced in both retrieval hooks (PR #15)
-> - Ollama pre-warm on `install-hooks` (PR #19) — removes the ~67 s first-turn cold start
-> - Test-isolation: unit tests no longer pollute real `~/.local/state/heimdall/hooks.log` (PR #14)
-> - 2-way skills sync with `~/.claude/skills/` (PR #20)
-> - Layer-2 integration + Layer-3 e2e test harnesses, both build-tag gated (PR #16)
-> - `.claude/` and `.idea/` gitignored (PR #21)
->
-> **What's next** (needs live sessions or decisions, not more dispatched agents):
-> 1. Dogfood the full 6-hook pipeline — especially PreToolUse guardrails in shadow, then promote to warn
-> 2. Measure savings with `heimdall-mcp sessions report --session-id=<latest>` after real sessions (new in PR #28 — supersedes the old T21 plan)
-> 3. Any follow-ups surfaced by live dogfood telemetry (`hooks tail --event=pre-tool-use`)
->
-> Before touching code, read this file + `TODO.md` + `docs/plans/hooks/08-destructive-op-primitive.md` (design for Phase 3) for full context.
+> Before any code edit, sanity-check:
+> ```bash
+> cd /home/noname/Code/heimdall-mcp
+> git status && git log --oneline -6
+> go build ./... && go vet ./... && go test ./... -race -count=1
+> ```
+> Expect: clean tree, `a405b24` on top, all tests pass.
 
 ---
 
-## First actions on resumption (2026-04-16 late session end)
+## First actions on resumption (2026-04-17, post-Wave-E)
 
-**Binary + hooks state at session close:**
-- Binary rebuilt from `65a396b` and installed at `/home/noname/.local/bin/heimdall-mcp`
-  (symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`).
-  `heimdall-mcp --version` → `v0.0.2-0.20260416204003-65a396b1b0b2 (65a396b)`.
-- `install-hooks --scope=project` run fresh — 6 hooks installed at
-  `/home/noname/Code/heimdall-mcp/.claude/settings.json`.
-- Prewarm succeeded in 31 ms (Ollama was hot).
-- `hooks doctor` = **12/13 OK** + 1 warn (skills sync: 5/7 synced — two skills
-  exceed `nomic-embed-text` context length, see note below).
-- `guardrail classifier: 19 rules loaded` ✅ — Phase 3 primitive active.
+**Binary state at session close:**
+- `/home/noname/.local/bin/heimdall-mcp` → symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`.
+- File on disk is `a405b24` (sessions report feature live).
+  `heimdall-mcp --version` → `v0.0.2-0.20260416232905-a405b2490ba0 (a405b24)`.
+- 6 hooks remain installed at `/home/noname/Code/heimdall-mcp/.claude/settings.json`.
 
-**Immediate dogfood to run (paste these in the first turn after reopen):**
+**Step 1 — confirm the restart picked up the new binary:**
 ```bash
-# Did the full 6-hook pipeline fire cleanly?
-heimdall-mcp hooks tail --event=session-start --since=10m
-heimdall-mcp hooks tail --event=user-prompt   --since=10m
-heimdall-mcp hooks tail --event=pre-tool-use  --since=10m   # NEW — Phase 3 shadow mode
-heimdall-mcp hooks tail --event=post-edit     --since=10m
-heimdall-mcp hooks tail --event=stop          --since=10m
-heimdall-mcp hooks tail --event=session-end   --since=10m
+heimdall-mcp --version
+# expect: ...(a405b24) or newer
 
-# Per-session savings summary (NEW — PR #28)
-heimdall-mcp sessions list
-heimdall-mcp sessions report --session-id=<latest-from-list>
+heimdall-mcp hooks tail --event=session-start --since=5m
+# expect: one line with session=<uuid-of-this-new-session>, stage=ok,
+#         bullets=N, chunks=NNNN, skills=K.
+# If session= is missing, the hook ran under the OLD binary — investigate.
 ```
+
+**Step 2 — send a couple of real prompts + bash/edit calls, then:**
+```bash
+heimdall-mcp hooks tail --since=5m
+# Every line except flag_parse / panic paths should carry session=<uuid>.
+
+heimdall-mcp sessions list
+# Pick the row matching this session id.
+
+heimdall-mcp sessions report --session-id=<that id>
+# Expect non-zero:
+#   - Transcript tokens (input + cache_read)
+#   - Tool use total + breakdown
+#   - Heimdall contribution: SessionStart bytes>0 events=1
+#   - UserPromptSubmit bytes>0 events=N (one per real prompt ≥8 runes)
+#   - prompts=N cache_hits=0..N on hook side (cache hits land on repeat queries)
+#   - Guardrail verdicts map[allow:N] (N = Bash tool calls)
+```
+
+**Step 3 — if #2 looks right, the whole plan is validated.** Nothing
+actionable unless you want to pick from the "What's next" menu above.
 
 **What "healthy" looks like on first open:**
 - `session-start stage=ok bullets=N chunks=2546 model=nomic-embed-text skills=K scope=`
