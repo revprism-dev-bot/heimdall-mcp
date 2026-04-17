@@ -1,6 +1,6 @@
 # heimdall-mcp
 
-Local semantic code search + persistent memory for Claude Code, powered by [Ollama](https://ollama.ai) embeddings (BGE-M3) and a SQLite vector store.
+Local semantic code search + persistent memory for Claude Code, powered by [Ollama](https://ollama.ai) embeddings (nomic-embed-text) and a SQLite vector store.
 
 No cloud APIs. No API keys. Everything runs on your machine.
 
@@ -14,9 +14,9 @@ flowchart LR
     CC["Claude Code session"]
     subgraph Hooks["Heimdall hooks (6 events)"]
         SS["SessionStart\ninject recall + skills"]
-        UP["UserPromptSubmit\n(hot path, 250ms)\nsearch + cache"]
+        UP["UserPromptSubmit\n(hot path, ~450ms budget)\nsearch + cache"]
         PTU["PreToolUse\nBash guardrail\n(19-rule classifier)"]
-        PT["PostToolUse\nEdit/Write\nqueue reindex"]
+        PT["PostToolUse\n(Edit|Write)\nqueue reindex"]
         StopEvt["Stop\nbuffer assistant turn"]
         SEnd["SessionEnd\ningest summary"]
     end
@@ -60,7 +60,7 @@ sequenceDiagram
 
     U->>CC: prompt
     CC->>H: UserPromptSubmit
-    Note over H: 250 ms budget
+    Note over H: ~450 ms budget
     H->>DB: cache lookup
     alt cache hit
         H-->>CC: cached ## Heimdall context
@@ -89,11 +89,22 @@ sequenceDiagram
 - **Tiered retrieval** — `detail=summary|snippet|full` on `heimdall_search` reduces output tokens by ~62% at typical expansion rates. Drill down with `heimdall_expand(chunk_id)`.
 - **Destructive-op guardrails** — `PreToolUse(Bash)` classifies commands against 19 static rules (`rm -rf /`, `git push --force` on protected branches, `DROP DATABASE`, etc.). Default is shadow mode: logs verdicts, never blocks. Toggle via `HEIMDALL_GUARDRAILS=shadow|warn|block|off`.
 
+The `UserPromptSubmit` hook runs under a 450 ms budget (default), with a design target of p95 latency ≤ 250 ms; the extra headroom absorbs cold-model or network variance without tripping Claude's hook timeout.
+
 ## Prerequisites
 
 - [Go 1.25+](https://go.dev/dl/)
-- [Ollama](https://ollama.ai) installed and running
+- [Ollama](https://ollama.ai) installed and running (e.g. `ollama serve` in another terminal, or started as a system service)
 - An embedding model pulled: `ollama pull nomic-embed-text` (default, recommended)
+
+### Network Interactions
+
+Heimdall is local-first. The only steps that touch the internet are one-time setup:
+
+- `go install github.com/caio-silva/heimdall-mcp@latest` — downloads the binary.
+- `ollama pull <model>` — downloads the embedding model into Ollama.
+
+Everything else — hooks, search, recall, index, remember, guardrails — runs against a local Ollama daemon (default `http://localhost:11434`, configurable via `ollamaEndpoint`). No cloud APIs, no telemetry, no API keys.
 
 ## Install
 
@@ -126,12 +137,14 @@ Then just start using Claude. Heimdall auto-indexes your project on first search
 | `heimdall_index_text` | Index external content (Jira tickets, docs, PRs, Slack messages, etc.) with typed metadata and relationships. |
 | `heimdall_status` | Ollama reachability, model status, index stats, indexing progress, registered projects. |
 | `heimdall_projects` | List all projects in the registry. |
-| `heimdall_remember` | Store a memory for persistent recall across sessions. Supports tags, types, and project scoping. |
+| `heimdall_remember` | Store a memory for persistent recall across sessions. Supports tags, types, project scoping, and an optional `context_path` (slash-separated subpath within a project). |
 | `heimdall_recall` | Retrieve memories by semantic search with optional type/tag/project filters. |
 | `heimdall_ingest_session` | Auto-extract memories from a conversation summary. Deduplicates against existing memories. |
 | `heimdall_explain` | Deep diagnostic for a search query — score distribution, source counts, timing, related items. |
 | `heimdall_configure` | Get or set Heimdall config. Supports dot-notation keys like `git.depth` or `lifecycle.active_days`. |
 | `heimdall_manage_paths` | Add, remove, or list directories to index. |
+| `heimdall_expand` | Expand a chunk by ID to get its full content. Use after searching with `detail=summary` or `detail=snippet` to drill down into a specific result. |
+| `heimdall_ls` | List the context path hierarchy — filesystem-style navigation of indexed content, with chunk counts at each directory level. |
 
 ## Smart Defaults
 
@@ -157,9 +170,9 @@ Heimdall maintains a persistent memory store across sessions:
 → heimdall_ingest_session auto-extracts and deduplicates memories
 ```
 
-Memory types: `preference`, `decision`, `fact`, `context`, `skill`. Memories can be scoped to projects and tagged for filtering.
+Memory types: `preference`, `decision`, `fact`, `context`, `skill`. Memories can be scoped to projects and tagged for filtering. Skills are surfaced automatically via `SessionStart` and `UserPromptSubmit` hooks; the other four types are retrievable via `heimdall_recall`'s `type` filter.
 
-The memory database lives at `~/.config/heimdall-mcp/memories.db`.
+The memory database lives at `~/.config/heimdall-mcp/memories.db` (respects `$XDG_CONFIG_HOME`; falls back to `$TMPDIR/heimdall-mcp/memories.db` if no home directory can be resolved).
 
 ## Hooks integration
 
@@ -173,7 +186,7 @@ heimdall-mcp install-hooks --scope=project
 heimdall-mcp install-hooks --scope=project --dry-run
 
 # Diagnose
-heimdall-mcp hooks doctor            # 13-check health table
+heimdall-mcp hooks doctor            # 14-check health table
 heimdall-mcp hooks tail --since=1h   # filter by --event, --project, --level
 heimdall-mcp hooks explain-command "rm -rf /"  # dry-run the guardrail classifier
 
@@ -181,9 +194,25 @@ heimdall-mcp hooks explain-command "rm -rf /"  # dry-run the guardrail classifie
 heimdall-mcp uninstall-hooks --scope=project
 ```
 
+Pre-warm is best-effort with a 5-second cap: if Ollama is cold or unreachable the install still succeeds, and the first `SessionStart` hook may take 60+ seconds to load the model on demand (one-time; subsequent hooks are fast).
+
+Hook subcommands dispatched by `heimdall-mcp hook <sub>`:
+
+- `session-start`
+- `user-prompt`
+- `pre-tool-use`
+- `post-edit`
+- `post-edit-actor` (internal — spawned by `PostToolUse` for async reindexing)
+- `stop`
+- `session-end`
+
+End users never invoke these directly — Claude Code runs them via `settings.json`.
+
 **Hooks are opt-in.** They never block Claude Code from starting. Retrieval hooks always exit 0; only `PreToolUse` in `block` mode can return exit 2, and only on a genuinely destructive Bash command.
 
-Toggle guardrails with `HEIMDALL_GUARDRAILS=shadow|warn|block|off` (default: `shadow` — logs verdicts, never blocks). Disable all hooks with `HEIMDALL_HOOKS=0` or drop a `.heimdall/hooks.disabled` marker in your project.
+Toggle guardrails with `HEIMDALL_GUARDRAILS=shadow|warn|block|off` (default: `shadow` — logs verdicts, never blocks). `block` also accepts `1`, `on`, `enforce`; `off` also accepts `0` or empty. Disable all hooks with `HEIMDALL_HOOKS=0` or drop a `.heimdall/hooks.disabled` marker in your project.
+
+**Hook log.** Structured JSON-lines events go to `~/.local/state/heimdall/hooks.log` (honors `$XDG_STATE_HOME`; override the full path with `HEIMDALL_HOOK_LOG`). Logs auto-rotate at 5 MB; the previous log is retained as `hooks.log.1`. Cached hook output is capped at 32 KB per row — larger payloads are refused rather than truncated.
 
 ### Per-session savings
 
@@ -217,11 +246,11 @@ Indexed content follows a three-stage lifecycle to prevent unbounded growth:
 | Stage | Condition | What Happens |
 |-------|-----------|--------------|
 | **Active** | Accessed within 30 days | Full content, full embedding, scores normally |
-| **Archived** | 30–90 days since last access | Content compressed to 200 chars. Still searchable. Claude can re-fetch from source if needed. |
+| **Archived** | >30 days to ≤90 days since last access | Content compressed to 200 chars. Still searchable. Claude can re-fetch from source if needed. |
 | **Pruned** | >90 days since last access | Deleted entirely |
 
 - **Code and memory entries are exempt** — they never get archived or pruned.
-- **Relevance decay** — Search scores factor in freshness: `final_score = cosine_similarity × freshness_weight` (1.0 → 0.5 over 90 days). New content is not penalized.
+- **Relevance decay** — Search scores factor in freshness: `final_score = cosine_similarity × freshness_weight`, where `freshness_weight` decays linearly from 1.0 (fresh) to 0.5 at ≥90 days old. New or never-accessed content is not penalized.
 - **Size cap** — 10,000 chunks per project. When exceeded, the oldest external entries are pruned first.
 - **Lifecycle runs automatically** on each search, throttled to once per hour.
 
@@ -263,7 +292,7 @@ heimdall-mcp paths remove /path/to/another/project
 
 ## Configuration
 
-Optional. Heimdall works with zero config — defaults to local Ollama with BGE-M3.
+Optional. Heimdall works with zero config — defaults to local Ollama with nomic-embed-text.
 
 Create `~/.config/heimdall-mcp/config.json` or use `heimdall_configure` / `heimdall-mcp config set`:
 
@@ -273,7 +302,7 @@ Create `~/.config/heimdall-mcp/config.json` or use `heimdall_configure` / `heimd
   "model": "nomic-embed-text",
   "contextDepth": 1,
   "maxContextTokens": 4096,
-  "excludePatterns": [".git", "node_modules", "vendor", ".heimdall_db", "__pycache__", ".idea"],
+  "excludePatterns": [".git", "node_modules", "vendor", ".heimdall_db", "__pycache__", ".idea", ".claude/worktrees"],
   "gitEnabled": true,
   "gitDepth": 200,
   "gitIncludeDiffs": false,
@@ -282,6 +311,7 @@ Create `~/.config/heimdall-mcp/config.json` or use `heimdall_configure` / `heimd
   "lifecycleActiveDays": 30,
   "lifecycleArchiveDays": 90,
   "maxChunksPerProject": 10000,
+  "embedBatchSize": 32,
   "indexedPaths": []
 }
 ```
@@ -305,6 +335,7 @@ Config precedence:
 | `lifecycle.active_days` | int | `30` | Days before content is archived |
 | `lifecycle.archive_days` | int | `90` | Days before content is pruned |
 | `max_chunks_per_project` | int | `10000` | Hard cap on chunks per project DB |
+| `embed_batch_size` | int | `32` | Maximum texts per embed API call to Ollama |
 
 ## Embedding Models
 
@@ -320,14 +351,16 @@ Then re-index your projects — Heimdall detects model mismatches and warns you 
 
 ### Recommended models
 
-| Model | Origin | Size | Dims | Best for |
-|-------|--------|------|------|----------|
+| Model | Origin | Params | Dims | Best for |
+|-------|--------|--------|------|----------|
 | `nomic-embed-text` | Nomic AI (US) | 137M | 768 | **Default.** Best balance of quality and speed. |
 | `snowflake-arctic-embed:s` | Snowflake (US) | 33M | 384 | Minimal resource usage. |
 | `snowflake-arctic-embed` | Snowflake (US) | 110M | 768 | Medium footprint, good quality. |
+| `snowflake-arctic-embed:l` | Snowflake (US) | 335M | 1024 | High quality, larger footprint. |
 | `all-minilm` | Microsoft (US) | 33M | 384 | Fastest, smallest. Lower quality. |
 | `mxbai-embed-large` | Mixedbread (DE) | 335M | 1024 | High quality, heavier. |
 | `bge-m3` | BAAI (CN) | 567M | 1024 | Multilingual, heaviest. |
+| `bge-large-en-v1.5` | BAAI (CN) | 335M | 1024 | English-only, smaller than bge-m3. |
 
 ### Model mismatch protection
 
@@ -393,7 +426,7 @@ This means if you have 500 indexed files and change 1, re-indexing makes 1 embed
 The CLI shows this in action:
 ```
 heimdall-mcp index /path/to/project
-  [0:02] 500/500 files 100% (12 chunks) — done
+  [0:02] 500/500 files 100% (12 chunks) — done      *(output is illustrative)*
   Scanned:  500 files
   Indexed:  1 file       ← only the changed one
   Skipped:  499 files (unchanged)
@@ -401,11 +434,11 @@ heimdall-mcp index /path/to/project
 
 ## Portable Indexes
 
-The `.heimdall_db/` directory contains a single `vectors.db` SQLite file. You can copy it between machines as long as the same embedding model is used (the model name is stored in the DB and checked automatically). File paths stored in the index are relative, so projects can live at different absolute paths.
+The `.heimdall_db/<sanitized-model-name>/vectors.db` layout stores one SQLite file per embedding model, so multiple models can co-exist side-by-side. You can copy a `.heimdall_db/` directory between machines as long as the same embedding model is used — the model name is stored in the DB and checked on every hook fetch. On mismatch, `heimdall_search` and hook retrieval surface `ErrIndexModelMismatch`; run `heimdall-mcp status` (or `heimdall_status`) to diagnose, then re-index with the correct model. File paths stored in the index are relative, so projects can live at different absolute paths.
 
 ## Ollama Tuning
 
-The included `ollama-env.sh` sets environment variables optimized for embedding workloads:
+The included `ollama-env.sh` sets environment variables optimized for embedding workloads (notably `OLLAMA_FLASH_ATTENTION=1`, plus `OLLAMA_NUM_THREADS` auto-sized to CPU count and `OLLAMA_NUM_PARALLEL=1`):
 
 ```bash
 source ollama-env.sh && ollama serve
@@ -413,7 +446,7 @@ source ollama-env.sh && ollama serve
 
 ## How It Works
 
-1. **Index** — `heimdall_index` scans files, chunks them, generates embeddings via Ollama, stores in `.heimdall_db/vectors.db`. Git commits are indexed automatically if `.git/` exists.
+1. **Index** — `heimdall_index` scans files, chunks them, generates embeddings via Ollama, stores in `.heimdall_db/<model>/vectors.db`. Git commits are indexed automatically if `.git/` exists.
 2. **Search** — `heimdall_search` embeds your query, finds similar chunks via cosine similarity with freshness decay, updates `last_accessed` timestamps, and triggers lifecycle maintenance.
 3. **Incremental** — Re-indexing only processes files that actually changed. Two-tier detection: fast modtime check first, then SHA-256 content hash fallback (handles copied DBs and git clones). Unchanged files are skipped entirely — no embedding calls, no DB writes. Background indexing with progress tracking and stall detection.
 4. **Memory** — `heimdall_remember` embeds and stores memories with two-tier deduplication (content hash + semantic similarity). `heimdall_recall` retrieves them via vector search.
