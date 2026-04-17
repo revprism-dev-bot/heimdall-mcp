@@ -36,7 +36,7 @@ type PostEditDeps struct {
 	// fork+setsid via os/exec. Returning nil signals "actor dispatched
 	// successfully"; the foreground path then writes inflight.pid and
 	// returns. Tests pass a spy that records the call without forking.
-	Spawn func(projectRoot string) error
+	Spawn func(projectRoot, sessionID string) error
 	// UseFlock chooses between flock(2) (true) and the O_CREAT|O_EXCL
 	// TTL-stamp fallback (false). Production defaults to true; tests use
 	// false to exercise the fallback path without touching OS-level locks.
@@ -163,7 +163,7 @@ func hookPostEditWithDeps(cfg config.Config, stdin io.Reader, stdout, stderr io.
 	// Spawn the detached actor. On success the actor takes ownership of the
 	// lockfile lifecycle — we still release *our* in-process flock handle,
 	// but the actor races to write its own PID into inflight.pid.
-	if err := deps.Spawn(projectRoot); err != nil {
+	if err := deps.Spawn(projectRoot, sessionID); err != nil {
 		logHookEventWithSession("WARN", "post-edit", sessionID, map[string]any{"err": "spawn_failed", "detail": err.Error()})
 		rel()
 		return 0
@@ -179,6 +179,7 @@ type postEditFlags struct {
 	project string
 	source  string
 	version int
+	session string
 }
 
 func parsePostEditFlags(args []string) (postEditFlags, error) {
@@ -194,6 +195,14 @@ func parsePostEditFlags(args []string) (postEditFlags, error) {
 			f.project = args[i]
 		case strings.HasPrefix(a, "--project="):
 			f.project = strings.TrimPrefix(a, "--project=")
+		case a == "--session":
+			if i+1 >= len(args) {
+				return f, errors.New("--session requires a value")
+			}
+			i++
+			f.session = args[i]
+		case strings.HasPrefix(a, "--session="):
+			f.session = strings.TrimPrefix(a, "--session=")
 		case a == "--source":
 			if i+1 >= len(args) {
 				return f, errors.New("--source requires a value")
@@ -444,12 +453,22 @@ func killCheck(pid int) bool {
 // spawnPostEditActor re-invokes heimdall-mcp with the hidden post-edit-actor
 // subcommand, detached via setsid. Foreground returns immediately after
 // Start(); the child lives on.
-func spawnPostEditActor(projectRoot string) error {
+//
+// sessionID is propagated via --session so the actor's `reindex_ok` /
+// `reindex_failed` log lines can be attributed to the spawning session in
+// `heimdall-mcp sessions report`. It may be empty (older stdin shapes,
+// dry-fire contexts) — in that case no --session flag is passed and the
+// actor falls back to session-less logging.
+func spawnPostEditActor(projectRoot, sessionID string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(self, "hook", "post-edit-actor", "--project", projectRoot)
+	args := []string{"hook", "post-edit-actor", "--project", projectRoot}
+	if sessionID != "" {
+		args = append(args, "--session", sessionID)
+	}
+	cmd := exec.Command(self, args...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -494,6 +513,7 @@ func HookPostEditActor(cfg config.Config, stdin io.Reader, stdout, stderr io.Wri
 	_ = runPostEditActor(context.Background(), postEditActorConfig{
 		projectRoot:    projectRoot,
 		hooksDir:       hooksDir,
+		sessionID:      flags.session,
 		coalesceWindow: postEditCoalesceWindow,
 		deadletterCap:  postEditDeadletterCap,
 		now:            time.Now,

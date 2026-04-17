@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
 
 // postEditActorConfig captures everything the background actor needs to run
@@ -19,6 +17,7 @@ import (
 type postEditActorConfig struct {
 	projectRoot    string
 	hooksDir       string
+	sessionID      string // spawning session id; empty ⇒ fall back to session-less logging
 	coalesceWindow time.Duration
 	deadletterCap  int
 	now            func() time.Time
@@ -61,7 +60,7 @@ func runPostEditActor(ctx context.Context, cfg postEditActorConfig) error {
 		cfg.deadletterCap = postEditDeadletterCap
 	}
 	if err := os.MkdirAll(cfg.hooksDir, 0o755); err != nil {
-		heimdall.LogHookEvent("WARN", "post-edit-actor", map[string]any{"err": "mkdir_hooks"})
+		logHookEventWithSession("WARN", "post-edit-actor", cfg.sessionID, map[string]any{"err": "mkdir_hooks"})
 		return nil
 	}
 
@@ -82,7 +81,7 @@ func runPostEditActor(ctx context.Context, cfg postEditActorConfig) error {
 
 	pending, derr := drainPending(filepath.Join(cfg.hooksDir, "reindex.pending"))
 	if derr != nil {
-		heimdall.LogHookEvent("WARN", "post-edit-actor", map[string]any{"err": "drain_pending"})
+		logHookEventWithSession("WARN", "post-edit-actor", cfg.sessionID, map[string]any{"err": "drain_pending"})
 		// Still continue into the deadletter retry pass — stale entries
 		// might still be recoverable even if the live pending file is
 		// momentarily wedged.
@@ -90,7 +89,7 @@ func runPostEditActor(ctx context.Context, cfg postEditActorConfig) error {
 
 	if len(pending) > 0 {
 		if rerr := cfg.runner.Reindex(ctx, pending); rerr != nil {
-			heimdall.LogHookEvent("WARN", "post-edit-actor", map[string]any{
+			logHookEventWithSession("WARN", "post-edit-actor", cfg.sessionID, map[string]any{
 				"err":   "reindex_failed",
 				"files": len(pending),
 			})
@@ -104,7 +103,7 @@ func runPostEditActor(ctx context.Context, cfg postEditActorConfig) error {
 			}
 		} else {
 			_ = writeLastRun(filepath.Join(cfg.hooksDir, "reindex.last_run"), cfg.now())
-			heimdall.LogHookEvent("INFO", "post-edit-actor", map[string]any{
+			logHookEventWithSession("INFO", "post-edit-actor", cfg.sessionID, map[string]any{
 				"msg":   "reindex_ok",
 				"files": len(pending),
 			})
@@ -136,7 +135,7 @@ func replayStaleDeadletter(ctx context.Context, cfg postEditActorConfig, dlPath 
 	var stillStale []deadletterEntry
 	for _, e := range snapshot {
 		if e.Attempt >= cfg.deadletterCap {
-			heimdall.LogHookEvent("WARN", "post-edit-actor", map[string]any{
+			logHookEventWithSession("WARN", "post-edit-actor", cfg.sessionID, map[string]any{
 				"msg":     "deadletter_dropped",
 				"attempt": e.Attempt,
 			})
@@ -152,7 +151,7 @@ func replayStaleDeadletter(ctx context.Context, cfg postEditActorConfig, dlPath 
 			stillStale = append(stillStale, e)
 			continue
 		}
-		heimdall.LogHookEvent("INFO", "post-edit-actor", map[string]any{
+		logHookEventWithSession("INFO", "post-edit-actor", cfg.sessionID, map[string]any{
 			"msg":     "deadletter_recovered",
 			"attempt": e.Attempt,
 		})

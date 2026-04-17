@@ -24,7 +24,7 @@ import (
 func newForegroundDeps(now time.Time, spawnCounter *int, spawnErr error) PostEditDeps {
 	return PostEditDeps{
 		Now: func() time.Time { return now },
-		Spawn: func(projectRoot string) error {
+		Spawn: func(projectRoot, sessionID string) error {
 			*spawnCounter++
 			return spawnErr
 		},
@@ -529,7 +529,7 @@ func TestHookPostEdit_LogsSessionID(t *testing.T) {
 
 	deps := PostEditDeps{
 		Now:       time.Now,
-		Spawn:     func(string) error { return nil },
+		Spawn:     func(string, string) error { return nil },
 		UseFlock:  false,
 		KillCheck: func(int) bool { return false },
 	}
@@ -541,5 +541,75 @@ func TestHookPostEdit_LogsSessionID(t *testing.T) {
 	data, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
 	if !strings.Contains(string(data), "session=sess-pe") {
 		t.Fatalf("expected session=sess-pe:\n%s", string(data))
+	}
+}
+
+// TestHookPostEdit_SpawnReceivesSessionID locks in that HookPostEdit plumbs
+// the extracted session_id through to the Spawn callback. Before this was
+// wired, the actor log lines emitted `event=post-edit-actor msg=reindex_ok`
+// with no session field, so `sessions report --session-id=<id>` showed
+// reindex_ok=0 even when the actor succeeded.
+func TestHookPostEdit_SpawnReceivesSessionID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	payload := `{"session_id":"sess-xyz","tool_name":"Edit","tool_input":{"file_path":"/nonexistent/path.go"},"cwd":"/tmp"}`
+	stdin := strings.NewReader(payload)
+	var out, errBuf bytes.Buffer
+
+	var gotProject, gotSession string
+	deps := PostEditDeps{
+		Now: time.Now,
+		Spawn: func(projectRoot, sessionID string) error {
+			gotProject = projectRoot
+			gotSession = sessionID
+			return nil
+		},
+		UseFlock:  false,
+		KillCheck: func(int) bool { return false },
+	}
+	rc := hookPostEditWithDeps(config.Config{}, stdin, &out, &errBuf, map[string]string{"HEIMDALL_HOOKS": "1"}, []string{"--project", tmp}, deps)
+	if rc != 0 {
+		t.Fatalf("expected exit 0, got %d", rc)
+	}
+	if gotProject == "" {
+		t.Fatalf("Spawn was not invoked")
+	}
+	if gotSession != "sess-xyz" {
+		t.Errorf("Spawn sessionID = %q, want %q", gotSession, "sess-xyz")
+	}
+}
+
+// TestPostEditActor_LogsSessionID proves the actor core uses
+// logHookEventWithSession, so `reindex_ok` / `reindex_failed` lines carry
+// session=<id> and AggregateHookLogBySession can attribute them.
+func TestPostEditActor_LogsSessionID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+	hooksDir := filepath.Join(tmp, ".heimdall_db", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pendingPath := filepath.Join(hooksDir, "reindex.pending")
+	if err := os.WriteFile(pendingPath, []byte("/tmp/a.go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = runPostEditActor(context.Background(), postEditActorConfig{
+		projectRoot:    tmp,
+		hooksDir:       hooksDir,
+		sessionID:      "sess-actor",
+		coalesceWindow: 0,
+		deadletterCap:  postEditDeadletterCap,
+		now:            time.Now,
+		sleep:          func(time.Duration) {},
+		runner:         &fakeIndexRunner{},
+	})
+	data, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	s := string(data)
+	if !strings.Contains(s, "msg=reindex_ok") {
+		t.Fatalf("expected reindex_ok line:\n%s", s)
+	}
+	if !strings.Contains(s, "session=sess-actor") {
+		t.Errorf("expected session=sess-actor on actor log line:\n%s", s)
 	}
 }
