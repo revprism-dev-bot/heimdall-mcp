@@ -378,6 +378,50 @@ func (s *MemoryStore) SearchMemoriesByIDPrefix(prefix string) int {
 	return count
 }
 
+// ListMemoryIDsByPrefix returns every memory ID starting with prefix, in
+// stable alphabetical order. Used by the skills importer to locate orphan
+// chunk rows (`mem:skill:disk:<slug>:part-N`) when the chunk count changes
+// across re-imports.
+//
+// SAFETY: prefix is parameterized via ?, never interpolated into the SQL.
+func (s *MemoryStore) ListMemoryIDsByPrefix(prefix string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if prefix == "" {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`SELECT id FROM memories WHERE id LIKE ? ORDER BY id`, prefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// DeleteMemoryByID removes a single memory row. Returns nil when the row
+// doesn't exist — delete is always safe to retry. Used by the skills
+// importer to prune orphan chunks when the chunk count shrinks.
+//
+// SAFETY: id is parameterized via ?, never interpolated into the SQL.
+func (s *MemoryStore) DeleteMemoryByID(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`DELETE FROM memories WHERE id = ?`, id)
+	return err
+}
+
 // scanMemory scans a single memory row from a *sql.Rows.
 // Expects the trailing column order:
 //

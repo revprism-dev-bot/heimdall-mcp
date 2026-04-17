@@ -519,3 +519,168 @@ func TestCountSyncedSkillMemories_NilStore(t *testing.T) {
 		t.Errorf("expected error on nil store")
 	}
 }
+
+// ----- chunk-oversized-body tests -----
+
+func TestChunkSkillBody_SmallFitsOneChunk(t *testing.T) {
+	chunks := ChunkSkillBody("small body under threshold", 6000)
+	if len(chunks) != 1 {
+		t.Fatalf("want 1 chunk, got %d", len(chunks))
+	}
+	if chunks[0] != "small body under threshold" {
+		t.Errorf("chunk mutated: %q", chunks[0])
+	}
+}
+
+func TestChunkSkillBody_EmptyReturnsSingleEmpty(t *testing.T) {
+	chunks := ChunkSkillBody("", 6000)
+	if len(chunks) != 1 || chunks[0] != "" {
+		t.Fatalf("want [\"\"], got %v", chunks)
+	}
+	chunks = ChunkSkillBody("   \n\n   ", 6000)
+	if len(chunks) != 1 || chunks[0] != "" {
+		t.Fatalf("whitespace-only must collapse to empty, got %v", chunks)
+	}
+}
+
+func TestChunkSkillBody_SplitsOnH2Boundaries(t *testing.T) {
+	// Build a body where two H2 sections together exceed maxChars but each
+	// individually fits.
+	secA := "## Section A\n" + strings.Repeat("alpha ", 40)
+	secB := "## Section B\n" + strings.Repeat("beta ", 40)
+	body := secA + "\n" + secB
+	chunks := ChunkSkillBody(body, 300)
+	if len(chunks) < 2 {
+		t.Fatalf("expected split into ≥2 chunks, got %d: %v", len(chunks), chunks)
+	}
+	// Headings must survive — each chunk should start on its `## ` marker.
+	if !strings.HasPrefix(chunks[0], "## Section A") {
+		t.Errorf("chunk 0 lost heading: %q", chunks[0])
+	}
+	if !strings.HasPrefix(chunks[1], "## Section B") {
+		t.Errorf("chunk 1 lost heading: %q", chunks[1])
+	}
+}
+
+func TestChunkSkillBody_HardSplitOnUnstructuredText(t *testing.T) {
+	// No markdown structure, purely linear text above the threshold —
+	// verifies the hard-split fallback kicks in.
+	body := strings.Repeat("a", 10_000)
+	chunks := ChunkSkillBody(body, 3000)
+	if len(chunks) < 4 {
+		t.Fatalf("expected ≥4 chunks for 10k chars at maxChars=3000, got %d", len(chunks))
+	}
+	for i, c := range chunks {
+		if len([]rune(c)) > 3000 {
+			t.Errorf("chunk %d exceeds maxChars: %d", i, len([]rune(c)))
+		}
+	}
+}
+
+func TestChunkSkillBody_ParagraphSplitWhenNoHeadings(t *testing.T) {
+	// Paragraphs separated by blank lines, no ## headings — binPack on \n\n.
+	paragraphs := []string{
+		strings.Repeat("p1 ", 80),
+		strings.Repeat("p2 ", 80),
+		strings.Repeat("p3 ", 80),
+		strings.Repeat("p4 ", 80),
+	}
+	body := strings.Join(paragraphs, "\n\n")
+	chunks := ChunkSkillBody(body, 400)
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks from paragraph split, got %d", len(chunks))
+	}
+	for i, c := range chunks {
+		if len([]rune(c)) > 400 {
+			t.Errorf("chunk %d exceeds maxChars: %d", i, len([]rune(c)))
+		}
+	}
+}
+
+func TestImportSkillsFromDir_ChunksLargeSkill(t *testing.T) {
+	store := importTestStore(t)
+	root := t.TempDir()
+
+	// Build a SKILL.md large enough that ChunkSkillBody will split it into
+	// multiple parts at the default threshold. We interleave H2 sections so
+	// the chunker takes the heading path rather than hard-split.
+	var body strings.Builder
+	for i := 0; i < 6; i++ {
+		body.WriteString("## Section ")
+		body.WriteString(string(rune('A' + i)))
+		body.WriteString("\n")
+		body.WriteString(strings.Repeat("content words ", 200))
+		body.WriteString("\n\n")
+	}
+	writeFile(t, filepath.Join(root, "big", "SKILL.md"),
+		"---\nname: big\ndescription: oversized skill.\n---\n"+body.String())
+
+	res, err := ImportSkillsFromDir(store, SkillImportOpts{Dir: root, Embed: fakeEmbed})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if res.Created < 2 {
+		t.Fatalf("expected ≥2 rows created (chunked), got %d (errors=%v)", res.Created, res.Errors)
+	}
+
+	// Primary row + at least one part-N row must both exist.
+	primary, _ := store.GetMemoryByID(SkillMemoryID("big"))
+	if primary == nil {
+		t.Fatal("primary row missing")
+	}
+	if !strings.Contains(primary.Content, "part 1 of") {
+		t.Errorf("primary row should carry `part 1 of N` marker: %q", primary.Content)
+	}
+	part2, _ := store.GetMemoryByID(SkillMemoryIDForPart("big", 2))
+	if part2 == nil {
+		t.Fatal("part-2 row missing")
+	}
+	if !strings.Contains(part2.Content, "skill: big") {
+		t.Errorf("part-2 should include skill header for retrieval: %q", part2.Content)
+	}
+}
+
+func TestImportSkillsFromDir_PrunesOrphanPartsWhenShrunk(t *testing.T) {
+	store := importTestStore(t)
+	root := t.TempDir()
+
+	// Start with a large body that chunks into 3+ parts. Each section is
+	// ~2800 chars so the total (6 * 2800 ≈ 16.8k) comfortably exceeds the
+	// 6000-char threshold and the chunker produces multiple rows.
+	var big strings.Builder
+	for i := 0; i < 6; i++ {
+		big.WriteString("## S")
+		big.WriteString(string(rune('0' + i)))
+		big.WriteString("\n")
+		big.WriteString(strings.Repeat("content words ", 200))
+		big.WriteString("\n\n")
+	}
+	skillPath := filepath.Join(root, "shrinker", "SKILL.md")
+	writeFile(t, skillPath, "---\nname: shrinker\ndescription: x.\n---\n"+big.String())
+
+	if _, err := ImportSkillsFromDir(store, SkillImportOpts{Dir: root, Embed: fakeEmbed}); err != nil {
+		t.Fatal(err)
+	}
+	parts1, _ := store.ListMemoryIDsByPrefix(SkillMemoryID("shrinker") + SkillMemoryIDPartPrefix)
+	if len(parts1) < 2 {
+		t.Fatalf("expected multiple part rows after first import, got %d", len(parts1))
+	}
+
+	// Shrink the body to a single-chunk size and re-import — orphan parts
+	// must be deleted.
+	writeFile(t, skillPath, "---\nname: shrinker\ndescription: x.\n---\nsmall now.\n")
+	if _, err := ImportSkillsFromDir(store, SkillImportOpts{Dir: root, Embed: fakeEmbed}); err != nil {
+		t.Fatal(err)
+	}
+	parts2, _ := store.ListMemoryIDsByPrefix(SkillMemoryID("shrinker") + SkillMemoryIDPartPrefix)
+	if len(parts2) != 0 {
+		t.Errorf("orphan parts not pruned: %v", parts2)
+	}
+	primary, _ := store.GetMemoryByID(SkillMemoryID("shrinker"))
+	if primary == nil {
+		t.Fatal("primary row vanished after shrink")
+	}
+	if !strings.Contains(primary.Content, "small now") {
+		t.Errorf("primary content not updated after shrink: %q", primary.Content)
+	}
+}

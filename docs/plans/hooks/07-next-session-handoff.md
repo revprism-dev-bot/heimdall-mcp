@@ -9,22 +9,32 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> **Status at `6b7d8c4` (2026-04-17):** main is clean, tests green, nothing in
-> flight. The per-session savings feature (`docs/plans/hooks/10-per-session-savings-report.md`)
-> shipped today as 5 squash-merged PRs — #25 Wave A (session_id on hook logs),
-> #26 Wave B (transcript parser), #27 Wave C (hooklog reader+aggregator),
-> #28 Wave D (`sessions list` / `sessions report` CLI), #29 Wave E (docs).
-> **PR #31** landed later the same day: the first-turn `UserPromptSubmit`
-> budget was bumped 250→450ms after `sessions report` surfaced
-> `UserPromptSubmit bytes=0 events=0` for every first prompt — a fresh CLI
-> process's first embed against CPU-Ollama reliably exceeded 250ms even on
-> an already-loaded model. Budget stays under the 500ms hard cap.
-> No open work.
+> **Status at `ff01aef` + uncommitted polish pass (2026-04-17 late):** 10
+> files modified on disk, not yet committed. Full suite green under
+> `go test ./... -race -count=1` (35s cli / 49s heimdall / 10s mcp /
+> 1s config). `go vet ./...` clean. Binary rebuilt to
+> `ff01aef+dirty` at `/home/noname/Code/heimdall-mcp/heimdall-mcp`
+> — the `~/.local/bin/heimdall-mcp` symlink picks it up
+> automatically. **First action: commit the polish pass + PR it; the
+> installed binary should be on a named commit, not `+dirty`.** Diff
+> stats: 846 insertions / 56 deletions across 10 files. See the
+> "2026-04-17 polish pass" section below for what shipped.
 >
-> **Binary state at restart:** `/home/noname/.local/bin/heimdall-mcp` is a
-> symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`. The file on disk
-> is `6b7d8c4` (post-PR-#31) — verified via `heimdall-mcp --version`.
-> Restarting Claude Code launches a fresh MCP server bound to the new binary too.
+> **Prior merged work (reference only, don't re-litigate):** PRs #25–#29
+> shipped the per-session savings feature
+> (`docs/plans/hooks/10-per-session-savings-report.md`) — Wave A session_id
+> on hook logs, Wave B transcript parser, Wave C hooklog reader+aggregator,
+> Wave D `sessions list` / `sessions report` CLI, Wave E docs. PR #31
+> bumped the first-turn `UserPromptSubmit` budget 250→450ms after
+> `sessions report` surfaced `UserPromptSubmit bytes=0 events=0` on the
+> first prompt of every session (fresh CLI process's first embed against
+> CPU-Ollama reliably exceeded 250ms). Budget stays under the 500ms hard cap.
+>
+> **Binary state at restart:** `/home/noname/.local/bin/heimdall-mcp` →
+> symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`. Rebuild and
+> `heimdall-mcp --version` will report `ff01aef+dirty` until the polish
+> pass is committed — that's expected, not a red flag. Restarting Claude
+> Code launches a fresh MCP server bound to the rebuilt binary.
 >
 > **Heimdall installs 6 hooks**: `SessionStart`, `PostToolUse(Edit|Write)`,
 > `UserPromptSubmit`, `Stop`, `SessionEnd`, `PreToolUse(Bash)`. Every
@@ -38,20 +48,27 @@ point at this file.
 > - Per-session savings are now queryable post-hoc: `heimdall-mcp sessions
 >   report --session-id=<id>` joins transcript (tokens, tool calls,
 >   hook_success bytes) with hooks.log (cache hits, guardrail verdicts,
->   reindex counts).
+>   reindex counts). `--format=json` emits `schema_version: "v1"` for
+>   scripted consumers.
 >
 > **What's next** (pick one, none urgent):
-> 1. Validate the new binary end-to-end on this fresh session — see "First
->    actions on resumption" below.
-> 2. Let guardrails accumulate a week of shadow-mode traffic, then audit
+> 1. **Commit + PR the polish pass.** 10 files changed (see "2026-04-17
+>    polish pass" below for the full list and the suggested commit
+>    breakdown). Then run `heimdall-mcp skills import` to materialize
+>    the newly-chunked `code-improvement-orchestrator` (26 KB) and
+>    `deep-code-review` (75 KB) memories. `hooks doctor` row
+>    `skills sync` should flip from `5/7 synced` → `7/7 synced` after.
+> 2. Validate the new binary end-to-end on this fresh session — see
+>    "First actions on resumption" below.
+> 3. Let guardrails accumulate a week of shadow-mode traffic, then audit
 >    `hooks tail --event=pre-tool-use --since=168h` for false `class=block`
 >    verdicts. If zero, promote default to `warn`.
-> 3. Three plan-deferred polish items: `sessions list --since=24h`, doctor
->    check #14 (`sessions report --self-check`), JSON schema versioning.
->    See `docs/plans/hooks/10-per-session-savings-report.md` §Open decisions.
-> 4. Re-embed the two oversized skills (`code-improvement-orchestrator`,
->    `deep-code-review`) that exceed `nomic-embed-text`'s context length —
->    chunk at import, switch model, or leave disk-only.
+> 4. ~~Three plan-deferred polish items~~ ✅ SHIPPED 2026-04-17:
+>    `sessions list --since=<duration>`, doctor check #14
+>    (`sessions pipeline`), JSON `schema_version: "v1"`. See
+>    `docs/plans/hooks/10-per-session-savings-report.md` §Open decisions.
+> 5. ~~Re-embed the two oversized skills~~ ✅ SHIPPED 2026-04-17:
+>    `ChunkSkillBody` + `importSkillChunks` handle it at import time.
 >
 > Before any code edit, sanity-check:
 > ```bash
@@ -59,7 +76,87 @@ point at this file.
 > git status && git log --oneline -6
 > go build ./... && go vet ./... && go test ./... -race -count=1
 > ```
-> Expect: clean tree, `a405b24` on top, all tests pass.
+> Expect: **uncommitted polish pass** on top of `ff01aef` (10 files
+> modified), or a newer top commit if you've already PR'd. All tests pass.
+
+---
+
+## 2026-04-17 polish pass (uncommitted when this doc was written)
+
+Four follow-ups shipped in one session, in response to "do all work now —
+stop asking, implement everything, tests later":
+
+**1. `sessions list --since=<duration>` filter**
+- `internal/heimdall/hooklog_reader.go`: `SessionHookAggregate` gained
+  `FirstSeen` / `LastSeen` fields, populated in `AggregateHookLogBySession`.
+- `internal/cli/sessions.go`: new `--since` flag (Go duration).
+  Invalid duration → rc=2. Empty window prints a clear hint rather than
+  the generic no-sessions line.
+- JSON rows now include `first_seen` / `last_seen` (RFC3339) and the top
+  level is `{schema_version, sessions: []}` instead of a bare array.
+- Tests: `TestSessionsList_SinceFilter`, `TestSessionsList_SinceInvalid`,
+  `TestSessionsList_JSONSchemaVersion`, `TestSessionsList_JSONEmpty`.
+
+**2. JSON `schema_version`**
+- `SessionsReportSchemaVersion = "v1"` constant in `internal/cli/sessions.go`.
+- Emitted on both `sessions list --format=json` and `sessions report
+  --format=json`.
+- Bump on **breaking** changes only (rename/removal/type change). New
+  fields are additive and do not require a version bump.
+- Tests: `TestSessionsReport_JSONSchemaVersion` + the list-side tests above.
+
+**3. Doctor check #14: `sessions pipeline`**
+- `internal/cli/doctor.go`: reads `hooks.log` via `ReadHookLog`, folds by
+  session via `AggregateHookLogBySession`, reports:
+  - Pass: `N session(s) available for `sessions list``
+  - Warn: `no sessions in hooks.log yet (expected on fresh install)`
+  - Fail: `hooks.log unreadable: <err>` (only on non-ENOENT errors)
+- Does NOT try to render a full report — that would false-fail on any
+  machine where the transcript hasn't been written yet. See
+  `docs/plans/hooks/10-per-session-savings-report.md` §Open decisions #6.
+- Check count bumped 13→14 in the file header comment and in `cap(checks)`.
+- Tests: `TestDoctorChecks_SessionsPipeline_NoLogWarns`,
+  `TestDoctorChecks_SessionsPipeline_ReadsSessions`, plus the existing
+  all-pass test updated to expect 14.
+
+**4. Chunk-at-import for oversized SKILL.md files**
+- `internal/heimdall/skills_sync.go`:
+  - `SkillBodyChunkThreshold = 6000` (chars) — well under `nomic-embed-text`'s
+    8192-token context with headroom for the skill header.
+  - `ChunkSkillBody(body, maxChars)` — prefers H2 splits, then H3, then
+    paragraph, then hard-split on rune boundaries as last resort.
+  - Chunks beyond the first stored under
+    `mem:skill:disk:<slug>:part-<n>` (n is 1-based, so `part-2` is the
+    second chunk; the first chunk uses the non-suffixed slug ID).
+  - Each chunk keeps the full `skill: <name>\ndescription: <desc>\n\n`
+    header for retrieval relevance, plus a trailing `(part N of M)` marker.
+  - Orphan `part-*` rows are pruned across re-imports via a new
+    `ListMemoryIDsByPrefix` + `DeleteMemoryByID` pair on `MemoryStore`.
+  - `CountSyncedSkillMemories` now counts **disk-file-equivalents** (ignores
+    part-* suffix rows) so `hooks doctor` sync rollup stays accurate after
+    chunking.
+- Tests: `TestChunkSkillBody_*` ×5,
+  `TestImportSkillsFromDir_ChunksLargeSkill`,
+  `TestImportSkillsFromDir_PrunesOrphanPartsWhenShrunk`.
+
+**5. Handoff doc fix**
+- Line that said "`a405b24` on top" → "`ff01aef` or newer on top" (the
+  ff01aef top commit is a docs-only PR #32 refresh, so it counts).
+
+**Suggested commit breakdown** (one PR, or split into logical PRs):
+- `feat(sessions): --since filter + JSON schema_version` —
+  sessions.go, sessions_test.go, hooklog_reader.go, 10-*.md table update.
+- `feat(doctor): 14th check for sessions pipeline` —
+  doctor.go, install_test.go, 10-*.md table update.
+- `feat(skills): chunk oversized SKILL.md bodies on import` —
+  skills_sync.go, skills_sync_test.go, memory_store.go.
+- `docs(handoff): mark 4 polish items shipped` — 07-*.md.
+
+All four land cleanly as independent commits; the CI gate is `go build
+./... && go vet ./... && go test ./... -race -count=1`, all green at
+the time of writing.
+
+---
 
 ---
 
@@ -503,11 +600,13 @@ From `docs/plans/hooks/06-decisions.md`:
     runs required. Run `heimdall-mcp sessions list && heimdall-mcp sessions
     report --session-id=<latest>` after any session to see the numbers.
 
-18. **Re-embed the oversized skill files.** Two skills
-    (`code-improvement-orchestrator`, `deep-code-review`) failed import
-    because they exceed the `nomic-embed-text` 8192-token context. Options:
-    chunk-at-import, switch to a larger-context embed model, or leave them
-    disk-only. Low priority — blocks nothing.
+18. ~~**Re-embed the oversized skill files.**~~ ✅ SHIPPED 2026-04-17 —
+    chunk-at-import is the chosen option. `ChunkSkillBody` pre-splits any
+    body exceeding `SkillBodyChunkThreshold` (6000 chars) on H2/H3/paragraph
+    boundaries with a hard-split fallback. `code-improvement-orchestrator`
+    (26 KB) and `deep-code-review` (75 KB) now import as multiple
+    `mem:skill:disk:<slug>:part-<n>` rows per file. Run `heimdall-mcp skills
+    import` once after the restart to materialize the new rows.
 
 ---
 

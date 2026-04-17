@@ -13,6 +13,13 @@ import (
 	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
 
+// SessionsReportSchemaVersion is the JSON schema version emitted by
+// `sessions list --format=json` and `sessions report --format=json`. Bump
+// on any breaking field change (rename, removal, type change). Additive
+// changes (new fields) do not require a bump. Consumers should accept
+// unknown fields for forward compatibility.
+const SessionsReportSchemaVersion = "v1"
+
 // DispatchSessions routes `heimdall-mcp sessions <subcommand>`.
 func DispatchSessions(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
 	_ = stdin
@@ -31,9 +38,11 @@ func DispatchSessions(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "heimdall-mcp sessions — per-session savings metrics")
 		fmt.Fprintln(stdout)
-		fmt.Fprintln(stdout, "  sessions list                       List recent sessions seen in hooks.log")
-		fmt.Fprintln(stdout, "  sessions report --session-id=<id>   Full report for one session")
-		fmt.Fprintln(stdout, "                [--format=text|json]")
+		fmt.Fprintln(stdout, "  sessions list [--since=<dur>] [--format=text|json]")
+		fmt.Fprintln(stdout, "                List recent sessions seen in hooks.log. --since")
+		fmt.Fprintln(stdout, "                accepts a Go duration (24h, 30m, etc.) and keeps")
+		fmt.Fprintln(stdout, "                only sessions whose last event falls inside the window.")
+		fmt.Fprintln(stdout, "  sessions report --session-id=<id> [--format=text|json]")
 		fmt.Fprintln(stdout, "                [--cwd=<project-root>] (defaults to current dir)")
 		return 0
 	default:
@@ -47,11 +56,29 @@ func sessionsList(cfg config.Config, stdout, stderr io.Writer, args []string) in
 
 	fs := flag.NewFlagSet("sessions list", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	var format string
+	var (
+		format   string
+		sinceRaw string
+	)
 	fs.StringVar(&format, "format", "text", "output format: text|json")
+	fs.StringVar(&sinceRaw, "since", "", "keep sessions whose last event is within this window (e.g. 24h, 30m)")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
+	}
+
+	var cutoff time.Time
+	if sinceRaw != "" {
+		d, perr := time.ParseDuration(sinceRaw)
+		if perr != nil {
+			fmt.Fprintf(stderr, "invalid --since value %q: %v\n", sinceRaw, perr)
+			return 2
+		}
+		if d < 0 {
+			fmt.Fprintf(stderr, "invalid --since value %q: must be non-negative\n", sinceRaw)
+			return 2
+		}
+		cutoff = time.Now().UTC().Add(-d)
 	}
 
 	entries, err := heimdall.ReadHookLog(heimdall.ReadHookLogOpts{})
@@ -61,14 +88,40 @@ func sessionsList(cfg config.Config, stdout, stderr io.Writer, args []string) in
 	}
 	agg := heimdall.AggregateHookLogBySession(entries)
 	ids := heimdall.SortedSessionIDs(agg)
+
+	if !cutoff.IsZero() {
+		kept := ids[:0]
+		for _, id := range ids {
+			if agg[id].LastSeen.After(cutoff) || agg[id].LastSeen.Equal(cutoff) {
+				kept = append(kept, id)
+			}
+		}
+		ids = kept
+	}
+
 	if len(ids) == 0 {
-		fmt.Fprintln(stdout, "no sessions in hooks.log (try starting a Claude Code session first)")
+		if format == "json" {
+			enc := json.NewEncoder(stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(map[string]interface{}{
+				"schema_version": SessionsReportSchemaVersion,
+				"sessions":       []any{},
+			})
+			return 0
+		}
+		if !cutoff.IsZero() {
+			fmt.Fprintf(stdout, "no sessions in hooks.log within --since=%s window\n", sinceRaw)
+		} else {
+			fmt.Fprintln(stdout, "no sessions in hooks.log (try starting a Claude Code session first)")
+		}
 		return 0
 	}
 
 	if format == "json" {
 		type listRow struct {
 			SessionID       string `json:"session_id"`
+			FirstSeen       string `json:"first_seen,omitempty"`
+			LastSeen        string `json:"last_seen,omitempty"`
 			PromptEvents    int    `json:"user_prompt_events"`
 			CacheHits       int    `json:"user_prompt_cache_hits"`
 			GuardrailEvents int    `json:"pre_tool_use_events"`
@@ -76,16 +129,26 @@ func sessionsList(cfg config.Config, stdout, stderr io.Writer, args []string) in
 		rows := make([]listRow, 0, len(ids))
 		for _, id := range ids {
 			a := agg[id]
-			rows = append(rows, listRow{
+			row := listRow{
 				SessionID:       id,
 				PromptEvents:    a.UserPromptEvents,
 				CacheHits:       a.UserPromptCacheHits,
 				GuardrailEvents: a.PreToolUseEvents,
-			})
+			}
+			if !a.FirstSeen.IsZero() {
+				row.FirstSeen = a.FirstSeen.UTC().Format(time.RFC3339)
+			}
+			if !a.LastSeen.IsZero() {
+				row.LastSeen = a.LastSeen.UTC().Format(time.RFC3339)
+			}
+			rows = append(rows, row)
 		}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(rows)
+		_ = enc.Encode(map[string]interface{}{
+			"schema_version": SessionsReportSchemaVersion,
+			"sessions":       rows,
+		})
 		return 0
 	}
 
@@ -226,11 +289,14 @@ func renderSessionReportText(w io.Writer, r SessionReport) {
 }
 
 // toJSON renders a map matching the text sections with stable keys.
+// The schema_version key lets downstream consumers detect incompatible
+// changes. Bump SessionsReportSchemaVersion on breaking changes only.
 func (r SessionReport) toJSON() map[string]interface{} {
 	return map[string]interface{}{
-		"session_id":   r.SessionID,
-		"cwd":          r.CWD,
-		"duration_sec": int64(r.Duration.Seconds()),
+		"schema_version": SessionsReportSchemaVersion,
+		"session_id":     r.SessionID,
+		"cwd":            r.CWD,
+		"duration_sec":   int64(r.Duration.Seconds()),
 		"tokens": map[string]int64{
 			"input":          r.Transcript.TotalInputTokens,
 			"cache_creation": r.Transcript.TotalCacheCreationTokens,

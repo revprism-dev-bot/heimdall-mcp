@@ -132,6 +132,12 @@ func ReadHookLog(opts ReadHookLogOpts) ([]HookLogEntry, error) {
 type SessionHookAggregate struct {
 	Session string
 
+	// FirstSeen is the earliest timestamp of any hooks.log entry carrying
+	// this session id; LastSeen is the latest. Both are zero when no
+	// timestamped entries were folded in.
+	FirstSeen time.Time
+	LastSeen  time.Time
+
 	SessionStartEvents int
 	SessionEndEvents   int
 
@@ -162,6 +168,14 @@ func AggregateHookLogBySession(entries []HookLogEntry) map[string]SessionHookAgg
 		}
 		agg := out[e.Session]
 		agg.Session = e.Session
+		if !e.Timestamp.IsZero() {
+			if agg.FirstSeen.IsZero() || e.Timestamp.Before(agg.FirstSeen) {
+				agg.FirstSeen = e.Timestamp
+			}
+			if e.Timestamp.After(agg.LastSeen) {
+				agg.LastSeen = e.Timestamp
+			}
+		}
 		switch e.Event {
 		case "session-start":
 			agg.SessionStartEvents++
