@@ -19,8 +19,13 @@ import (
 )
 
 // userPromptBudgetDefault is the soft wall-clock target the hook aims to hit
-// on the uncached path (plan §3.2: p95 ≤ 250 ms). --budget-ms overrides.
-const userPromptBudgetDefault = 250
+// on the uncached path. Plan §3.2 targets p95 ≤ 250 ms, but real-world
+// dogfooding on CPU-only Ollama shows the first embed after a fresh CLI
+// process reliably exceeds 250 ms (dial + model touch), even when the model
+// is already loaded in memory. Subsequent prompts cache-hit and cost nothing,
+// so the bump only affects the first-of-session prompt. Budget stays under
+// userPromptHardTimeout. --budget-ms overrides.
+const userPromptBudgetDefault = 450
 
 // userPromptHardTimeout is the hard internal ceiling. If a user passes
 // --budget-ms higher than this we raise the hard cap to at least match —

@@ -682,3 +682,18 @@ func TestHookUserPrompt_SkipPromptTooShortStillLogsSession(t *testing.T) {
 		t.Fatalf("expected reason=prompt_too_short in log:\n%s", string(data))
 	}
 }
+
+// Regression pin: the default budget was bumped from 250 → 450 in response
+// to CPU-Ollama dogfood data showing first-of-process embeds exceeding
+// 250 ms even on an already-loaded model. If anyone lowers this back toward
+// the original plan §3.2 target, first-turn context injection silently
+// regresses. Change the test *and* the comment on userPromptBudgetDefault
+// if the bump is being intentionally revisited.
+func TestUserPromptBudgetDefault_PinnedTo450(t *testing.T) {
+	if userPromptBudgetDefault != 450 {
+		t.Fatalf("userPromptBudgetDefault = %d, want 450 (see comment on the constant)", userPromptBudgetDefault)
+	}
+	if userPromptBudgetDefault > userPromptHardTimeout {
+		t.Fatalf("default budget %d exceeds hard cap %d", userPromptBudgetDefault, userPromptHardTimeout)
+	}
+}
