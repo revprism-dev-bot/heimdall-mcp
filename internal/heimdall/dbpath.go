@@ -2,6 +2,7 @@ package heimdall
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,6 +108,44 @@ func ResolveUsableModelDB(ctx context.Context, client modelLister, baseDir, pref
 	}
 
 	return "", ""
+}
+
+// DiscoverSubReposAbs returns the absolute paths of immediate subdirectories
+// of root that contain a `.git` entry (directory or file — `.git` may be a
+// gitlink in worktrees).
+//
+// Unlike DiscoverSubRepos (which silently returns an empty map on a read
+// failure), DiscoverSubReposAbs propagates the underlying ReadDir error so
+// callers can distinguish "no sub-repos" from "couldn't scan". See L1 in the
+// plan review.
+//
+// Symlinks are NOT followed — this matches the industry-standard default
+// (git, fd, ripgrep) and prevents the double-indexing hazard where
+// `outer-a/child` and `outer-b/child` both resolve to the same git repo
+// via a symlink. Any entry whose Type includes os.ModeSymlink is ignored
+// even if it would resolve to a directory with a `.git/` inside.
+func DiscoverSubReposAbs(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read sub-repo root %s: %w", root, err)
+	}
+	var out []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			// Skips regular files. On Unix entry.IsDir is lstat-based, so
+			// symlinks already return false here — the explicit check below
+			// is defense in depth for platforms that behave differently.
+			continue
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		gitPath := filepath.Join(root, entry.Name(), ".git")
+		if _, err := os.Stat(gitPath); err == nil {
+			out = append(out, filepath.Join(root, entry.Name()))
+		}
+	}
+	return out, nil
 }
 
 // DiscoverSubRepos scans immediate subdirectories of root and returns the set

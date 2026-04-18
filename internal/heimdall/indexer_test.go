@@ -387,6 +387,88 @@ func TestDiscoverSubRepos_GitlinkFile(t *testing.T) {
 	}
 }
 
+// TestDiscoverSubReposAbs_ReturnsAbsolutePaths exercises the plan's §4
+// helper: scan immediate subdirectories and return absolute paths of those
+// containing a `.git` entry (dir OR file).
+func TestDiscoverSubReposAbs_ReturnsAbsolutePaths(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "a", ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "b", ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Not a sub-repo — plain directory.
+	if err := os.MkdirAll(filepath.Join(root, "plain"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := DiscoverSubReposAbs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d, want 2 (%v)", len(got), got)
+	}
+	for _, p := range got {
+		if !filepath.IsAbs(p) {
+			t.Errorf("expected absolute path, got %q", p)
+		}
+	}
+}
+
+// TestDiscoverSubReposAbs_ReadErrorPropagates is the L1 regression: an
+// unreadable root must return an error rather than a silent empty slice.
+func TestDiscoverSubReposAbs_ReadErrorPropagates(t *testing.T) {
+	_, err := DiscoverSubReposAbs("/definitely/not/a/real/path/abc123xyz")
+	if err == nil {
+		t.Fatal("expected error for nonexistent root, got nil")
+	}
+}
+
+// TestDiscoverSubReposAbs_IgnoresSymlinks is the M4 regression: symlinks to
+// git repos are NOT auto-discovered (matches git, fd, ripgrep defaults and
+// avoids double-indexing when `outer-a/child -> outer-b/child`).
+func TestDiscoverSubReposAbs_IgnoresSymlinks(t *testing.T) {
+	realRepo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(realRepo, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.Symlink(realRepo, filepath.Join(root, "linked-sub")); err != nil {
+		t.Skipf("symlink unsupported on this platform: %v", err)
+	}
+	got, err := DiscoverSubReposAbs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 discovered (symlinks ignored), got %v", got)
+	}
+}
+
+// TestDiscoverSubReposAbs_GitlinkFile mirrors the gitlink test for the new
+// helper: worktrees must be detected.
+func TestDiscoverSubReposAbs_GitlinkFile(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "wt")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, ".git"), []byte("gitdir: /some/worktrees/wt\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := DiscoverSubReposAbs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1 (%v)", len(got), got)
+	}
+	if filepath.Base(got[0]) != "wt" {
+		t.Errorf("got %q, want basename 'wt'", got[0])
+	}
+}
+
 func TestDiscoverSubRepoDirs_Empty(t *testing.T) {
 	root := t.TempDir()
 	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
