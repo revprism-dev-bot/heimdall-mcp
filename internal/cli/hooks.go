@@ -25,7 +25,7 @@ type HookHandler func(stdin io.Reader, stdout, stderr io.Writer, env map[string]
 // exit code to surface to the shell. Called by RunCLI via a tiny wrapper.
 func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "Usage: heimdall-mcp hooks <tail|cache-clear|cache-stats|doctor|explain-command>")
+		fmt.Fprintln(stderr, "Usage: heimdall-mcp hooks <tail|cache-clear|cache-stats|doctor|explain-command|audit-guardrails>")
 		return 2
 	}
 	sub := args[0]
@@ -41,6 +41,8 @@ func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer,
 		return HooksDoctor(cfg, stdin, stdout, stderr, env, rest)
 	case "explain-command":
 		return HooksExplainCommand(stdin, stdout, stderr, env, rest)
+	case "audit-guardrails":
+		return HooksAuditGuardrails(stdin, stdout, stderr, env, rest)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "heimdall-mcp hooks — operate on the Claude Code hooks subsystem")
 		fmt.Fprintln(stdout)
@@ -49,6 +51,8 @@ func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer,
 		fmt.Fprintln(stdout, "  hooks cache-stats [--project <path>] [--format text|json] [--all-models]")
 		fmt.Fprintln(stdout, "  hooks doctor [--scope=user|project]    Diagnose hooks installation")
 		fmt.Fprintln(stdout, "  hooks explain-command \"<cmd>\"          Classify a Bash command (allow/warn/block)")
+		fmt.Fprintln(stdout, "  hooks audit-guardrails [--since=<dur>] [--format text|json]")
+		fmt.Fprintln(stdout, "                                         Audit PreToolUse shadow-mode verdicts")
 		return 0
 	default:
 		fmt.Fprintf(stderr, "Unknown hooks subcommand: %s\n", sub)

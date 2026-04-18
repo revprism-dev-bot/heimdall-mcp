@@ -298,6 +298,18 @@ promote by setting `HEIMDALL_GUARDRAILS=warn` (`block` mode is the eventual
 target, but only after a false-positive audit). See the rollout section of
 `docs/plans/hooks/08-destructive-op-primitive.md`.
 
+**How to run the audit:**
+`heimdall-mcp hooks audit-guardrails [--since=<dur>] [--format=text|json]`
+reads `hooks.log`, filters to `event=pre-tool-use` entries, and produces a
+structured report: time window, totals by class/mode, top 10 rules by
+block-verdict count, the full list of shadow-mode blocks (the
+false-positive candidate dataset), and a `promote_to_warn` recommendation.
+Promotion flips to `true` when block count in window is zero OR the window
+covers less than 24h; otherwise the top offending rule is surfaced. JSON
+output includes `schema_version: "v1"` so scripts can assert compatibility.
+Typical usage: `heimdall-mcp hooks audit-guardrails --since=168h --format=json`
+after a week of real traffic.
+
 ---
 
 ## Ground truth — where everything lives
