@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
 
 func TestSessionsList_EmptyLog(t *testing.T) {
@@ -758,4 +759,109 @@ func TestSessionsReport_NeitherFlagFails(t *testing.T) {
 	if !strings.Contains(errBuf.String(), "--session-id or --current is required") {
 		t.Errorf("expected required-flag error, got: %s", errBuf.String())
 	}
+}
+
+// TestSemanticDriftToJSON_CompanionCountersNested asserts that the
+// textually-derived `heimdall_non_search_when_hits_present` counter lives
+// inside the `companion_counters` sub-map rather than sitting flat next to
+// the cosine-derived semantic counters (HD-7 decision, 2026-04-18;
+// 12a §6 item 4). The structural split mirrors OpenTelemetry semconv
+// practice and makes the "companion, not semantic" distinction explicit.
+func TestSemanticDriftToJSON_CompanionCountersNested(t *testing.T) {
+	sd := &heimdall.SemanticDriftReport{
+		SemanticRedundantCalls:           4,
+		MissedCallOpportunities:          3,
+		NearThresholdRedundant:           2,
+		NearThresholdMissed:              1,
+		TurnsTotal:                       42,
+		TurnsWithHits:                    31,
+		TurnsSkipped:                     5,
+		TurnsSkippedBy:                   map[string]int{"no_embed": 5},
+		HeimdallNonSearchWhenHitsPresent: 7,
+		ThresholdT1:                      0.55,
+		ThresholdT2:                      0.45,
+		ThresholdVersion:                 1,
+		EmbeddingModel:                   "nomic-embed-text",
+	}
+	raw := semanticDriftToJSON(sd)
+	block, ok := raw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map[string]interface{}, got %T", raw)
+	}
+
+	// Flat counter must NOT be present at the top of the drift block.
+	if _, flat := block["heimdall_non_search_when_hits_present"]; flat {
+		t.Errorf("heimdall_non_search_when_hits_present must not live flat on semantic_drift; expected it inside companion_counters")
+	}
+
+	// Nested map is present and holds the counter.
+	companionRaw, ok := block["companion_counters"]
+	if !ok {
+		t.Fatalf("companion_counters sub-map missing; keys: %v", mapKeys(block))
+	}
+	companion, ok := companionRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("companion_counters is not a map: %T", companionRaw)
+	}
+	got, ok := companion["heimdall_non_search_when_hits_present"]
+	if !ok {
+		t.Fatalf("companion_counters.heimdall_non_search_when_hits_present missing")
+	}
+	// The concrete value type is int (Go's default for the struct field).
+	if gotInt, _ := got.(int); gotInt != 7 {
+		t.Errorf("companion_counters.heimdall_non_search_when_hits_present=%v, want 7", got)
+	}
+
+	// Semantic counters stay flat on the drift block (sanity check — only
+	// the one textual counter moved).
+	for _, key := range []string{
+		"semantic_redundant_calls",
+		"missed_call_opportunities",
+		"near_threshold_redundant",
+		"near_threshold_missed",
+	} {
+		if _, present := block[key]; !present {
+			t.Errorf("expected %q to remain flat on semantic_drift", key)
+		}
+	}
+}
+
+// TestSemanticDriftToJSON_CompanionCountersRoundTrip encodes the drift
+// block through encoding/json and asserts the nested path round-trips —
+// downstream consumers parse JSON, not Go maps, so this guards the wire
+// shape (not just the in-memory shape).
+func TestSemanticDriftToJSON_CompanionCountersRoundTrip(t *testing.T) {
+	sd := &heimdall.SemanticDriftReport{HeimdallNonSearchWhenHitsPresent: 2}
+	raw := semanticDriftToJSON(sd)
+	bs, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(bs, &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, flat := parsed["heimdall_non_search_when_hits_present"]; flat {
+		t.Errorf("flat counter leaked through JSON round-trip: %s", bs)
+	}
+	comp, ok := parsed["companion_counters"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("companion_counters missing from JSON: %s", bs)
+	}
+	v, ok := comp["heimdall_non_search_when_hits_present"]
+	if !ok {
+		t.Fatalf("companion_counters.heimdall_non_search_when_hits_present missing from JSON: %s", bs)
+	}
+	// JSON numbers decode to float64.
+	if f, _ := v.(float64); f != 2 {
+		t.Errorf("round-tripped value=%v, want 2", v)
+	}
+}
+
+func mapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

@@ -430,10 +430,20 @@ Extend `tool_use` in `SessionReport.toJSON` (see PR #39 diff,
     "threshold_t1": 0.55,
     "threshold_t2": 0.45,
     "embedding_model": "nomic-embed-text",
-    "threshold_version": 1
+    "threshold_version": 1,
+    "companion_counters": {
+      "heimdall_non_search_when_hits_present": 7
+    }
   }
 }
 ```
+
+`companion_counters` is a sub-map for **textually-derived** counters
+that live alongside the cosine-derived semantic metrics above. The
+structural split (decided HD-7, 2026-04-18 — see
+[12a §6 item 4](./12a-design-decisions.md)) makes the "companion,
+not semantic" distinction explicit and leaves room for future
+textual counters without polluting the flat `semantic_drift` keyspace.
 
 **Why nested under `semantic_drift`:** keeps top-level `tool_use`
 readable; cleanly separates v2 from v1's flat

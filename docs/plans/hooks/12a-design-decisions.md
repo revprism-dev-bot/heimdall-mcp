@@ -861,10 +861,29 @@ plus a recommendation the human can ratify or reject.
 
    **Status (2026-04-18): RESOLVED — Nest inside `tool_use.semantic_drift.companion_counters` sub-map. Executed as code follow-up F5.**
 
-   - *Recommendation:* ship it inside `semantic_drift` as a
-     `companion_counters` sub-map — keeps the drift block
+   - *Decision (HD-7, 2026-04-18):* ship it inside `semantic_drift`
+     under a `companion_counters` sub-map — keeps the drift block
      self-contained and makes the "we added a companion metric, not
-     a semantic one" distinction explicit via structure.
+     a semantic one" distinction explicit via structure. PR #58
+     initially shipped the counter flat at
+     `tool_use.semantic_drift.heimdall_non_search_when_hits_present`;
+     the follow-up PR moves it to
+     `tool_use.semantic_drift.companion_counters.heimdall_non_search_when_hits_present`.
+     No `schema_version` bump — the change is internal to `tool_use`,
+     and `tool_use` is additive-only per plan 12 §6.3.
+
+   The resulting JSON shape:
+
+   ```json
+   "semantic_drift": {
+     "semantic_redundant_calls": 4,
+     "missed_call_opportunities": 3,
+     "...": "...",
+     "companion_counters": {
+       "heimdall_non_search_when_hits_present": 7
+     }
+   }
+   ```
 
 ---
 

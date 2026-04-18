@@ -522,20 +522,29 @@ func semanticDriftToJSON(sd *heimdall.SemanticDriftReport) interface{} {
 		return nil
 	}
 	block := map[string]interface{}{
-		"semantic_redundant_calls":             sd.SemanticRedundantCalls,
-		"missed_call_opportunities":            sd.MissedCallOpportunities,
-		"near_threshold_redundant":             sd.NearThresholdRedundant,
-		"near_threshold_missed":                sd.NearThresholdMissed,
-		"turns_total":                          sd.TurnsTotal,
-		"turns_with_hits":                      sd.TurnsWithHits,
-		"turns_skipped":                        sd.TurnsSkipped,
-		"turns_skipped_by_reason":              sd.TurnsSkippedBy,
-		"heimdall_non_search_when_hits_present": sd.HeimdallNonSearchWhenHitsPresent,
-		"threshold_t1":                         sd.ThresholdT1,
-		"threshold_t2":                         sd.ThresholdT2,
-		"threshold_version":                    sd.ThresholdVersion,
-		"embedding_model":                      sd.EmbeddingModel,
-		"near_threshold_delta":                 heimdall.NearThresholdDelta,
+		"semantic_redundant_calls":  sd.SemanticRedundantCalls,
+		"missed_call_opportunities": sd.MissedCallOpportunities,
+		"near_threshold_redundant":  sd.NearThresholdRedundant,
+		"near_threshold_missed":     sd.NearThresholdMissed,
+		"turns_total":               sd.TurnsTotal,
+		"turns_with_hits":           sd.TurnsWithHits,
+		"turns_skipped":             sd.TurnsSkipped,
+		"turns_skipped_by_reason":   sd.TurnsSkippedBy,
+		"threshold_t1":              sd.ThresholdT1,
+		"threshold_t2":              sd.ThresholdT2,
+		"threshold_version":         sd.ThresholdVersion,
+		"embedding_model":           sd.EmbeddingModel,
+		"near_threshold_delta":      heimdall.NearThresholdDelta,
+		// companion_counters holds textually-derived counters that sit
+		// alongside the cosine-derived semantic metrics above. They are
+		// NOT part of the cosine signal — they come from transcript
+		// inspection (e.g. "hits present + model used heimdall_ls").
+		// Grouping them in a sub-map mirrors OpenTelemetry semconv
+		// practice and makes the "companion, not semantic" distinction
+		// explicit to downstream consumers (HD-7 decision, 2026-04-18).
+		"companion_counters": map[string]interface{}{
+			"heimdall_non_search_when_hits_present": sd.HeimdallNonSearchWhenHitsPresent,
+		},
 	}
 	// Per-turn rows only when --verbose was set. Absent entirely (not
 	// empty array) when verbose is off, keeping the headline JSON small.
