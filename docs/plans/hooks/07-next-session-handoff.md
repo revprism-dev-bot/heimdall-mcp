@@ -9,18 +9,17 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> **Status at `main` @ commit `c3d28ca` (2026-04-18 evening):** clean
-> tree, **7 more PRs merged this session (#52–#58)** on top of the
+> **Status at `main` @ commit `54966b8` (2026-04-18 late evening):** clean
+> tree, **12 more PRs merged this session (#52–#63)** on top of the
 > earlier 2026-04-18 afternoon batch (#39–#49). Full suite green under
 > `go test ./... -race -count=1`. `go vet ./...` clean.
 > `heimdall-mcp hooks smoke --fake-ollama` → **6/6 PASS**. Binary at
 > `/home/noname/.local/bin/heimdall-mcp` → symlink →
-> `/home/noname/Code/heimdall-mcp/heimdall-mcp`, reports `(c3d28ca)`
+> `/home/noname/Code/heimdall-mcp/heimdall-mcp`, reports `(54966b8)`
 > after rebuild. **First action: rebuild, then pick an item from the
-> priority list below. Every non-time-gated item from the prior
-> handoff's punch list has shipped — the remaining work is telemetry
-> collection, calibration-gated rollouts, and human sign-off on seven
-> flagged product decisions (see §Human sign-off queue).**
+> priority list below. All seven human sign-offs are recorded and every
+> code follow-up they spawned has shipped — the remaining work is
+> telemetry collection and calibration-gated rollouts.**
 >
 > **Priority punch list (pick in order, none are blocking each other):**
 >
@@ -52,19 +51,14 @@ point at this file.
 >    zero false-positive candidates, flip default
 >    `HEIMDALL_GUARDRAILS=shadow → warn`.
 >
-> 5. **Follow-up PRs identified this session** (see §Follow-up PRs):
->    - 3-line `calibrate-drift` refactor: switch direct
->      `store.DB().QueryRow` to `store.VectorByID(id)`.
->    - Plan 11 §5.5 F5 `model_missing` logging: wire into
->      `hooks doctor` once that check lands.
->    - README guardrails paragraph: one-paragraph note on the LLM
->      fallback with a link to `docs/reference/llm-classifier.md`.
->
-> 6. **Human sign-off queue (7 items).** **All 7 resolved 2026-04-18.**
->    HD-5 + HD-7 spawn code follow-ups (F4 `hooks.log` cap bump 5 MB
->    → 10 MB; F5 nest `heimdall_non_search_when_hits_present` under
->    `tool_use.semantic_drift.companion_counters`) shipping as separate
->    PRs. See the §Human sign-off queue table below for each decision.
+> 5. **Human sign-off queue (7 items).** **All 7 resolved 2026-04-18**,
+>    and every code follow-up they spawned has shipped: F1/F2/F3 as #61
+>    (`calibrate-drift` → `store.VectorByID`, `hooks doctor` check #8
+>    for `llm classifier model`, README guardrails paragraph), F4 as
+>    #62 (`hooks.log` cap 5 MB → 10 MB), F5 as #63 (nest
+>    `heimdall_non_search_when_hits_present` under
+>    `tool_use.semantic_drift.companion_counters`). See the §Human
+>    sign-off queue table below for each decision.
 >
 > **This session's shipped PRs (afternoon → evening, 2026-04-18):**
 > Morning/afternoon batch #39–#49 (prior handoff, for context).
@@ -95,6 +89,19 @@ point at this file.
 >   JSON/text wire-up` (`c3d28ca`) — `semantic_drift.go` + sessions.go
 >   wiring, 24 drift tests + 8 siblings. `--verbose` flag, reserved
 >   `--scope-aware`.
+> - **#60** `docs(hooks): record HD-1..HD-7 sign-off decisions
+>   (2026-04-18)` — doc-only; pins each resolution into 11a/12a +
+>   §Human sign-off queue table.
+> - **#61** `chore: plan 11/12 follow-ups (calibrate-drift refactor,
+>   hooks doctor, README)` — ships F1 (`calibrate-drift` switches to
+>   `store.VectorByID`), F2 (new `hooks doctor` check #8 for `llm
+>   classifier model`, 6 test paths), F3 (README guardrails paragraph
+>   on LLM fallback).
+> - **#62** `chore(hooks): bump hooks.log rotation cap 5 MB → 10 MB
+>   (HD-5)` — implements HD-5 / 12a §6 item 2 (F4).
+> - **#63** `refactor(sessions): nest heimdall_non_search_when_hits_present
+>   in companion_counters` (`54966b8`) — implements HD-7 / 12a §6
+>   item 4 (F5).
 >
 > **Prior merged work (reference only, don't re-litigate):**
 > 2026-04-18 afternoon shipped PRs #39–#49 (Wave F follow-ups,
@@ -143,15 +150,16 @@ point at this file.
 > go build ./... && go vet ./... && go test ./... -race -count=1
 > heimdall-mcp hooks smoke --fake-ollama   # 6/6 PASS
 > ```
-> Expect: clean tree on top of `c3d28ca`. All tests pass.
+> Expect: clean tree on top of `54966b8`. All tests pass.
 
 ---
 
-## 2026-04-18 evening session — what shipped (PRs #52–#58)
+## 2026-04-18 evening session — what shipped (PRs #52–#63)
 
-Seven PRs closing every non-time-gated item from the prior handoff
-(#39–#49 punch list items 1–7). All merged to `main`, commit range
-`3701954..c3d28ca`.
+Twelve PRs closing every non-time-gated item from the prior handoff
+(#39–#49 punch list items 1–7) plus all seven HD-1..HD-7 sign-offs
+and the code follow-ups they spawned. All merged to `main`, commit
+range `3701954..54966b8`.
 
 **Investigation / consolidation (1 PR):**
 - **#52 `chore(sessions): consolidate cache-hit counters + deprecate
@@ -211,7 +219,7 @@ Seven PRs closing every non-time-gated item from the prior handoff
   (per 12a OQ-5). 24 drift-specific tests + 8 sibling coverage tests.
 
 **Verification:**
-- Full suite green under `-race -count=1` at `c3d28ca`.
+- Full suite green under `-race -count=1` at `54966b8`.
 - `hooks smoke --fake-ollama` → 6/6 PASS.
 - `bench-retrieval` auto-scope (PR #41, prior session) re-verified
   at session start.
@@ -220,15 +228,9 @@ Seven PRs closing every non-time-gated item from the prior handoff
 
 ---
 
-## Follow-up PRs (identified this session, not yet scheduled)
+## Follow-up PRs
 
-Small, independent, none of them gate any of the priority work.
-
-| # | PR idea | Size | Notes |
-|---|---|---|---|
-| F1 | `refactor(calibrate-drift)`: switch `store.DB().QueryRow` → `store.VectorByID(id)` | ~3 lines | Agent G noted during #58 review; now unblocked because #58 merged. Pure refactor, same behavior. |
-| F2 | `feat(doctor)`: wire Plan 11 §5.5 F5 `model_missing` logging into `hooks doctor` | ~1 check | Agent E deferred during #57 scope review. Surfaces a clean hint when `HEIMDALL_LLM_CLASSIFIER=1` is set but the configured model isn't pulled. |
-| F3 | `docs(readme)`: add one paragraph on LLM classifier fallback + link to `docs/reference/llm-classifier.md` | ~5 lines | Intentionally out-of-scope for #57. |
+All 2026-04-18 follow-ups shipped: F1/F2/F3 as #61, F4 as #62, F5 as #63.
 
 ---
 
@@ -245,15 +247,13 @@ allowed to pick the FP rate or commit operator hours to labeling).
 | **11a HD-2** | Auto-pull UX on first `HEIMDALL_LLM_CLASSIFIER=1` | **Resolved 2026-04-18: Never auto-pull. Surface a one-line hint via the Tier-B suppressor pointing at `ollama pull <model>`. Fall back to static classifier if model missing.** | 11a §4 |
 | **11a HD-3** | `prompt_version` bump policy | **Resolved 2026-04-18: Bump on any non-whitespace, non-comment character change. Pair bump with a CHANGELOG entry.** | 11a §4 |
 | **12a §6 item 1** | Operator labeling commitment (~5 h for 100 turns) | **Resolved 2026-04-18: Commit to a 5-hour labeling block ~2026-05-02 (after 2-week Stage 1 soak). Do not ship Stage 3 without labels.** | `docs/plans/hooks/12a-design-decisions.md` §6 |
-| **12a §6 item 2** | Stage 1 log-cap sharing (hit_ids + prompt_embed_b64) | **Resolved 2026-04-18: Prophylactic cap bump: 5 MB → 10 MB. Executed as code follow-up F4.** | 12a §6 |
+| **12a §6 item 2** | Stage 1 log-cap sharing (hit_ids + prompt_embed_b64) | **Resolved 2026-04-18: Prophylactic cap bump: 5 MB → 10 MB. Shipped as #62 (F4).** | 12a §6 |
 | **12a §6 item 3** | Embedding-model migration ownership | **Resolved 2026-04-18: Post-v2 follow-up: record `embedding_model` in the calibration artifact and add a pre-flight warn in `sessions report` when the artifact's model ≠ current store's model.** | 12a §6 |
-| **12a §6 item 4** | `heimdall_non_search_when_hits_present` placement | **Resolved 2026-04-18: Nest inside `tool_use.semantic_drift.companion_counters` sub-map. Executed as code follow-up F5.** | 12a §6 |
+| **12a §6 item 4** | `heimdall_non_search_when_hits_present` placement | **Resolved 2026-04-18: Nest inside `tool_use.semantic_drift.companion_counters` sub-map. Shipped as #63 (F5).** | 12a §6 |
 
-All seven decisions were recorded in the design docs on 2026-04-18.
-HD-5 (12a §6 item 2) and HD-7 (12a §6 item 4) spawn code follow-ups
-(F4 raises the `hooks.log` cap to 10 MB; F5 nests the companion
-counter under `tool_use.semantic_drift.companion_counters`); both
-ship as separate PRs.
+All seven decisions were recorded in the design docs on 2026-04-18
+(PR #60). HD-5 (12a §6 item 2) shipped as #62; HD-7 (12a §6 item 4)
+shipped as #63. F1/F2/F3 (Plan 11 follow-ups) shipped as #61.
 
 ---
 
@@ -390,7 +390,7 @@ From `docs/plans/hooks/06-decisions.md`:
   2026-04-18). If rotation fires >1×/14 days, revisit per 12a §6
   item 2.
 - **`hooks smoke --fake-ollama` (PR #47)** validates all 6 hooks
-  end-to-end without a real Claude Code restart. 6/6 PASS at `c3d28ca`.
+  end-to-end without a real Claude Code restart. 6/6 PASS at `54966b8`.
 
 ---
 
@@ -463,10 +463,15 @@ From `docs/plans/hooks/06-decisions.md`:
 
 ---
 
-## Final git state at session end (2026-04-18 evening)
+## Final git state at session end (2026-04-18 late evening)
 
 ```
-$ git log --oneline -8
+$ git log --oneline -13
+54966b8 refactor(sessions): nest heimdall_non_search_when_hits_present in companion_counters (#63)
+7a5933e chore: plan 11/12 follow-ups (calibrate-drift refactor, hooks doctor, README) (#61)
+c78309d chore(hooks): bump hooks.log rotation cap 5 MB → 10 MB (HD-5) (#62)
+1821f6d docs(hooks): record HD-1..HD-7 sign-off decisions (2026-04-18) (#60)
+9c6be56 docs(handoff): refresh for 2026-04-18 evening session (PRs #52-#58) (#59)
 c3d28ca feat(sessions): plan-12 stage-2 semantic-drift compute + JSON/text wire-up (#58)
 b3524c4 feat(calibrate-drift): T1xT2 threshold-sweep harness for semantic-drift metric (#56)
 9f345a8 feat(guardrails): plan 11 stage 0 — LLM classifier fallback (opt-in) (#57)
@@ -477,10 +482,10 @@ e6b2490 docs(hooks): design decisions for plan 11 (LLM classifier fallback) (#53
 3701954 docs(handoff): refresh for 2026-04-18 session (PRs #39-#49) (#51)
 ```
 
-Main is **in sync with `origin/main`** at `c3d28ca`. All 7 of
-2026-04-18 evening's PRs (#52–#58) merged. Binary at
+Main is **in sync with `origin/main`** at `54966b8`. All 12 of
+2026-04-18's evening+late-evening PRs (#52–#63) merged. Binary at
 `/home/noname/.local/bin/heimdall-mcp` rebuilt and reports
-`(c3d28ca)`. Hooks installed at
+`(54966b8)`. Hooks installed at
 `/home/noname/Code/heimdall-mcp/.claude/settings.json` (6 hooks,
 template envelope `wave2-phase3`). Plan 11 Stage 0 code path present
 but OFF by default.
@@ -492,11 +497,9 @@ but OFF by default.
 2. **Plan 12 Stage 1 data accumulation** — no action; just let
    traffic flow. Calibration window opens ~2026-05-02.
 3. **Human sign-off queue** (7 items, see §Human sign-off queue).
-   **All 7 resolved 2026-04-18.** HD-5 + HD-7 spawn follow-up PRs
-   F4 + F5.
+   **All 7 resolved 2026-04-18**; F1/F2/F3 shipped as #61, F4 as
+   #62, F5 as #63. Queue is closed.
 4. **PreToolUse shadow-mode audit** — run `hooks audit-guardrails`
    ~2026-04-25, flip `shadow → warn` if report recommends promotion.
 5. **UserPromptSubmit cache-hit ratio over sessions** — surfaced in
    `sessions report` JSON. Track over weeks.
-6. **Follow-up PRs F1/F2/F3** — small, none blocking. File when
-   convenient.
