@@ -61,13 +61,17 @@ point at this file.
 >    semantic-drift rollout per plan 12. Design details in the plan's
 >    §Calibration section; OQ-3 in §9 is the main open question.
 >
-> 7. **Cosmetic: cache-hit ratio consolidation.** PR #43 added
->    top-level `user_prompt_cache_hits` / `user_prompt_cache_total`
->    to `SessionReport`, but `heimdall_contribution.cache_hits`
->    already exposed an identical counter. For a future v2, either
->    consolidate to one field or document the intended semantic split
->    (per-hook vs whole-session scope). Not urgent — additive fields
->    don't bump `schema_version: "v1"`.
+> 7. **✅ Resolved: cache-hit ratio consolidation.** Investigation
+>    confirmed `heimdall_contribution.cache_hits` and the top-level
+>    `user_prompt_cache_hits` read from the same
+>    `SessionHookAggregate.UserPromptCacheHits` counter — no semantic
+>    split. The top-level pair (with companion
+>    `user_prompt_cache_total` denominator) is now the canonical source;
+>    `heimdall_contribution.cache_hits` is retained as a deprecated
+>    back-compat alias and documented as such in `sessions.go toJSON()`.
+>    A new test (`TestSessionsReport_CacheHitsAliasMatchesTopLevel`)
+>    asserts the two fields never diverge. Schema stays `v1` — safe to
+>    drop the alias on a future v2 revision.
 >
 > **This session's shipped PRs (all merged, for reference):**
 > - **#39** `feat(sessions): add redundant_heimdall_calls to SessionReport`
@@ -841,10 +845,14 @@ telemetry.
    false-positive candidates.
 6. **`cmd/calibrate-drift` harness** — gates Stage 2→3 of semantic-drift
    rollout per plan 12.
-7. **Cache-hit ratio consolidation** — PR #43 added top-level
-   `user_prompt_cache_hits` alongside the pre-existing
-   `heimdall_contribution.cache_hits`. Either consolidate or document the
-   semantic split in a future v2.
+7. ~~**Cache-hit ratio consolidation**~~ — ✅ Resolved: investigation
+   confirmed the two fields share the same underlying counter (no
+   semantic split). The top-level `user_prompt_cache_hits` /
+   `user_prompt_cache_total` pair is canonical;
+   `heimdall_contribution.cache_hits` is retained as a deprecated
+   back-compat alias with a `// Deprecated:` comment in `sessions.go`.
+   `TestSessionsReport_CacheHitsAliasMatchesTopLevel` asserts the
+   invariant. Schema stays `v1`; alias can drop on a future v2.
 
 **Manual / dogfood-only (not dispatchable work):**
 - **Dogfood the 6-hook pipeline on reopen.** First-actions block at the top

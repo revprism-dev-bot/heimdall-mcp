@@ -2181,3 +2181,13 @@ JSON format: a flat object with the same sections under typed keys, see
 - `user_prompt_cache_total: int` — same as the M above.
 
 Schema stays `schema_version: "v1"` — both are additive keys.
+
+**Deprecated back-compat alias:** `heimdall_contribution.cache_hits`
+predates PR #43 (shipped in the initial PR #28) and emits the same
+integer as the canonical top-level `user_prompt_cache_hits`. Both read
+from `SessionHookAggregate.UserPromptCacheHits`. The nested alias is
+retained for back-compat (no schema bump) but new consumers should read
+the top-level pair so they get both numerator *and* denominator for the
+hit-ratio calculation. The alias is safe to remove on a future
+`schema_version: "v2"` revision. See the `toJSON()` doc comment in
+`internal/cli/sessions.go` for the authoritative note.
