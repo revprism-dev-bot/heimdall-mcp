@@ -1026,6 +1026,72 @@ func TestIndexer_NoFileCountCap(t *testing.T) {
 	}
 }
 
+// TestIndexSubRepos_StampsEmbeddingDim is the H2 regression test:
+// IndexSubRepos MUST stamp both embedding_model AND embedding_dim on the
+// sub-repo store, matching what the outer indexer (cli.go:352-354 and
+// tools.go:336-340) does for the outer store.
+//
+// Without embedding_dim, VerifyHookIndexDim rejects the store with
+// ErrIndexDimMismatch, breaking the hook path for any search scoped to a
+// sub-repo.
+func TestIndexSubRepos_StampsEmbeddingDim(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+
+	const dim = 5
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: dim}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	subResults, err := idx.IndexSubRepos(context.Background(), "test-model", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subResults) != 1 {
+		t.Fatalf("got %d sub-results, want 1", len(subResults))
+	}
+	if subResults[0].Err != nil {
+		t.Fatalf("sub-repo failed: %v", subResults[0].Err)
+	}
+
+	// Open the sub-repo store and verify both metadata fields are populated.
+	subDBDir := ModelDBDir(subResults[0].DBPath, "test-model")
+	subStore, err := OpenStore(subDBDir)
+	if err != nil {
+		t.Fatalf("open sub-store: %v", err)
+	}
+	defer subStore.Close()
+
+	if got := subStore.GetMetadata("embedding_model"); got != "test-model" {
+		t.Errorf("embedding_model = %q, want %q", got, "test-model")
+	}
+	gotDim := subStore.GetMetadata("embedding_dim")
+	if gotDim == "" {
+		t.Fatalf("embedding_dim metadata missing — hook verification will reject this store")
+	}
+	wantDim := fmt.Sprintf("%d", dim)
+	if gotDim != wantDim {
+		t.Errorf("embedding_dim = %q, want %q", gotDim, wantDim)
+	}
+
+	// Cross-check by invoking VerifyHookIndexDim directly — this is the
+	// real consumer that was failing before the fix.
+	if err := VerifyHookIndexDim(subStore, dim); err != nil {
+		t.Errorf("VerifyHookIndexDim(sub-store, %d) = %v, want nil", dim, err)
+	}
+}
+
 // TestIndexer_NoFileSizeCap verifies that files larger than the former
 // 100 KB cap are indexed end-to-end. The chunker handles the split.
 func TestIndexer_NoFileSizeCap(t *testing.T) {

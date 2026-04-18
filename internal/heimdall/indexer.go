@@ -223,6 +223,16 @@ func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, _ SubRepoOp
 		subRes.Err = indexErr
 		if indexErr == nil {
 			subStore.SetMetadata("embedding_model", effectiveModel)
+			// Also stamp embedding_dim so VerifyHookIndexDim accepts this
+			// store on the hook path. Missing dim metadata is a
+			// hard-fail there (returns ErrIndexDimMismatch). One test
+			// embed is cheap and matches the outer-indexer pattern at
+			// cli.go:352-354 and tools.go:336-340.
+			if subStore.GetMetadata("embedding_dim") == "" {
+				if vec, embedErr := idx.embedder.Embed(ctx, "test"); embedErr == nil {
+					subStore.SetMetadata("embedding_dim", fmt.Sprintf("%d", len(vec)))
+				}
+			}
 		}
 		if closeErr := subStore.Close(); closeErr != nil && subRes.Err == nil {
 			subRes.Err = fmt.Errorf("close sub-repo store %s: %w", subDBDir, closeErr)
