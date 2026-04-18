@@ -172,6 +172,17 @@ func parseAuditFlags(args []string) (auditFlags, error) {
 	return f, nil
 }
 
+// knownClasses enumerates every classifier bucket that `hooks
+// audit-guardrails` surfaces as a first-class count. Keeping these
+// seeded (at zero) guarantees the text report and the JSON payload are
+// symmetric across windows — a window with no `unknown` verdicts still
+// renders `unknown=0` so operators don't have to wonder whether the key
+// is missing because nothing matched or because the audit tool predates
+// ClassUnknown. See plan 11 §2.1 / plan 08 §8 (rollout): Unknown is the
+// LLM-fallback extension point and needs to be observable before
+// promotion, not after.
+var knownClasses = []string{"allow", "warn", "block", "unknown"}
+
 // aggregateAudit folds pre-filtered `event=pre-tool-use` entries into the
 // summary shape. Callers must pre-filter by event to keep this function
 // event-agnostic (and trivially testable with canned inputs).
@@ -183,6 +194,12 @@ func aggregateAudit(entries []heimdall.HookLogEntry, windowFrom, windowTo time.T
 		CountsByMode:           map[string]int{},
 		TopRules:               []ruleStat{},
 		FalsePositiveCandidate: []fpCandidate{},
+	}
+	// Seed every known class at zero so the JSON payload always
+	// includes the `unknown` key (and every other bucket) even on a
+	// fresh log. Additive change — schema_version stays v1.
+	for _, k := range knownClasses {
+		s.CountsByClass[k] = 0
 	}
 	if hasWindow {
 		s.WindowFrom = windowFrom.Format(time.RFC3339)
@@ -353,7 +370,12 @@ func renderAuditText(w io.Writer, s auditSummary) {
 
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "## Counts by class")
-	for _, k := range sortedKeysWithDefaults(s.CountsByClass, []string{"allow", "warn", "block"}) {
+	// knownClasses includes `unknown` — the "no rule matched" bucket
+	// introduced by plan 11 §2.1. Unknown is NOT a promotion blocker
+	// (see the recommendation logic above) and NEVER appears in the FP
+	// candidate list, but it IS reported here so reviewers can see how
+	// much traffic is hitting the future LLM-fallback extension point.
+	for _, k := range sortedKeysWithDefaults(s.CountsByClass, knownClasses) {
 		fmt.Fprintf(w, "  %s=%d\n", k, s.CountsByClass[k])
 	}
 

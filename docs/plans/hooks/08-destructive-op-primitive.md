@@ -409,7 +409,11 @@ by class/mode, top offending rules, the full shadow-mode block dataset
 (the false-positive candidate list reviewers must eyeball), and a
 `promote_to_warn` recommendation. The recommendation is `true` iff
 block count in window == 0 OR window covers <24h; otherwise `false`
-with the top offender called out. Run after ≥1 day of real traffic:
+with the top offender called out. `class=unknown` verdicts (the plan 11
+§2.1 LLM-fallback fall-through) are surfaced in `counts_by_class` so
+reviewers can see how much traffic is hitting that extension point, but
+they do NOT affect promotion and are never listed as false-positive
+candidates. Run after ≥1 day of real traffic:
 `heimdall-mcp hooks audit-guardrails --since=168h --format=json`.
 
 **Install behavior:** `install-hooks` adds the `PreToolUse` entry by
