@@ -26,6 +26,14 @@ type Config struct {
 	MaxChunksPerProject  int      `json:"maxChunksPerProject"`
 	EmbedBatchSize       int      `json:"embedBatchSize"`
 	IndexedPaths         []string `json:"indexedPaths"`
+	// LLMClassifierModel names the Ollama instruct model consulted by the
+	// PreToolUse guardrail's optional LLM fallback. Empty (the default)
+	// disables the fallback regardless of HEIMDALL_LLM_CLASSIFIER. The
+	// fallback is strictly opt-in at BOTH the env-var and config layers —
+	// see docs/plans/hooks/11-llm-classification-fallback.md §3.3 / §5 and
+	// docs/plans/hooks/11a-design-decisions.md §5.4. Recommended value:
+	// "llama3.2:3b" (primary) with "qwen2.5-coder:3b" as fallback.
+	LLMClassifierModel string `json:"llmClassifierModel,omitempty"`
 }
 
 // DefaultConfig returns sensible defaults.

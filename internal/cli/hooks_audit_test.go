@@ -447,3 +447,43 @@ func TestDispatchHooks_Help_MentionsAuditGuardrails(t *testing.T) {
 		t.Errorf("help must list audit-guardrails; got:\n%s", out.String())
 	}
 }
+
+// Plan 11a §5.4 item 9: audit-guardrails must bucket `class=unknown →
+// llm:<class>` verdicts and `prompt_version=N` in separate sections.
+func TestHooksAudit_LLMVerdictsAndPromptVersion(t *testing.T) {
+	seedAuditLog(t, []string{
+		// Three classify rows whose rule_id is `llm:<model>`. The LLM
+		// fallback upgraded ClassUnknown to allow/warn/block.
+		`2026-04-18T10:00:00Z INFO event=pre-tool-use stage=classify mode=block class=allow rule_id=llm:llama3.2:3b reason=benign`,
+		`2026-04-18T10:00:01Z INFO event=pre-tool-use stage=classify mode=block class=warn  rule_id=llm:llama3.2:3b reason=r`,
+		`2026-04-18T10:00:02Z WARN event=pre-tool-use stage=classify mode=block class=block rule_id=llm:llama3.2:3b reason=p`,
+		// Two llm.classifier.classify telemetry rows, one per prompt version.
+		`2026-04-18T10:00:03Z INFO event=pre-tool-use stage=llm.classifier.classify model=llama3.2:3b prompt_version=1 elapsed_ms=120 class=allow reason_len=12`,
+		`2026-04-18T10:00:04Z INFO event=pre-tool-use stage=llm.classifier.classify model=llama3.2:3b prompt_version=2 elapsed_ms=110 class=warn reason_len=14`,
+	})
+	out, errBuf, code := runAudit(t, "--format=json", "--since=24h")
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errBuf)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("bad JSON: %v\n%s", err, out)
+	}
+	verdicts, ok := payload["llm_verdicts"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected llm_verdicts map; got %v", payload["llm_verdicts"])
+	}
+	want := map[string]float64{"allow": 1, "warn": 1, "block": 1}
+	for k, v := range want {
+		if verdicts[k] != v {
+			t.Errorf("llm_verdicts[%q]=%v, want %v", k, verdicts[k], v)
+		}
+	}
+	pv, ok := payload["llm_prompt_versions"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected llm_prompt_versions map; got %v", payload["llm_prompt_versions"])
+	}
+	if pv["1"] != float64(1) || pv["2"] != float64(1) {
+		t.Errorf("llm_prompt_versions split missing; got %v", pv)
+	}
+}

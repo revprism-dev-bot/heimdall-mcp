@@ -26,6 +26,7 @@
 package heimdall
 
 import (
+	"context"
 	"regexp"
 	"strings"
 )
@@ -370,7 +371,22 @@ func isEnvAssignment(tok string) bool {
 // This function is pure and allocation-light: it does a string trim, a
 // single normalization pass, and a fixed-size regex sweep. It never touches
 // disk, the network, or the clock.
+//
+// Refactor note (plan 11 §7.4 / 11a §5 item 13): this function delegates
+// to classifyStatic. The determinism guard in destructive_ops_test.go
+// lives on classifyStatic so that, once a Classifier with an LLM fallback
+// is wired up at the hook-handler layer, the pure static-layer contract
+// remains directly testable without stubbing the LLM out.
 func ClassifyBashCommand(cmd string) (Classification, string, string) {
+	return classifyStatic(cmd)
+}
+
+// classifyStatic is the pure, deterministic static-rule layer. No I/O,
+// no goroutines, no randomness — safe to repeat-call and assert against.
+// Callers that want the LLM overlay construct a Classifier and call
+// Classify; callers that want today's static-only behavior call
+// ClassifyBashCommand which delegates here.
+func classifyStatic(cmd string) (Classification, string, string) {
 	norm := normalizeCommand(cmd)
 	if norm == "" {
 		// An empty / whitespace-only command isn't really a command at
@@ -412,6 +428,71 @@ func ClassifyBashCommand(cmd string) (Classification, string, string) {
 
 	// Nothing matched: not recognized — neither safe nor unsafe.
 	return ClassUnknown, "", ""
+}
+
+// -----------------------------------------------------------------------
+// Classifier — static rules + optional LLM fallback overlay.
+// -----------------------------------------------------------------------
+
+// Classifier bundles the static rule table with an optional LLM fallback
+// consulted ONLY when the static layer returns ClassUnknown. The zero
+// value (LLM==nil) is static-only and matches today's behavior exactly —
+// so a `Classifier{}` is a drop-in for code that previously called
+// ClassifyBashCommand.
+//
+// Wiring for the PreToolUse hook happens in internal/cli/hook_pre_tool_use.go;
+// the hook-handler layer owns (a) the env-var gate (HEIMDALL_LLM_CLASSIFIER),
+// (b) the timeout context, and (c) the per-error WARN/ERROR log shapes.
+// The Classifier itself is intentionally small: it runs the static layer
+// and, if Unknown, forwards to LLM.ClassifyBash.
+type Classifier struct {
+	// LLM is the optional second-pass classifier. nil → static-only.
+	LLM LLMClassifier
+}
+
+// Classify runs the static rules and, on ClassUnknown with a non-nil LLM,
+// forwards to the LLM fallback. Returns (class, reason, ruleID) in the
+// same shape as ClassifyBashCommand.
+//
+// On LLM error (timeout, unreachable, bad response), returns the
+// underlying ClassUnknown with empty reason/ruleID — the caller is
+// expected to fail open at its own surface (the hook handler collapses
+// Unknown to exit-0 allow per plan 11 §2.1) and log the error.
+//
+// The caller MUST pass a ctx with a deadline when c.LLM is non-nil. We do
+// NOT apply a default timeout here; the hook handler wraps ctx with
+// context.WithTimeout so the timeout value is observable in one place
+// (HEIMDALL_LLM_CLASSIFIER_TIMEOUT_MS) and capped at the handler budget.
+//
+// This method returns the LLM error as a 4th return value so the caller
+// can discriminate success from ClassUnknown-fail-open — we do that via a
+// package-private helper rather than changing the 3-tuple public shape
+// (see ClassifyWithErr below).
+func (c *Classifier) Classify(ctx context.Context, cmd string) (Classification, string, string) {
+	class, reason, ruleID, _ := c.ClassifyWithErr(ctx, cmd)
+	return class, reason, ruleID
+}
+
+// ClassifyWithErr is the error-exposing variant of Classify. The hook
+// handler uses this so it can log per-failure-mode events (F1 timeout,
+// F2 unreachable, F3 bad response) distinct from the ClassUnknown
+// fall-through. On success err is nil; on LLM failure err is non-nil and
+// the returned class is ClassUnknown (the static verdict that triggered
+// the call) so fail-open semantics are preserved.
+func (c *Classifier) ClassifyWithErr(ctx context.Context, cmd string) (Classification, string, string, error) {
+	class, reason, ruleID := classifyStatic(cmd)
+	if class != ClassUnknown || c == nil || c.LLM == nil {
+		return class, reason, ruleID, nil
+	}
+
+	llmClass, llmReason, err := c.LLM.ClassifyBash(ctx, cmd)
+	if err != nil {
+		// Fail open: return the original Unknown so the caller's
+		// existing Unknown-handling surface (exit 0 in every mode)
+		// stays load-bearing for the error path.
+		return ClassUnknown, "", "", err
+	}
+	return llmClass, llmReason, "", nil
 }
 
 // DestructiveRuleCount returns the number of rules currently shipped in the
