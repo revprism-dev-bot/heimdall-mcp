@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -44,6 +46,8 @@ func DispatchSessions(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 		fmt.Fprintln(stdout, "                only sessions whose last event falls inside the window.")
 		fmt.Fprintln(stdout, "  sessions report (--session-id=<id> | --current) [--format=text|json]")
 		fmt.Fprintln(stdout, "                [--cwd=<project-root>] (defaults to current dir)")
+		fmt.Fprintln(stdout, "                [--verbose] (include semantic_drift per-turn rows)")
+		fmt.Fprintln(stdout, "                [--scope-aware] (reserved; OQ-5)")
 		fmt.Fprintln(stdout, "                --current auto-picks the most-recent session from hooks.log.")
 		return 0
 	default:
@@ -163,25 +167,36 @@ func sessionsList(cfg config.Config, stdout, stderr io.Writer, args []string) in
 }
 
 func sessionsReport(cfg config.Config, stdout, stderr io.Writer, args []string) int {
-	_ = cfg
 	fs := flag.NewFlagSet("sessions report", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var (
-		sessionID string
-		format    string
-		cwd       string
-		home      string
-		current   bool
+		sessionID  string
+		format     string
+		cwd        string
+		home       string
+		current    bool
+		verbose    bool
+		scopeAware bool
 	)
 	fs.StringVar(&sessionID, "session-id", "", "target Claude Code session id")
 	fs.BoolVar(&current, "current", false, "auto-pick the most-recent session from hooks.log")
 	fs.StringVar(&format, "format", "text", "output format: text|json")
 	fs.StringVar(&cwd, "cwd", "", "project cwd for transcript lookup (default: os.Getwd)")
 	fs.StringVar(&home, "home", "", "override home dir for transcript lookup (debug/tests)")
+	// --verbose (OQ-10): expose per-turn semantic_drift rows alongside the
+	// headline counts. Off by default to keep the report readable.
+	fs.BoolVar(&verbose, "verbose", false, "include semantic_drift per-turn rows (OQ-10)")
+	// --scope-aware (OQ-5): when set, the missed-bucket replay filters the
+	// store by the hook-time scope instead of full-index. Not wired in
+	// Stage 2 (requires per-turn scope from the hook log which F hasn't
+	// added); accepted but ignored for now. Keeps the CLI forward-
+	// compatible with the v2 expansion.
+	fs.BoolVar(&scopeAware, "scope-aware", false, "filter missed-bucket replay by hook scope (OQ-5; not yet wired)")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	_ = scopeAware // reserved for v2.x; §OQ-5
 	if sessionID != "" && current {
 		fmt.Fprintln(stderr, "--session-id and --current are mutually exclusive")
 		return 2
@@ -233,10 +248,19 @@ func sessionsReport(cfg config.Config, stdout, stderr io.Writer, args []string) 
 		Hooks:      hookAgg,
 		Duration:   transcriptDuration(tsum),
 		Now:        time.Now().UTC(),
+		Verbose:    verbose,
 	}
 	if transcriptErr != nil {
 		report.TranscriptError = transcriptErr.Error()
 	}
+
+	// Semantic-drift v2 compute (plan 12 Stage 2). Fail-open: any F1-F9
+	// path yields report.SemanticDrift=nil + a non-empty Diag, which the
+	// renderers serialize as `semantic_drift: null` plus a diagnostic
+	// field. Never aborts `sessions report`.
+	driftRep, driftDiag := computeSemanticDriftForReport(cfg, cwd, tsum, entries, verbose)
+	report.SemanticDrift = driftRep
+	report.SemanticDriftDiag = driftDiag
 
 	switch format {
 	case "json":
@@ -253,6 +277,56 @@ func sessionsReport(cfg config.Config, stdout, stderr io.Writer, args []string) 
 	}
 }
 
+// computeSemanticDriftForReport is the sessions-report-side glue: opens
+// the project's vector store, constructs an Ollama-backed embedder, and
+// calls heimdall.ComputeSemanticDrift. Every failure maps to a diagnostic
+// string + nil report (fail-open, plan 12 §7). We never mutate the caller.
+//
+// The store + embedder are created here rather than injected because
+// `sessions report` is a cold post-hoc command — latency isn't a concern
+// and we want the happy path to Just Work without extra plumbing. Tests
+// that exercise the compute directly bypass this helper and call
+// ComputeSemanticDrift with fakes.
+func computeSemanticDriftForReport(cfg config.Config, cwd string, tsum heimdall.TranscriptSummary, entries []heimdall.HookLogEntry, verbose bool) (*heimdall.SemanticDriftReport, string) {
+	// Fast-exit: no transcript signal at all. Mirrors F8 which already
+	// bails in the compute path, but we skip the store open entirely
+	// so a missing store doesn't produce a misleading diagnostic.
+	if tsum.UserMessages == 0 {
+		return nil, "no_transcript"
+	}
+
+	baseDir := filepath.Join(cwd, ".heimdall_db")
+	ctx, cancel := context.WithTimeout(context.Background(), heimdall.SemanticDriftEmbedBatchTimeout+5*time.Second)
+	defer cancel()
+
+	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	dbDir, model := heimdall.ResolveUsableModelDB(ctx, client, baseDir, cfg.Model)
+	if dbDir == "" || model == "" {
+		return nil, "no_usable_index"
+	}
+
+	store, err := heimdall.OpenStore(dbDir)
+	if err != nil {
+		return nil, "store_open_error"
+	}
+	defer store.Close()
+
+	embedder := heimdall.NewOllamaEmbedder(client, model)
+
+	rep, diag, cerr := heimdall.ComputeSemanticDrift(ctx, heimdall.ComputeSemanticDriftInputs{
+		Transcript:     tsum,
+		HookEntries:    entries,
+		Store:          store,
+		Embedder:       embedder,
+		EmbeddingModel: model,
+		IncludePerTurn: verbose,
+	})
+	if cerr != nil {
+		return nil, "invariant_broken"
+	}
+	return rep, diag
+}
+
 // SessionReport is the joined per-session view used by both renderers.
 type SessionReport struct {
 	SessionID       string
@@ -262,6 +336,19 @@ type SessionReport struct {
 	Duration        time.Duration
 	Now             time.Time
 	TranscriptError string
+
+	// SemanticDrift holds the v2 semantic-drift metric (plan 12 §6). Nil
+	// when the compute path degrades (any F1-F9); SemanticDriftDiag carries
+	// the reason ("ollama_unreachable", "no_hook_data", etc.). Additive
+	// field — JSON schema_version stays "v1" per plan 12 §6.3.
+	SemanticDrift     *heimdall.SemanticDriftReport
+	SemanticDriftDiag string
+
+	// Verbose mirrors the --verbose CLI flag. When true, the renderers
+	// emit the per-turn semantic_drift rows (OQ-10). The compute layer
+	// already gates PerTurn on a separate IncludePerTurn bool — this
+	// field governs whether the renderers surface what's there.
+	Verbose bool
 }
 
 func transcriptDuration(t heimdall.TranscriptSummary) time.Duration {
@@ -269,6 +356,36 @@ func transcriptDuration(t heimdall.TranscriptSummary) time.Duration {
 		return 0
 	}
 	return t.LastTimestamp.Sub(t.FirstTimestamp)
+}
+
+// renderSemanticDriftText emits the 2-line headline for the semantic_drift
+// block (plan 12 §6.2). When r.Verbose is true, per-turn rows follow
+// (OQ-10). On failure (r.SemanticDrift==nil), shows "n/a (<diag>)".
+func renderSemanticDriftText(w io.Writer, r SessionReport) {
+	if r.SemanticDrift == nil {
+		diag := r.SemanticDriftDiag
+		if diag == "" {
+			diag = "unknown"
+		}
+		fmt.Fprintf(w, "\n  semantic_drift: n/a (%s)\n", diag)
+		return
+	}
+	sd := r.SemanticDrift
+	fmt.Fprintf(w, "\n  semantic_drift: redundant=%d missed=%d (T1=%.2f T2=%.2f, near: t1=%d t2=%d)\n",
+		sd.SemanticRedundantCalls, sd.MissedCallOpportunities,
+		sd.ThresholdT1, sd.ThresholdT2,
+		sd.NearThresholdRedundant, sd.NearThresholdMissed)
+	if sd.HeimdallNonSearchWhenHitsPresent > 0 {
+		fmt.Fprintf(w, "  heimdall_non_search_when_hits_present=%d\n",
+			sd.HeimdallNonSearchWhenHitsPresent)
+	}
+	if r.Verbose && len(sd.PerTurn) > 0 {
+		fmt.Fprintf(w, "  per_turn:\n")
+		for _, row := range sd.PerTurn {
+			fmt.Fprintf(w, "    turn=%d verdict=%s best_sim=%.3f query=%q\n",
+				row.TurnIdx, row.Verdict, row.BestSim, row.Query)
+		}
+	}
 }
 
 func renderSessionReportText(w io.Writer, r SessionReport) {
@@ -293,6 +410,7 @@ func renderSessionReportText(w io.Writer, r SessionReport) {
 	for _, n := range names {
 		fmt.Fprintf(w, "  - %s: %d\n", n, r.Transcript.ToolUseByName[n])
 	}
+	renderSemanticDriftText(w, r)
 	fmt.Fprintf(w, "\n## Heimdall contribution\n")
 	fmt.Fprintf(w, "  SessionStart bytes=%d events=%d\n",
 		r.Transcript.HookSuccessBytesByEvent["SessionStart"], r.Transcript.HookSuccessCountByEvent["SessionStart"])
@@ -319,6 +437,21 @@ func renderSessionReportText(w io.Writer, r SessionReport) {
 // The schema_version key lets downstream consumers detect incompatible
 // changes. Bump SessionsReportSchemaVersion on breaking changes only.
 func (r SessionReport) toJSON() map[string]interface{} {
+	toolUse := map[string]interface{}{
+		"total":                    r.Transcript.ToolUseCount,
+		"heimdall":                 r.Transcript.HeimdallToolCalls,
+		"redundant_heimdall_calls": r.Transcript.RedundantHeimdallCalls,
+		"by_name":                  r.Transcript.ToolUseByName,
+	}
+	// Nested semantic_drift block (plan 12 §6.1). Always present under
+	// tool_use; the compute path emits `null` on failure so consumers
+	// can distinguish "we tried and couldn't" from "the CLI predates
+	// the feature". A sibling semantic_drift_error carries the diag.
+	toolUse["semantic_drift"] = semanticDriftToJSON(r.SemanticDrift)
+	if r.SemanticDrift == nil && r.SemanticDriftDiag != "" {
+		toolUse["semantic_drift_error"] = r.SemanticDriftDiag
+	}
+
 	return map[string]interface{}{
 		"schema_version": SessionsReportSchemaVersion,
 		"session_id":     r.SessionID,
@@ -330,12 +463,7 @@ func (r SessionReport) toJSON() map[string]interface{} {
 			"cache_read":     r.Transcript.TotalCacheReadTokens,
 			"output":         r.Transcript.TotalOutputTokens,
 		},
-		"tool_use": map[string]interface{}{
-			"total":                    r.Transcript.ToolUseCount,
-			"heimdall":                 r.Transcript.HeimdallToolCalls,
-			"redundant_heimdall_calls": r.Transcript.RedundantHeimdallCalls,
-			"by_name":                  r.Transcript.ToolUseByName,
-		},
+		"tool_use": toolUse,
 		"heimdall_contribution": map[string]interface{}{
 			"session_start_bytes":  r.Transcript.HookSuccessBytesByEvent["SessionStart"],
 			"session_start_events": r.Transcript.HookSuccessCountByEvent["SessionStart"],
@@ -380,4 +508,48 @@ func (r SessionReport) toJSON() map[string]interface{} {
 		"user_prompt_cache_total": r.Hooks.UserPromptCacheTotal,
 		"transcript_error":        r.TranscriptError,
 	}
+}
+
+// semanticDriftToJSON renders the SemanticDriftReport as a map with stable
+// key order. Go's json encoder sorts map keys alphabetically by default,
+// so building a plain map is sufficient for deterministic output — we do
+// NOT need to hand-roll JSON.
+//
+// Returns nil when sd is nil, which serializes to `null` under the
+// `tool_use.semantic_drift` key (plan 12 §6.1 fail-open path).
+func semanticDriftToJSON(sd *heimdall.SemanticDriftReport) interface{} {
+	if sd == nil {
+		return nil
+	}
+	block := map[string]interface{}{
+		"semantic_redundant_calls":             sd.SemanticRedundantCalls,
+		"missed_call_opportunities":            sd.MissedCallOpportunities,
+		"near_threshold_redundant":             sd.NearThresholdRedundant,
+		"near_threshold_missed":                sd.NearThresholdMissed,
+		"turns_total":                          sd.TurnsTotal,
+		"turns_with_hits":                      sd.TurnsWithHits,
+		"turns_skipped":                        sd.TurnsSkipped,
+		"turns_skipped_by_reason":              sd.TurnsSkippedBy,
+		"heimdall_non_search_when_hits_present": sd.HeimdallNonSearchWhenHitsPresent,
+		"threshold_t1":                         sd.ThresholdT1,
+		"threshold_t2":                         sd.ThresholdT2,
+		"threshold_version":                    sd.ThresholdVersion,
+		"embedding_model":                      sd.EmbeddingModel,
+		"near_threshold_delta":                 heimdall.NearThresholdDelta,
+	}
+	// Per-turn rows only when --verbose was set. Absent entirely (not
+	// empty array) when verbose is off, keeping the headline JSON small.
+	if len(sd.PerTurn) > 0 {
+		rows := make([]map[string]interface{}, 0, len(sd.PerTurn))
+		for _, row := range sd.PerTurn {
+			rows = append(rows, map[string]interface{}{
+				"turn_idx": row.TurnIdx,
+				"verdict":  row.Verdict,
+				"best_sim": row.BestSim,
+				"query":    row.Query,
+			})
+		}
+		block["per_turn"] = rows
+	}
+	return block
 }

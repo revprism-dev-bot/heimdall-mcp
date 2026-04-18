@@ -652,6 +652,102 @@ func TestSessionsReport_CacheHitsAliasMatchesTopLevel(t *testing.T) {
 	}
 }
 
+// TestSessionsReport_SemanticDriftFailOpen asserts the JSON output always
+// carries a `tool_use.semantic_drift` key, even when the compute path
+// can't run (e.g. no Ollama, no store). On a fresh tempdir there is no
+// .heimdall_db, so ResolveUsableModelDB returns ("","") and we degrade
+// to diag="no_usable_index" with semantic_drift: null — the expected
+// fail-open shape per plan 12 §7.
+func TestSessionsReport_SemanticDriftFailOpen(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	t.Setenv("HEIMDALL_HOOKS", "1")
+	_ = os.WriteFile(logPath, []byte("2026-04-16T20:00:00Z INFO event=user-prompt session=SD stage=ok\n"), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-sdproj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	transcriptPath := filepath.Join(slugDir, "SD.jsonl")
+	tdata := `{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"SD","timestamp":"2026-04-16T20:00:01Z"}` + "\n" +
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}},"sessionId":"SD","timestamp":"2026-04-16T20:00:02Z"}` + "\n"
+	_ = os.WriteFile(transcriptPath, []byte(tdata), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=SD", "--cwd=/sdproj", "--format=json"})
+	if rc != 0 {
+		t.Fatalf("rc: %d stderr: %s", rc, errBuf.String())
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("invalid json: %v\nraw: %s", err, out.String())
+	}
+	tu, ok := parsed["tool_use"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("no tool_use object: %s", out.String())
+	}
+	// semantic_drift key is always present — value may be nil (fail-open).
+	if _, exists := tu["semantic_drift"]; !exists {
+		t.Errorf("tool_use.semantic_drift key missing")
+	}
+}
+
+// TestSessionsReport_SemanticDriftTextLine asserts the text renderer
+// always emits a 2-line semantic_drift block under `## Tool use`, even
+// on the fail-open path.
+func TestSessionsReport_SemanticDriftTextLine(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	_ = os.WriteFile(logPath, []byte("2026-04-16T20:00:00Z INFO event=user-prompt session=SDT stage=ok\n"), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-sdtproj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	transcriptPath := filepath.Join(slugDir, "SDT.jsonl")
+	tdata := `{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"SDT","timestamp":"2026-04-16T20:00:01Z"}` + "\n"
+	_ = os.WriteFile(transcriptPath, []byte(tdata), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=SDT", "--cwd=/sdtproj", "--format=text"})
+	if rc != 0 {
+		t.Fatalf("rc: %d stderr: %s", rc, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "semantic_drift:") {
+		t.Errorf("expected semantic_drift line, got:\n%s", out.String())
+	}
+}
+
+// TestSessionsReport_VerboseFlagAccepted guards the --verbose flag plumbing
+// (OQ-10). We don't exercise per-turn rows here (that requires a live
+// compute path); we just confirm the flag parses cleanly and doesn't break
+// the report.
+func TestSessionsReport_VerboseFlagAccepted(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	_ = os.WriteFile(logPath, []byte("2026-04-16T20:00:00Z INFO event=user-prompt session=V stage=ok\n"), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-vproj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	transcriptPath := filepath.Join(slugDir, "V.jsonl")
+	tdata := `{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"V","timestamp":"2026-04-16T20:00:01Z"}` + "\n"
+	_ = os.WriteFile(transcriptPath, []byte(tdata), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=V", "--cwd=/vproj", "--format=text", "--verbose"})
+	if rc != 0 {
+		t.Fatalf("rc: %d stderr: %s", rc, errBuf.String())
+	}
+}
+
 func TestSessionsReport_NeitherFlagFails(t *testing.T) {
 	var out, errBuf bytes.Buffer
 	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
