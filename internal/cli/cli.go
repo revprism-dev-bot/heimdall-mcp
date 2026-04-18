@@ -4,6 +4,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -86,12 +87,14 @@ func envToMap(environ []string) map[string]string {
 // RunCLI dispatches the CLI subcommand.
 func RunCLI(cfg config.Config, args []string) {
 	cmd := args[0]
-	// Parse --out, --model, and repeatable --exclude flags from anywhere
-	// in args. Keep the hand-rolled loop (rest of cli.go relies on the
-	// same shape) but factor --exclude into a small helper so the MCP /
-	// CLI validation path is shared.
+	// Parse --out, --model (repeatable, CSV-friendly), --all-models, and
+	// repeatable --exclude flags from anywhere in args. Keep the hand-rolled
+	// loop (rest of cli.go relies on the same shape) but collect --model
+	// into a slice so both `--model a,b` and `--model a --model b` reach
+	// the resolver as a flat list.
 	outPath := ""
-	modelFlag := ""
+	var modelFlags []string
+	allModels := false
 	var excludeFlags []string
 	var cleanArgs []string
 	for i := 1; i < len(args); i++ {
@@ -99,8 +102,10 @@ func RunCLI(cfg config.Config, args []string) {
 			outPath = args[i+1]
 			i++
 		} else if args[i] == "--model" && i+1 < len(args) {
-			modelFlag = args[i+1]
+			modelFlags = append(modelFlags, args[i+1])
 			i++
+		} else if args[i] == "--all-models" {
+			allModels = true
 		} else if args[i] == "--exclude" && i+1 < len(args) {
 			excludeFlags = append(excludeFlags, args[i+1])
 			i++
@@ -112,14 +117,14 @@ func RunCLI(cfg config.Config, args []string) {
 	switch cmd {
 	case "index":
 		if len(cleanArgs) < 1 {
-			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp index <path> [--out /path/to/output/dir] [--model <name>] [--exclude <pattern>]...\n")
+			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp index <path> [--out /path/to/output/dir] [--model <name>[,<name>...]]... [--all-models] [--exclude <pattern>]...\n")
 			os.Exit(1)
 		}
 		if err := config.ValidateExcludePatterns(excludeFlags); err != nil {
 			fmt.Fprintf(os.Stderr, "Invalid --exclude: %v\n", err)
 			os.Exit(1)
 		}
-		cliIndex(cfg, cleanArgs[0], outPath, modelFlag, excludeFlags)
+		cliIndex(cfg, cleanArgs[0], outPath, modelFlags, allModels, excludeFlags)
 	case "status":
 		// Status handler parses its own flags (including --out/-o and --format).
 		os.Exit(CLIStatus(os.Stdin, os.Stdout, os.Stderr, envToMap(os.Environ()), args[1:], StatusDeps{}))
@@ -172,11 +177,16 @@ func RunCLI(cfg config.Config, args []string) {
 		fmt.Println("heimdall-mcp — local semantic code search + memory")
 		fmt.Println()
 		fmt.Println("CLI usage:")
-		fmt.Println("  heimdall-mcp index <path> [--out <dir>] [--model <name>] [--exclude <pat>]...")
+		fmt.Println("  heimdall-mcp index <path> [--out <dir>] [--model <name>[,<name>...]]... [--all-models] [--exclude <pat>]...")
 		fmt.Println("                                                   Index a directory.")
 		fmt.Println("                                                   Nested git repos are indexed")
 		fmt.Println("                                                   as separate projects, each")
 		fmt.Println("                                                   with its own .heimdall_db/.")
+		fmt.Println("                                                   --model accepts a comma-separated")
+		fmt.Println("                                                   list and can be repeated; runs")
+		fmt.Println("                                                   one pass per selected model.")
+		fmt.Println("                                                   --all-models picks every")
+		fmt.Println("                                                   embedding-capable Ollama model.")
 		fmt.Println("                                                   --exclude is repeatable; it")
 		fmt.Println("                                                   takes a glob or relative path,")
 		fmt.Println("                                                   not an absolute path.")
@@ -211,7 +221,7 @@ func RunCLI(cfg config.Config, args []string) {
 	}
 }
 
-func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string, excludeFlags []string) {
+func cliIndex(cfg config.Config, path string, dbPath string, modelFlags []string, allModels bool, excludeFlags []string) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid path: %v\n", err)
@@ -235,19 +245,19 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string, e
 		baseDir = filepath.Join(absPath, ".heimdall_db")
 	}
 
-	// Resume-marker check runs BEFORE Ollama discovery so a Cancel exits
-	// fast without flapping the user through a network ping. Result of
-	// "continue" means we skip model selection entirely; "restart" means
-	// the marker is already deleted and we run normal model selection;
-	// "cancel" exits cleanly with the marker preserved.
-	decision, resumeModels, err := resolveResume(baseDir, absPath, os.Stdin, os.Stdout, isStdinTTY())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Resume check failed: %v\n", err)
-		os.Exit(1)
-	}
-	if decision == resumeCancel {
-		fmt.Println("Cancelled.")
-		return
+	// Consult the on-disk resume marker BEFORE the Ollama ping so a
+	// flag-only run doesn't flap the user through an unnecessary network
+	// probe. The marker's models feed resolveIndexModels as pre-selection
+	// (TTY) or auto-continue list (non-TTY).
+	var markerModels []string
+	if marker, err := heimdall.ReadResumeMarker(baseDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: unreadable resume marker at %s: %v (ignoring)\n",
+			heimdall.ResumeMarkerPath(baseDir), err)
+		_ = heimdall.DeleteResumeMarker(baseDir)
+	} else if marker != nil {
+		markerModels = append([]string{}, marker.Models...)
+		fmt.Printf("\nPrevious indexing of %s with models %v was interrupted on %s.\n",
+			absPath, marker.Models, marker.StartTime.Format("2006-01-02 15:04:05 UTC"))
 	}
 
 	ctx := context.Background()
@@ -260,29 +270,35 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string, e
 	}
 	fmt.Println("Ollama: connected")
 
-	var selectedModels []string
-	if decision == resumeContinue {
-		// Skip discovery prompts — the marker is the source of truth for
-		// which models the interrupted run was touching.
-		selectedModels = resumeModels
-		fmt.Printf("Resuming with models: %v\n", selectedModels)
-	} else {
-		// resumeProceedFresh or resumeRestart — both go through normal flow.
-		fmt.Println("\nDiscovering embedding models...")
-		discovered, err := discoverEmbeddingModels(cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Model discovery failed: %v\n", err)
-			os.Exit(1)
-		}
-		formatDiscoveryResults(discovered)
-		fmt.Println()
+	fmt.Println("\nDiscovering embedding models...")
+	discovered, err := discoverEmbeddingModels(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Model discovery failed: %v\n", err)
+		os.Exit(1)
+	}
+	formatDiscoveryResults(discovered)
+	fmt.Println()
 
-		// Pick models: explicit --model wins, then auto-pick from config, else prompt.
-		selectedModels, err = resolveIndexModels(discovered, modelFlag, cfg.Model)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "\n%v\n", err)
-			os.Exit(1)
+	// Resolve models via the unified selector. TTY → multi-select with
+	// marker + cfg pre-checked; non-TTY → silent auto-pick from marker /
+	// config / flags.
+	selectedModels, fromMarker, err := resolveIndexModels(resolveOpts{
+		Discovered:   discovered,
+		ModelFlags:   modelFlags,
+		AllModels:    allModels,
+		ConfigModel:  cfg.Model,
+		MarkerModels: markerModels,
+		IsTTY:        isStdinTTY(),
+	})
+	if err != nil {
+		if errors.Is(err, errNoModelsSelected) {
+			// Clean exit: user opened the prompt and submitted empty.
+			// Leave any marker on disk so a later run can still resume.
+			fmt.Println("No models selected. Nothing to index.")
+			return
 		}
+		fmt.Fprintf(os.Stderr, "\n%v\n", err)
+		os.Exit(1)
 	}
 
 	// Write the resume marker BEFORE the first indexWithModel call so an
@@ -292,6 +308,11 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string, e
 	// continue — missing a marker is worse than a silent-write bug, not
 	// fatal to indexing itself. (If marker write ever fails, the next run
 	// will just look like a fresh start.)
+	//
+	// Skip the re-write on the non-TTY "resume" path where the marker on
+	// disk already describes exactly this run — re-writing would be a
+	// harmless no-op but avoiding the extra syscall keeps the log tidy.
+	_ = fromMarker
 	if err := heimdall.WriteResumeMarker(baseDir, selectedModels, time.Now()); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write resume marker: %v\n", err)
 	}

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -17,6 +18,174 @@ type discoveredModel struct {
 	CanEmbed   bool
 	Dimensions int
 	Known      *heimdall.KnownEmbeddingModel // nil if not in curated list
+}
+
+// errNoModelsSelected is returned by resolveIndexModels when the user
+// submits the multi-select form with zero selections. Callers should treat
+// it as a clean exit (exit code 0, print "Nothing to index", leave the
+// resume marker on disk).
+var errNoModelsSelected = errors.New("no models selected")
+
+// resolveOpts captures every input resolveIndexModels consults. Grouping
+// them in a struct keeps the TTY/non-TTY decision tree legible and makes
+// tests easy to write — a bare-struct literal expresses the exact scenario
+// under test.
+type resolveOpts struct {
+	// Discovered is the output of discoverEmbeddingModels — the full list
+	// of Ollama models plus their can-embed flag.
+	Discovered []discoveredModel
+	// ModelFlags is every argument the user passed via --model. Each entry
+	// may itself be a comma-separated list (`--model a,b`); repeated flags
+	// (`--model a --model b`) stack into this slice. Empty when no flag.
+	ModelFlags []string
+	// AllModels reflects the --all-models boolean flag. When true the
+	// resolver short-circuits to every embeddable model.
+	AllModels bool
+	// ConfigModel is cfg.Model (persisted via `heimdall-mcp config set
+	// model`). Used to pre-select in TTY prompts and to auto-pick in
+	// non-TTY mode for back-compat with CI / hooks.
+	ConfigModel string
+	// MarkerModels is the list from an on-disk resume marker. Empty when
+	// no marker or marker was deleted by the caller.
+	MarkerModels []string
+	// IsTTY gates the interactive path. False means this run cannot prompt
+	// the user (piped stdin, CI, background hooks).
+	IsTTY bool
+}
+
+// promptModelSelectionFunc is the package-level hook that tests replace to
+// avoid touching the huh TUI. Kept as a variable rather than an interface
+// because there is exactly one caller (resolveIndexModels) and exactly one
+// production implementation. Tests invoke `withStubPrompt` to swap it.
+//
+// Signature:
+//
+//	embeddable   — the filtered list of CanEmbed=true models
+//	preSelected  — canonical-name → annotation (e.g. "configured",
+//	               "in progress — resume"). Keys drive which checkboxes are
+//	               ticked on open; values drive the trailing "(…)" tag.
+var promptModelSelectionFunc = promptModelSelection
+
+// resolveIndexModels picks the models to index with. The resolution order is:
+//
+//  1. --all-models       → every embeddable model (or error if none).
+//  2. --model <flags>    → explicit list, comma-split + repeat-merged. An
+//     unknown name fails with the full embeddable list.
+//  3. Non-TTY branches (CI, hooks, piped stdin):
+//     a. cfg.Model — silent auto-pick, matching the pre-fix CLI behaviour.
+//     b. Marker models — resume the interrupted run silently.
+//     c. Single embeddable model — auto-pick.
+//     d. Otherwise error: nothing to do without a TTY.
+//  4. TTY branches:
+//     a. Zero embeddable → error (prompt has nothing to show).
+//     b. One embeddable  → auto-pick (prompt would be a one-option
+//     checkbox — pointless).
+//     c. Two or more     → interactive multi-select. cfg.Model and marker
+//     models come back pre-checked with annotated labels; the user is
+//     free to add or remove. Submitting empty is a clean exit
+//     (errNoModelsSelected).
+//
+// Returned (selected, fromMarker, err): fromMarker=true only when the
+// non-TTY path auto-continued using the marker's recorded list — it signals
+// the caller to skip re-writing the marker (already correct on disk).
+func resolveIndexModels(opts resolveOpts) ([]string, bool, error) {
+	// --all-models wins over everything else.
+	if opts.AllModels {
+		all := embeddableNames(opts.Discovered)
+		if len(all) == 0 {
+			return nil, false, fmt.Errorf("--all-models requested but no embedding-capable models found.\n\n%s", listEmbeddable(opts.Discovered))
+		}
+		fmt.Printf("Using all %d embedding models: %v\n\n", len(all), all)
+		return all, false, nil
+	}
+
+	// Explicit --model takes precedence over config and prompt. CSV and
+	// repeated flags are merged here; duplicate names are de-duped by
+	// canonical resolution.
+	if flagNames := expandModelFlags(opts.ModelFlags); len(flagNames) > 0 {
+		resolved := make([]string, 0, len(flagNames))
+		seen := make(map[string]struct{}, len(flagNames))
+		for _, n := range flagNames {
+			m, ok := findEmbeddableModel(opts.Discovered, n)
+			if !ok {
+				return nil, false, fmt.Errorf("--model %q not found among embedding-capable Ollama models.\n\nAvailable embedding models:\n%s", n, listEmbeddable(opts.Discovered))
+			}
+			if _, dup := seen[m]; dup {
+				continue
+			}
+			seen[m] = struct{}{}
+			resolved = append(resolved, m)
+		}
+		if len(resolved) == 1 {
+			fmt.Printf("Using model: %s\n\n", resolved[0])
+		} else {
+			fmt.Printf("Using %d models: %v\n\n", len(resolved), resolved)
+		}
+		return resolved, false, nil
+	}
+
+	embeddable := filterEmbeddable(opts.Discovered)
+	if len(embeddable) == 0 {
+		return nil, false, fmt.Errorf("no embedding-capable models found in Ollama.\n\nPull an embedding model first:\n  ollama pull nomic-embed-text\n\nSee all options: heimdall-mcp models")
+	}
+
+	// Non-TTY: no prompt ever. Resolve via config → marker → single.
+	if !opts.IsTTY {
+		if opts.ConfigModel != "" {
+			if m, ok := findEmbeddableModel(opts.Discovered, opts.ConfigModel); ok {
+				fmt.Printf("Using configured model: %s\n\n", m)
+				return []string{m}, false, nil
+			}
+			// Config names a model that isn't pulled / isn't embeddable —
+			// fall through to marker / single-pick so the run still has a
+			// shot, but surface a notice.
+			fmt.Printf("Notice: configured model %q is not available; trying other resolution paths.\n", opts.ConfigModel)
+		}
+		if len(opts.MarkerModels) > 0 {
+			fmt.Printf("Resuming with models from interrupted run: %v\n\n", opts.MarkerModels)
+			return append([]string{}, opts.MarkerModels...), true, nil
+		}
+		if len(embeddable) == 1 {
+			fmt.Printf("Using model: %s\n\n", embeddable[0].Name)
+			return []string{embeddable[0].Name}, false, nil
+		}
+		return nil, false, fmt.Errorf("non-interactive run with multiple embeddable models and no --model / --all-models / config.Model / resume marker.\n\nAvailable embedding models:\n%s\nPass --model <name>[,<name>...] or --all-models, or set a default via `heimdall-mcp config set model <name>`.", listEmbeddable(opts.Discovered))
+	}
+
+	// TTY branches. One embeddable → auto-pick; two+ → always prompt.
+	if len(embeddable) == 1 {
+		m := embeddable[0]
+		fmt.Printf("1 embedding model found:\n")
+		if m.Known != nil {
+			fmt.Printf("  %s — %s, %s, %dd\n", stripTag(m.Name), m.Known.Origin, m.Known.Params, m.Dimensions)
+		} else {
+			fmt.Printf("  %s — %dd\n", stripTag(m.Name), m.Dimensions)
+		}
+		fmt.Println()
+		return []string{m.Name}, false, nil
+	}
+
+	// Build the pre-selection map, marker wins on collision.
+	preSelected := map[string]string{}
+	if opts.ConfigModel != "" {
+		if m, ok := findEmbeddableModel(opts.Discovered, opts.ConfigModel); ok {
+			preSelected[m] = "configured"
+		}
+	}
+	for _, mm := range opts.MarkerModels {
+		if m, ok := findEmbeddableModel(opts.Discovered, mm); ok {
+			preSelected[m] = "in progress — resume"
+		}
+	}
+
+	selected, err := promptModelSelectionFunc(embeddable, preSelected)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(selected) == 0 {
+		return nil, false, errNoModelsSelected
+	}
+	return selected, false, nil
 }
 
 // discoverEmbeddingModels probes Ollama for all pulled models and tests which ones
@@ -50,36 +219,48 @@ func discoverEmbeddingModels(cfg config.Config) ([]discoveredModel, error) {
 	return results, nil
 }
 
-// resolveIndexModels picks the models to index with, preferring explicit/configured
-// values over the interactive prompt so `heimdall-mcp index` can run in CI,
-// background hooks, and other non-TTY contexts.
-//
-// Resolution order:
-//  1. modelFlag (from --model) — must match a discovered embedding-capable model, else error.
-//  2. configModel — auto-pick silently if it matches a discovered embedding-capable model.
-//  3. If exactly one embeddable model is discovered, auto-pick it.
-//  4. Otherwise fall back to promptModelSelection (requires TTY).
-func resolveIndexModels(discovered []discoveredModel, modelFlag, configModel string) ([]string, error) {
-	if modelFlag != "" {
-		m, ok := findEmbeddableModel(discovered, modelFlag)
-		if !ok {
-			return nil, fmt.Errorf("--model %q not found among embedding-capable Ollama models.\n\nAvailable embedding models:\n%s", modelFlag, listEmbeddable(discovered))
-		}
-		fmt.Printf("Using model: %s\n\n", m)
-		return []string{m}, nil
+// expandModelFlags turns raw --model arguments into a flat list of names.
+// Each element is split on "," so both --model a,b and --model a --model b
+// funnel into the same shape. Empty strings are skipped.
+func expandModelFlags(flags []string) []string {
+	if len(flags) == 0 {
+		return nil
 	}
-
-	if configModel != "" {
-		if m, ok := findEmbeddableModel(discovered, configModel); ok {
-			fmt.Printf("Using configured model: %s\n\n", m)
-			return []string{m}, nil
+	var out []string
+	for _, f := range flags {
+		for _, part := range strings.Split(f, ",") {
+			p := strings.TrimSpace(part)
+			if p != "" {
+				out = append(out, p)
+			}
 		}
-		// Config names a model that isn't pulled / isn't embeddable — fall through
-		// to discovery-driven selection rather than hard-failing, so the interactive
-		// user still gets a chance to pick.
 	}
+	return out
+}
 
-	return promptModelSelection(discovered, configModel)
+// filterEmbeddable returns only the discovered models that produce
+// embeddings. Order is preserved so the multi-select matches the user's
+// `heimdall-mcp models` output.
+func filterEmbeddable(models []discoveredModel) []discoveredModel {
+	var out []discoveredModel
+	for _, m := range models {
+		if m.CanEmbed {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// embeddableNames returns the canonical names of every embeddable model,
+// in discovery order.
+func embeddableNames(models []discoveredModel) []string {
+	var out []string
+	for _, m := range models {
+		if m.CanEmbed {
+			out = append(out, m.Name)
+		}
+	}
+	return out
 }
 
 // findEmbeddableModel matches `name` against the discovered list, tolerating
@@ -112,46 +293,39 @@ func listEmbeddable(discovered []discoveredModel) string {
 	return b.String()
 }
 
-// promptModelSelection shows an interactive multi-select for embedding models.
-// Returns the selected model names. If only one embedding model exists, auto-selects it.
-func promptModelSelection(models []discoveredModel, currentModel string) ([]string, error) {
-	var embeddable []discoveredModel
-	for _, m := range models {
-		if m.CanEmbed {
-			embeddable = append(embeddable, m)
-		}
-	}
-
-	if len(embeddable) == 0 {
-		return nil, fmt.Errorf("no embedding-capable models found in Ollama.\n\nPull an embedding model first:\n  ollama pull nomic-embed-text\n\nSee all options: heimdall-mcp models")
-	}
-
-	// Single model — show what it is, auto-select
-	if len(embeddable) == 1 {
-		m := embeddable[0]
-		fmt.Printf("1 embedding model found:\n")
-		if m.Known != nil {
-			fmt.Printf("  %s — %s, %s, %dd\n", stripTag(m.Name), m.Known.Origin, m.Known.Params, m.Dimensions)
-		} else {
-			fmt.Printf("  %s — %dd\n", stripTag(m.Name), m.Dimensions)
-		}
-		fmt.Println()
-		return []string{m.Name}, nil
-	}
-
-	// Build options for multi-select
+// promptModelSelection shows an interactive multi-select for embedding models
+// and returns the user's picks. preSelected maps canonical-name → annotation
+// and drives BOTH the initial checkbox state and the trailing "(…)" suffix
+// on each label. An empty map means no pre-checks, no annotations.
+//
+// Returning (nil, nil) is the "user submitted with zero selected" path — the
+// caller (resolveIndexModels) promotes that to errNoModelsSelected so the CLI
+// can exit(0) cleanly and preserve any resume marker.
+func promptModelSelection(embeddable []discoveredModel, preSelected map[string]string) ([]string, error) {
 	options := make([]huh.Option[string], 0, len(embeddable))
 	for _, m := range embeddable {
-		label := m.Name
+		base := m.Name
 		if m.Known != nil {
-			label = fmt.Sprintf("%s — %s, %s, %dd", m.Name, m.Known.Origin, m.Known.Params, m.Dimensions)
+			base = fmt.Sprintf("%s — %s, %s, %dd", m.Name, m.Known.Origin, m.Known.Params, m.Dimensions)
 		} else {
-			label = fmt.Sprintf("%s — %dd", m.Name, m.Dimensions)
+			base = fmt.Sprintf("%s — %dd", m.Name, m.Dimensions)
 		}
-		options = append(options, huh.NewOption(label, m.Name).Selected(m.Name == currentModel))
+		if note, ok := preSelected[m.Name]; ok && note != "" {
+			base = fmt.Sprintf("%s  (%s)", base, note)
+		}
+		_, preChecked := preSelected[m.Name]
+		options = append(options, huh.NewOption(base, m.Name).Selected(preChecked))
 	}
 
-	var selected []string
+	// Pre-populate the value slice so huh treats pre-checked items as the
+	// initial state. huh's MultiSelect mutates this slice in-place.
+	selected := make([]string, 0, len(preSelected))
+	for _, m := range embeddable {
+		if _, ok := preSelected[m.Name]; ok {
+			selected = append(selected, m.Name)
+		}
+	}
+
 	form := huh.NewForm(
 		huh.NewGroup(
 			huh.NewMultiSelect[string]().
@@ -165,11 +339,6 @@ func promptModelSelection(models []discoveredModel, currentModel string) ([]stri
 	if err := form.Run(); err != nil {
 		return nil, err
 	}
-
-	if len(selected) == 0 {
-		return nil, fmt.Errorf("no models selected")
-	}
-
 	return selected, nil
 }
 

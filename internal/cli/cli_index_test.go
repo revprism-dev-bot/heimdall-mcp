@@ -3,12 +3,60 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
+
+// TestMarkerLifecycle_DroppedModelDirStaysOnDisk verifies the contract that
+// when a resume marker recorded models [A, B] and the user re-runs the
+// resolver and picks only [A], the on-disk subdirectory for B — a partial
+// .heimdall_db/B/ left over from the interrupted run — is NOT deleted.
+// The user can still resume the dropped model later by re-running and
+// re-selecting it.
+//
+// This is a filesystem-level regression: the fix introduces no cleanup
+// codepaths, so the test just asserts the pre-existing subdir survives
+// a marker rewrite.
+func TestMarkerLifecycle_DroppedModelDirStaysOnDisk(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	// Simulate an interrupted run: marker recording two models, plus both
+	// their subdirectories populated with a placeholder file each.
+	if err := heimdall.WriteResumeMarker(baseDir, []string{"alpha", "beta"}, time.Now()); err != nil {
+		t.Fatalf("WriteResumeMarker: %v", err)
+	}
+	for _, m := range []string{"alpha", "beta"} {
+		dir := filepath.Join(baseDir, m)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "vectors.db"), []byte("partial"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// User re-runs; resolver picks only alpha. cliIndex updates the marker
+	// to reflect the new selection. We simulate just that step (the real
+	// indexWithModel call writes into alpha/ only).
+	if err := heimdall.WriteResumeMarker(baseDir, []string{"alpha"}, time.Now()); err != nil {
+		t.Fatalf("WriteResumeMarker (update): %v", err)
+	}
+
+	// beta/ must still be on disk — we do NOT prune dropped models.
+	betaDB := filepath.Join(baseDir, "beta", "vectors.db")
+	if _, err := os.Stat(betaDB); err != nil {
+		t.Errorf("partial beta DB was removed: %v (should be preserved for later resume)", err)
+	}
+	// alpha/ should still exist too.
+	alphaDB := filepath.Join(baseDir, "alpha", "vectors.db")
+	if _, err := os.Stat(alphaDB); err != nil {
+		t.Errorf("alpha DB missing: %v", err)
+	}
+}
 
 // TestSubRepoOpts_PrintsStartLine asserts the CLI-owned SubRepoOpts
 // factory emits an "Indexing sub-repo i/N: <name>" line on start so users
