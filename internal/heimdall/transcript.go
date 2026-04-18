@@ -42,10 +42,45 @@ type TranscriptSummary struct {
 	// that mode counts as redundant. Reset on the next user message.
 	RedundantHeimdallCalls int
 
+	// HeimdallSearchQueries captures the `input.query` string from every
+	// mcp__heimdall__heimdall_search tool_use the assistant emitted, paired
+	// with the TurnIdx it appeared in (0-based, counted per UserMessages).
+	// Populated for the semantic-drift compute path (plan 12 §3.1 /
+	// semantic_drift.go) which re-embeds these queries post-hoc to score
+	// cosine similarity against the hits the UserPromptSubmit hook
+	// injected. Only `heimdall_search` is captured: recall/expand/ls take
+	// typed inputs (memory query, chunk id, path) that aren't meaningful
+	// to cosine-compare against embedded prose (plan 12 §2.2).
+	HeimdallSearchQueries []TranscriptSearchQuery
+
+	// HeimdallCallsByTurn counts ANY mcp__heimdall__* tool call per turn,
+	// keyed by TurnIdx (same 0-based scheme as HeimdallSearchQueries). Used
+	// by the semantic-drift missed-opportunity bucket (plan 12 §2.3 /
+	// OQ-4): a turn with zero heimdall_* calls is a candidate for the
+	// missed bucket; a turn with >=1 any-heimdall call is disqualified.
+	HeimdallCallsByTurn map[int]int
+
+	// NonSearchHeimdallWhenHitsPresent counts mcp__heimdall__{recall,
+	// expand,ls} tool calls made during a turn where UserPromptSubmit
+	// injected >=1 hit. OQ-2 companion: the metric excludes these from
+	// the redundant-bucket (§2.2) but surfaces them as a sibling signal
+	// so consumers can see "the hook had context, the model reached for
+	// a non-search heimdall tool anyway."
+	NonSearchHeimdallWhenHitsPresent int
+
 	HookSuccessBytesByEvent map[string]int64 // e.g. "SessionStart" → 1240
 	HookSuccessCountByEvent map[string]int
 
 	ParseErrors int // non-fatal malformed lines
+}
+
+// TranscriptSearchQuery is one captured heimdall_search invocation from the
+// transcript. TurnIdx is the 0-based index among user turns — i.e. the
+// value of UserMessages-1 at the moment the call was parsed. Queries issued
+// before any user message (pathological transcripts) carry TurnIdx=-1.
+type TranscriptSearchQuery struct {
+	TurnIdx int
+	Query   string
 }
 
 // TranscriptPathForSession returns the filesystem path Claude Code uses for a
@@ -77,6 +112,7 @@ func ParseTranscript(path string) (TranscriptSummary, error) {
 		ToolUseByName:           map[string]int{},
 		HookSuccessBytesByEvent: map[string]int64{},
 		HookSuccessCountByEvent: map[string]int{},
+		HeimdallCallsByTurn:     map[int]int{},
 	}
 
 	f, err := os.Open(path)
@@ -147,7 +183,12 @@ func applyTranscriptLine(sum *TranscriptSummary, raw []byte, turnHasPromptHits *
 		*turnHasPromptHits = false
 	case "assistant":
 		sum.AssistantMessages++
-		applyAssistantMessage(sum, env.Message, *turnHasPromptHits)
+		// TurnIdx is 0-based and tracks the current user turn. When the
+		// assistant speaks before any user message (synthetic/imported
+		// transcripts) we tag it with -1 so semantic-drift callers can
+		// discard those rather than collide on TurnIdx=0.
+		turnIdx := sum.UserMessages - 1
+		applyAssistantMessage(sum, env.Message, *turnHasPromptHits, turnIdx)
 	case "attachment":
 		applyAttachment(sum, env.Attachment, turnHasPromptHits)
 	}
@@ -155,8 +196,9 @@ func applyTranscriptLine(sum *TranscriptSummary, raw []byte, turnHasPromptHits *
 
 type assistantMessage struct {
 	Content []struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type  string          `json:"type"`
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
 	} `json:"content"`
 	Usage struct {
 		InputTokens              int64 `json:"input_tokens"`
@@ -166,7 +208,20 @@ type assistantMessage struct {
 	} `json:"usage"`
 }
 
-func applyAssistantMessage(sum *TranscriptSummary, raw json.RawMessage, turnHadPromptHits bool) {
+// heimdallSearchInput is the subset of a tool_use.input JSON object we care
+// about for mcp__heimdall__heimdall_search. Other fields (scope, sub_project,
+// detail, etc.) are ignored — only the free-text query matters for the
+// cosine-compare step in semantic_drift.go.
+type heimdallSearchInput struct {
+	Query string `json:"query"`
+}
+
+// SearchToolName is the full MCP tool name for heimdall_search, exported so
+// the semantic-drift compute path can filter without re-declaring the
+// string literal.
+const SearchToolName = "mcp__heimdall__heimdall_search"
+
+func applyAssistantMessage(sum *TranscriptSummary, raw json.RawMessage, turnHadPromptHits bool, turnIdx int) {
 	if len(raw) == 0 {
 		return
 	}
@@ -190,11 +245,34 @@ func applyAssistantMessage(sum *TranscriptSummary, raw json.RawMessage, turnHadP
 		sum.ToolUseByName[name]++
 		if strings.HasPrefix(name, "mcp__heimdall__") {
 			sum.HeimdallToolCalls++
+			if sum.HeimdallCallsByTurn == nil {
+				sum.HeimdallCallsByTurn = map[int]int{}
+			}
+			sum.HeimdallCallsByTurn[turnIdx]++
 			if turnHadPromptHits {
 				// Hook already injected context this turn; the model called
 				// heimdall anyway. Mark the call as redundant (v1 definition;
 				// no semantic-overlap scoring — that's item 3(A), deferred).
 				sum.RedundantHeimdallCalls++
+				// OQ-2 sibling: surface when the model reaches for a
+				// non-search heimdall tool while hits were already
+				// present. The semantic-drift metric excludes those
+				// from the redundant-bucket scoring (§2.2) because
+				// recall/expand/ls don't take free-text queries to
+				// cosine-compare, but the count is still useful signal.
+				if name != SearchToolName {
+					sum.NonSearchHeimdallWhenHitsPresent++
+				}
+			}
+			// Capture heimdall_search's query text so semantic_drift.go
+			// can batch re-embed it post-hoc (plan 12 §3.4). Other
+			// heimdall_* tools are deliberately skipped (plan 12 §2.2).
+			if name == SearchToolName && len(c.Input) > 0 {
+				var in heimdallSearchInput
+				if err := json.Unmarshal(c.Input, &in); err == nil && in.Query != "" {
+					sum.HeimdallSearchQueries = append(sum.HeimdallSearchQueries,
+						TranscriptSearchQuery{TurnIdx: turnIdx, Query: in.Query})
+				}
 			}
 		}
 	}

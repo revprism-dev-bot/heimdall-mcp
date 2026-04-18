@@ -2,6 +2,8 @@ package heimdall
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -876,5 +878,57 @@ func TestSearchFiltered_NilContext(t *testing.T) {
 	results := store.SearchFiltered(nil, []float32{1.0}, 1, "", "", nil)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result with nil ctx, got %d", len(results))
+	}
+}
+
+// TestVectorByID_Found asserts the helper returns the encoded vector blob
+// decoded back to the same []float32 that was upserted — this is the
+// round-trip that semantic-drift scoring relies on.
+func TestVectorByID_Found(t *testing.T) {
+	dir := tempStoreDir(t)
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	want := []float32{0.1, 0.2, 0.3, 0.4}
+	if err := store.Upsert([]VectorRecord{
+		{ID: "vec:1", FilePath: "a.go", Content: "x", Embedding: want, ModTime: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.VectorByID("vec:1")
+	if err != nil {
+		t.Fatalf("VectorByID: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len: got %d want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("vec[%d]: got %v want %v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestVectorByID_Missing asserts the helper returns sql.ErrNoRows for an
+// unknown id — callers (semantic drift compute) rely on this sentinel to
+// decide between "skip hit" (F3) and "hard fail".
+func TestVectorByID_Missing(t *testing.T) {
+	dir := tempStoreDir(t)
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	_, err = store.VectorByID("does-not-exist")
+	if err == nil {
+		t.Fatalf("expected error on missing id")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows, got %v", err)
 	}
 }

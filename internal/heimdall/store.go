@@ -534,6 +534,29 @@ func (s *VectorStore) MarkLifecycleRun() {
 	s.lastLifecycleRun = time.Now().Unix()
 }
 
+// VectorByID returns the embedding vector for the given chunk id. Used by
+// the semantic-drift compute path to cosine-compare an assistant's
+// heimdall_search query vector against the vectors of hits the hook
+// injected earlier in the same turn (see
+// docs/plans/hooks/12-semantic-drift-metric.md §3.1).
+//
+// Returns sql.ErrNoRows when the id is not present — the caller treats
+// that as an F3 fail-open skip (the index was reindexed between hook fire
+// and report time). Unlike ExpandByID this SELECT only pulls the vector
+// blob: drift lookups happen per-hit and would dominate SQLite wall time
+// if we fetched every column.
+func (s *VectorStore) VectorByID(chunkID string) ([]float32, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var vecBlob []byte
+	err := s.db.QueryRow(`SELECT vector FROM entries WHERE id = ?`, chunkID).Scan(&vecBlob)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeFloat32Vec(vecBlob), nil
+}
+
 // ExpandByID returns the full content for a given chunk ID.
 // Used by the heimdall_expand tool for tiered retrieval drill-down.
 func (s *VectorStore) ExpandByID(chunkID string) (*VectorRecord, error) {

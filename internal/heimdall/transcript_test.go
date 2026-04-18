@@ -235,6 +235,105 @@ func TestParseTranscript_RedundantHeimdallCalls_EmptyStdoutNotAHit(t *testing.T)
 	}
 }
 
+// TestParseTranscript_HeimdallSearchQueriesCaptured asserts the parser pulls
+// the `input.query` string from each mcp__heimdall__heimdall_search tool_use
+// and pairs it with the 0-based turn index. Drives the semantic-drift
+// metric (plan 12 §3.1) which cosine-compares these to the hits injected
+// by the UserPromptSubmit hook.
+func TestParseTranscript_HeimdallSearchQueriesCaptured(t *testing.T) {
+	sum, err := ParseTranscript("testdata/transcript_heimdall.jsonl")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(sum.HeimdallSearchQueries) != 1 {
+		t.Fatalf("HeimdallSearchQueries: got %d want 1", len(sum.HeimdallSearchQueries))
+	}
+	q := sum.HeimdallSearchQueries[0]
+	if q.Query != "hooks" {
+		t.Errorf("query text: got %q want %q", q.Query, "hooks")
+	}
+	if q.TurnIdx != 0 {
+		t.Errorf("turn idx: got %d want 0", q.TurnIdx)
+	}
+	// heimdall_recall / heimdall_expand / heimdall_ls are NOT captured —
+	// §2.2 excludes them from the redundant-bucket cosine scoring because
+	// their `input` fields aren't free-text queries.
+	if sum.HeimdallCallsByTurn[0] != 2 {
+		t.Errorf("HeimdallCallsByTurn[0]: got %d want 2 (search+recall)", sum.HeimdallCallsByTurn[0])
+	}
+}
+
+// TestParseTranscript_HeimdallSearchQueriesMultiTurn asserts multi-turn
+// transcripts assign TurnIdx monotonically per UserMessages, and that a
+// missing input.query is silently dropped (fail-open F5 path).
+func TestParseTranscript_HeimdallSearchQueriesMultiTurn(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "t.jsonl")
+	content := strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"q1"},"sessionId":"mt","timestamp":"2026-03-01T00:00:00Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[` +
+			`{"type":"tool_use","id":"a","name":"mcp__heimdall__heimdall_search","input":{"query":"alpha"}},` +
+			`{"type":"tool_use","id":"b","name":"mcp__heimdall__heimdall_search","input":{}}` +
+			`],"usage":{"input_tokens":1,"output_tokens":1}},"sessionId":"mt","timestamp":"2026-03-01T00:00:01Z"}`,
+		`{"type":"user","message":{"role":"user","content":"q2"},"sessionId":"mt","timestamp":"2026-03-01T00:00:02Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[` +
+			`{"type":"tool_use","id":"c","name":"mcp__heimdall__heimdall_search","input":{"query":"beta"}}` +
+			`],"usage":{"input_tokens":1,"output_tokens":1}},"sessionId":"mt","timestamp":"2026-03-01T00:00:03Z"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := ParseTranscript(p)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(sum.HeimdallSearchQueries) != 2 {
+		t.Fatalf("HeimdallSearchQueries: got %d want 2", len(sum.HeimdallSearchQueries))
+	}
+	if sum.HeimdallSearchQueries[0].TurnIdx != 0 || sum.HeimdallSearchQueries[0].Query != "alpha" {
+		t.Errorf("q0: got %+v", sum.HeimdallSearchQueries[0])
+	}
+	if sum.HeimdallSearchQueries[1].TurnIdx != 1 || sum.HeimdallSearchQueries[1].Query != "beta" {
+		t.Errorf("q1: got %+v", sum.HeimdallSearchQueries[1])
+	}
+}
+
+// TestParseTranscript_NonSearchHeimdallWhenHitsPresent asserts the OQ-2
+// sibling counter: when hits are present and the model reaches for
+// recall/expand/ls, NonSearchHeimdallWhenHitsPresent increments while
+// RedundantHeimdallCalls (v1) still counts all heimdall_* calls.
+func TestParseTranscript_NonSearchHeimdallWhenHitsPresent(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "t.jsonl")
+	content := strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"q"},"sessionId":"ns","timestamp":"2026-03-01T00:00:00Z"}`,
+		`{"type":"attachment","attachment":{"type":"hook_success","hookEvent":"UserPromptSubmit","stdout":"## Heimdall context\n\nhits"},"sessionId":"ns","timestamp":"2026-03-01T00:00:00Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[` +
+			`{"type":"tool_use","id":"a","name":"mcp__heimdall__heimdall_recall","input":{"query":"x"}},` +
+			`{"type":"tool_use","id":"b","name":"mcp__heimdall__heimdall_expand","input":{"chunk_id":"c1"}},` +
+			`{"type":"tool_use","id":"c","name":"mcp__heimdall__heimdall_ls","input":{"path":"/"}}` +
+			`],"usage":{"input_tokens":1,"output_tokens":1}},"sessionId":"ns","timestamp":"2026-03-01T00:00:01Z"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := ParseTranscript(p)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if sum.NonSearchHeimdallWhenHitsPresent != 3 {
+		t.Errorf("NonSearchHeimdallWhenHitsPresent: got %d want 3", sum.NonSearchHeimdallWhenHitsPresent)
+	}
+	if sum.RedundantHeimdallCalls != 3 {
+		t.Errorf("RedundantHeimdallCalls: got %d want 3", sum.RedundantHeimdallCalls)
+	}
+	if len(sum.HeimdallSearchQueries) != 0 {
+		t.Errorf("HeimdallSearchQueries: got %d want 0 (no search calls)", len(sum.HeimdallSearchQueries))
+	}
+}
+
 func TestParseTranscript_MalformedLineCounted(t *testing.T) {
 	// Write a fixture with one valid line and one garbage line to a tempdir.
 	tmp := t.TempDir()
