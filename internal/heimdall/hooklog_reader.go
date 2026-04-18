@@ -141,9 +141,17 @@ type SessionHookAggregate struct {
 	SessionStartEvents int
 	SessionEndEvents   int
 
-	UserPromptEvents        int
-	UserPromptCacheHits     int
-	UserPromptSkips         int
+	UserPromptEvents    int
+	UserPromptCacheHits int
+	UserPromptSkips     int
+	// UserPromptCacheTotal is the denominator for "cache hit ratio" —
+	// the count of user-prompt events that actually reached the cache
+	// lookup layer (stage=ok + stage=cache_hit). Degraded stages
+	// (ollama_ping, embed errors, verify_hook_index, etc.) and
+	// stage=skip (prompt_too_short) are excluded — those aren't
+	// attempts the cache got to observe, so including them would
+	// deflate the ratio misleadingly.
+	UserPromptCacheTotal    int
 	UserPromptBytesInjected int64
 
 	PreToolUseEvents  int
@@ -186,6 +194,12 @@ func AggregateHookLogBySession(entries []HookLogEntry) map[string]SessionHookAgg
 			switch e.Fields["stage"] {
 			case "cache_hit":
 				agg.UserPromptCacheHits++
+				agg.UserPromptCacheTotal++
+			case "ok":
+				// Fresh retrieval that reached the cache layer —
+				// counts toward the cache-hit-ratio denominator
+				// but not the numerator.
+				agg.UserPromptCacheTotal++
 			case "skip":
 				agg.UserPromptSkips++
 			}

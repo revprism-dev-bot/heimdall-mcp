@@ -412,6 +412,166 @@ func TestSessionsReport_TextFormat_IncludesRedundantHeimdallCalls(t *testing.T) 
 	}
 }
 
+// TestSessionsReport_JSONIncludesUserPromptCacheCounters verifies the
+// additive user_prompt_cache_hits / user_prompt_cache_total fields land on
+// the SessionReport JSON at the top level. Synthetic hooks.log has 3
+// user-prompt events (1 cache_hit, 2 ok) → hits=1, total=3. Schema stays v1.
+func TestSessionsReport_JSONIncludesUserPromptCacheCounters(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	lines := strings.Join([]string{
+		"2026-04-16T20:00:00Z INFO event=user-prompt session=CH stage=cache_hit bytes=100",
+		"2026-04-16T20:00:01Z INFO event=user-prompt session=CH stage=ok bytes=200",
+		"2026-04-16T20:00:02Z INFO event=user-prompt session=CH stage=ok bytes=300",
+		"2026-04-16T20:00:03Z INFO event=user-prompt session=CH stage=skip reason=prompt_too_short",
+		"",
+	}, "\n")
+	_ = os.WriteFile(logPath, []byte(lines), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-tmp-proj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	_ = os.WriteFile(filepath.Join(slugDir, "CH.jsonl"),
+		[]byte(`{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"CH"}`+"\n"), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=CH", "--cwd=/tmp/proj", "--format=json"})
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, errBuf.String())
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	if parsed["schema_version"] != SessionsReportSchemaVersion {
+		t.Errorf("schema_version: got %v, want %s", parsed["schema_version"], SessionsReportSchemaVersion)
+	}
+	hits, ok := parsed["user_prompt_cache_hits"].(float64)
+	if !ok {
+		t.Fatalf("user_prompt_cache_hits missing or wrong type: %T %v",
+			parsed["user_prompt_cache_hits"], parsed["user_prompt_cache_hits"])
+	}
+	if int(hits) != 1 {
+		t.Errorf("user_prompt_cache_hits: got %v want 1", hits)
+	}
+	total, ok := parsed["user_prompt_cache_total"].(float64)
+	if !ok {
+		t.Fatalf("user_prompt_cache_total missing or wrong type: %T %v",
+			parsed["user_prompt_cache_total"], parsed["user_prompt_cache_total"])
+	}
+	// stage=ok + stage=cache_hit = 3; stage=skip is excluded per contract.
+	if int(total) != 3 {
+		t.Errorf("user_prompt_cache_total: got %v want 3", total)
+	}
+}
+
+// TestSessionsReport_JSONUserPromptCacheCountersZero verifies that a session
+// with zero user-prompt events renders both counters as 0 (not missing, not
+// divide-by-zero-inducing) in JSON. The schema contract requires the keys
+// to be present for every report.
+func TestSessionsReport_JSONUserPromptCacheCountersZero(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	// A session with NO user-prompt events (just a session-start), so the
+	// aggregator's UserPromptCacheHits/UserPromptCacheTotal are both 0.
+	_ = os.WriteFile(logPath,
+		[]byte("2026-04-16T20:00:00Z INFO event=session-start session=Z stage=ok\n"), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-tmp-proj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	_ = os.WriteFile(filepath.Join(slugDir, "Z.jsonl"),
+		[]byte(`{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"Z"}`+"\n"), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=Z", "--cwd=/tmp/proj", "--format=json"})
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, errBuf.String())
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	hits, hOK := parsed["user_prompt_cache_hits"].(float64)
+	total, tOK := parsed["user_prompt_cache_total"].(float64)
+	if !hOK || !tOK {
+		t.Fatalf("both counters must be present even at zero: hits=%v total=%v",
+			parsed["user_prompt_cache_hits"], parsed["user_prompt_cache_total"])
+	}
+	if int(hits) != 0 || int(total) != 0 {
+		t.Errorf("zero session: got hits=%v total=%v, want both 0", hits, total)
+	}
+}
+
+// TestSessionsReport_TextFormat_UserPromptCacheCounters verifies the
+// terse text rendering. Contract: one extra line in the UserPromptSubmit
+// stats block of the form "cache_hits=N/M" where M = total cache-eligible
+// attempts (stage=ok + stage=cache_hit).
+func TestSessionsReport_TextFormat_UserPromptCacheCounters(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	lines := strings.Join([]string{
+		"2026-04-16T20:00:00Z INFO event=user-prompt session=TC stage=cache_hit bytes=10",
+		"2026-04-16T20:00:01Z INFO event=user-prompt session=TC stage=ok bytes=20",
+		"2026-04-16T20:00:02Z INFO event=user-prompt session=TC stage=ok bytes=30",
+		"",
+	}, "\n")
+	_ = os.WriteFile(logPath, []byte(lines), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-tmp-proj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	_ = os.WriteFile(filepath.Join(slugDir, "TC.jsonl"),
+		[]byte(`{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"TC"}`+"\n"), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=TC", "--cwd=/tmp/proj", "--format=text"})
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, errBuf.String())
+	}
+	// Expect the new summary line "cache_hits=1/3" somewhere in text output.
+	if !strings.Contains(out.String(), "cache_hits=1/3") {
+		t.Errorf("expected 'cache_hits=1/3' in text output:\n%s", out.String())
+	}
+}
+
+// TestSessionsReport_TextFormat_UserPromptCacheCountersZeroSafe verifies
+// that zero user-prompt events does not render a divide-by-zero or broken
+// line; it should render "cache_hits=0/0".
+func TestSessionsReport_TextFormat_UserPromptCacheCountersZeroSafe(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	_ = os.WriteFile(logPath,
+		[]byte("2026-04-16T20:00:00Z INFO event=session-start session=ZT stage=ok\n"), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-tmp-proj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	_ = os.WriteFile(filepath.Join(slugDir, "ZT.jsonl"),
+		[]byte(`{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"ZT"}`+"\n"), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=ZT", "--cwd=/tmp/proj", "--format=text"})
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "cache_hits=0/0") {
+		t.Errorf("expected 'cache_hits=0/0' in zero-event text output:\n%s", out.String())
+	}
+}
+
 func TestSessionsReport_NeitherFlagFails(t *testing.T) {
 	var out, errBuf bytes.Buffer
 	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},

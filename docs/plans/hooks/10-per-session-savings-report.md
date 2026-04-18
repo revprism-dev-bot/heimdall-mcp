@@ -2154,6 +2154,7 @@ Duration:      1h8m
   SessionStart bytes=1240 events=1
   UserPromptSubmit bytes=9872 events=14
   prompts=14 cache_hits=3 skips=1 bytes_injected=13040
+  cache_hits=3/13
 
 ## Guardrails
   guardrail=28 verdicts=map[allow:28]
@@ -2162,4 +2163,20 @@ Duration:      1h8m
   post_edit_events=11 reindex_ok=6
 ```
 
-JSON format: a flat object with the same sections under typed keys, see `SessionReport.toJSON()` in D.3.
+The `cache_hits=N/M` line under "Heimdall contribution" reports the
+UserPromptSubmit cache hit ratio. `N` is the number of `stage=cache_hit`
+lines; `M` is the denominator: `stage=ok + stage=cache_hit` (i.e. all
+attempts that reached the cache layer). `stage=skip` and degraded stages
+(ollama_ping, embed errors, verify_hook_index, etc.) are excluded from
+both numerator and denominator — the cache layer never observed them.
+Renders as `cache_hits=0/0` on a session with no user-prompt events
+(no divide-by-zero on the consumer side: compute the ratio only when M>0).
+
+JSON format: a flat object with the same sections under typed keys, see
+`SessionReport.toJSON()` in D.3. Additive fields emitted at the top level
+(alongside `session_id`, `cwd`, `tokens`, `tool_use`, …):
+
+- `user_prompt_cache_hits: int` — same as the N above.
+- `user_prompt_cache_total: int` — same as the M above.
+
+Schema stays `schema_version: "v1"` — both are additive keys.
