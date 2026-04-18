@@ -479,7 +479,9 @@ To add LLM-judge support later: add a `Level = "judge"` value, a
 codepath in `Classify` that runs the judge only when (a) a deterministic
 rule returned `warn` and (b) the user opted in via
 `HEIMDALL_GUARDRAILS=judge`. This keeps the hot path zero-LLM by
-default.
+default. See `11-llm-classification-fallback.md` for the full design of
+the LLM-fallback extension (target: consult the model only on
+`ClassUnknown`, opt-in via `HEIMDALL_LLM_CLASSIFIER=1`).
 
 To add YAML rules later: add a `loadExtraRules(path)` call that
 appends to `defaultRules`, with schema validation that refuses any
