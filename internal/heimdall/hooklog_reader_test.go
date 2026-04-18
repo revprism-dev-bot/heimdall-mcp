@@ -121,6 +121,11 @@ func TestAggregateBySession(t *testing.T) {
 	if a.UserPromptSkips != 1 {
 		t.Errorf("skips: got %d", a.UserPromptSkips)
 	}
+	// UserPromptCacheTotal = stage=ok + stage=cache_hit (the "cache-eligible
+	// attempts" denominator). Excludes stage=skip and degraded stages.
+	if a.UserPromptCacheTotal != 2 {
+		t.Errorf("UserPromptCacheTotal A: got %d want 2", a.UserPromptCacheTotal)
+	}
 	if a.GuardrailVerdicts["allow"] != 1 || a.GuardrailVerdicts["block"] != 1 {
 		t.Errorf("guardrail verdicts: %+v", a.GuardrailVerdicts)
 	}
@@ -132,5 +137,30 @@ func TestAggregateBySession(t *testing.T) {
 	}
 	if got["B"].UserPromptEvents != 1 {
 		t.Errorf("B count: got %d", got["B"].UserPromptEvents)
+	}
+	if got["B"].UserPromptCacheTotal != 1 {
+		t.Errorf("UserPromptCacheTotal B: got %d want 1", got["B"].UserPromptCacheTotal)
+	}
+}
+
+// TestAggregateBySession_CacheTotalExcludesDegraded verifies that only stage=ok
+// and stage=cache_hit count toward UserPromptCacheTotal. Degraded stages
+// (ollama_ping, embed errors, resolve_model failures) and stage=skip MUST
+// NOT be counted — those aren't attempts the cache layer got to observe.
+func TestAggregateBySession_CacheTotalExcludesDegraded(t *testing.T) {
+	entries := []HookLogEntry{
+		{Event: "user-prompt", Session: "S", Fields: map[string]string{"stage": "ok"}},
+		{Event: "user-prompt", Session: "S", Fields: map[string]string{"stage": "cache_hit"}},
+		{Event: "user-prompt", Session: "S", Fields: map[string]string{"stage": "skip"}},
+		{Event: "user-prompt", Session: "S", Fields: map[string]string{"stage": "ollama_ping"}},
+		{Event: "user-prompt", Session: "S", Fields: map[string]string{"stage": "embed"}},
+	}
+	got := AggregateHookLogBySession(entries)
+	s := got["S"]
+	if s.UserPromptCacheHits != 1 {
+		t.Errorf("cache_hits: got %d want 1", s.UserPromptCacheHits)
+	}
+	if s.UserPromptCacheTotal != 2 {
+		t.Errorf("cache_total: got %d want 2 (stage=ok + stage=cache_hit only)", s.UserPromptCacheTotal)
 	}
 }

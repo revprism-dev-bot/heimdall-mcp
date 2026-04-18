@@ -300,6 +300,12 @@ func renderSessionReportText(w io.Writer, r SessionReport) {
 		r.Transcript.HookSuccessBytesByEvent["UserPromptSubmit"], r.Transcript.HookSuccessCountByEvent["UserPromptSubmit"])
 	fmt.Fprintf(w, "  prompts=%d cache_hits=%d skips=%d bytes_injected=%d\n",
 		r.Hooks.UserPromptEvents, r.Hooks.UserPromptCacheHits, r.Hooks.UserPromptSkips, r.Hooks.UserPromptBytesInjected)
+	// Cache-hit ratio summary. Format is "cache_hits=<hits>/<total>" where
+	// total = stage=ok + stage=cache_hit (skips and degraded stages
+	// excluded). Zero-events renders "cache_hits=0/0" — consumers compute
+	// the ratio and handle divide-by-zero themselves.
+	fmt.Fprintf(w, "  cache_hits=%d/%d\n",
+		r.Hooks.UserPromptCacheHits, r.Hooks.UserPromptCacheTotal)
 	fmt.Fprintf(w, "\n## Guardrails\n")
 	fmt.Fprintf(w, "  guardrail=%d verdicts=%v\n", r.Hooks.PreToolUseEvents, r.Hooks.GuardrailVerdicts)
 	fmt.Fprintf(w, "\n## Reindexes\n")
@@ -347,6 +353,13 @@ func (r SessionReport) toJSON() map[string]interface{} {
 			"events":     r.Hooks.PostEditEvents,
 			"reindex_ok": r.Hooks.PostEditReindexes,
 		},
-		"transcript_error": r.TranscriptError,
+		// Top-level cache-hit counters (numerator + denominator). Kept at
+		// top level so consumers can compute hit-ratio without reaching
+		// into the heimdall_contribution sub-object (which already emits
+		// cache_hits under a different semantic — all hooks.log cache_hit
+		// lines for the session). Additive fields; schema_version stays "v1".
+		"user_prompt_cache_hits":  r.Hooks.UserPromptCacheHits,
+		"user_prompt_cache_total": r.Hooks.UserPromptCacheTotal,
+		"transcript_error":        r.TranscriptError,
 	}
 }
