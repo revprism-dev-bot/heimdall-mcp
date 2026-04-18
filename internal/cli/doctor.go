@@ -1,6 +1,6 @@
 // doctor.go — implements T16 `heimdall-mcp hooks doctor`.
 //
-// Fourteen checks are run in a fixed order and rendered as a small ASCII table.
+// Fifteen checks are run in a fixed order and rendered as a small ASCII table.
 // Each check returns a status (pass/warn/fail) plus a short message. Any
 // `fail` row makes the overall command exit 1; `warn`-only or all-pass rows
 // exit 0. ASCII markers are used unconditionally — `NO_COLOR` is honored by
@@ -152,12 +152,12 @@ func renderDoctorTable(w io.Writer, checks []doctorCheck) {
 	}
 }
 
-// runDoctorChecks executes all 14 checks in order. Pure-ish: the only side
+// runDoctorChecks executes all 15 checks in order. Pure-ish: the only side
 // effects are file reads on the chosen settings.json path, exec calls via
 // deps, and HTTP calls via deps. Tests inject doctorDeps to bypass exec/net.
 func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) []doctorCheck {
 	deps = fillDoctorDeps(cfg, deps)
-	checks := make([]doctorCheck, 0, 14)
+	checks := make([]doctorCheck, 0, 15)
 
 	// 1 — settings.json exists at the chosen scope?
 	settingsBytes, settingsErr := os.ReadFile(deps.settingsPath)
@@ -292,7 +292,58 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 		}
 	}
 
-	// 8 — does the current project have an index?
+	// 8 — LLM classifier model pulled (plan 11 §5.5 F5 error event, deferred
+	// from #57 to hooks doctor). Only relevant when the opt-in fallback is
+	// actually armed: HEIMDALL_LLM_CLASSIFIER=1 AND cfg.LLMClassifierModel is
+	// non-empty. If either gate is off, we skip with a clear explanation so
+	// operators running `hooks doctor` on a default-off box don't see a
+	// spurious warning. If Ollama itself is down (pingErr from check #6),
+	// skip silently — the model-pulled check above already warned about that,
+	// and a second warn on the same root cause would be noise.
+	llmEnabled := env["HEIMDALL_LLM_CLASSIFIER"] == "1"
+	llmModel := cfg.LLMClassifierModel
+	switch {
+	case !llmEnabled:
+		checks = append(checks, doctorCheck{
+			name: "llm classifier model", status: statusPass,
+			message: "disabled (HEIMDALL_LLM_CLASSIFIER != 1)",
+		})
+	case llmModel == "":
+		checks = append(checks, doctorCheck{
+			name: "llm classifier model", status: statusWarn,
+			message: "HEIMDALL_LLM_CLASSIFIER=1 but cfg.llmClassifierModel is empty — run: heimdall-mcp configure --llm-classifier-model=<model>",
+		})
+	case pingErr != nil:
+		checks = append(checks, doctorCheck{
+			name: "llm classifier model", status: statusWarn, message: "ollama down — skipped",
+		})
+	default:
+		ctxL, cancelL := context.WithTimeout(context.Background(), 3*time.Second)
+		models, listErr := deps.listModels(ctxL, cfg.OllamaEndpoint)
+		cancelL()
+		switch {
+		case listErr != nil:
+			checks = append(checks, doctorCheck{
+				name: "llm classifier model", status: statusWarn, message: listErr.Error(),
+			})
+		case !modelInList(models, llmModel):
+			// Plan 11 §5.5 F5 `llm.classifier.model_missing`: surface a clean
+			// remediation hint before the hook ever fires. The hook itself
+			// still logs `unreachable`/`bad_response` at call time, but this
+			// proactive check catches the common "enabled the flag, forgot to
+			// pull the model" misconfiguration.
+			checks = append(checks, doctorCheck{
+				name: "llm classifier model", status: statusWarn,
+				message: fmt.Sprintf("%s not pulled — run: ollama pull %s", llmModel, llmModel),
+			})
+		default:
+			checks = append(checks, doctorCheck{
+				name: "llm classifier model", status: statusPass, message: llmModel,
+			})
+		}
+	}
+
+	// 9 — does the current project have an index?
 	projectRoot := deps.projectRoot
 	if projectRoot == "" {
 		projectRoot = findProjectRoot(env)
@@ -324,7 +375,7 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 		})
 	}
 
-	// 9 — index matches configured model?
+	// 10 — index matches configured model?
 	if hasIndex {
 		modelDir := heimdall.ModelDBDir(dbBaseDir, cfg.Model)
 		if _, err := os.Stat(modelDir); err == nil {
@@ -344,7 +395,7 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 		})
 	}
 
-	// 10 — dry-fire each installed hook.
+	// 11 — dry-fire each installed hook.
 	if len(installedEntries) == 0 {
 		checks = append(checks, doctorCheck{
 			name: "hook dry-fire", status: statusWarn, message: "no hooks installed",
@@ -381,7 +432,7 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 		}
 	}
 
-	// 11 — hook log file writable?
+	// 12 — hook log file writable?
 	logPath := deps.hookLogPath
 	if logPath == "" {
 		logPath = heimdall.HookLogPath()
@@ -401,7 +452,7 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 		})
 	}
 
-	// 12 — Claude Code skills sync rollup (informational; warn on drift).
+	// 13 — Claude Code skills sync rollup (informational; warn on drift).
 	// Compares the count of SKILL.md files under the configured skills dir
 	// against the count of memory rows whose ID matches the disk-skill prefix.
 	// Drift means either: a skill file exists that has not been imported, or
@@ -458,7 +509,7 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 		}
 	}
 
-	// 13 — PreToolUse guardrail dry-fire (in-process). Runs a known-block
+	// 14 — PreToolUse guardrail dry-fire (in-process). Runs a known-block
 	// command (`rm -rf /`) through the exact same classifier the installed
 	// hook uses; a ClassBlock return proves the rule table compiled and
 	// the handler wiring is intact. (The generic hook dry-fire at check
@@ -486,7 +537,7 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 		}
 	}
 
-	// 14 — sessions report pipeline self-check. Reads hooks.log, folds it
+	// 15 — sessions report pipeline self-check. Reads hooks.log, folds it
 	// into per-session aggregates, and confirms that `heimdall-mcp sessions
 	// list` / `sessions report` can see at least one session. A missing or
 	// empty log warns (system is fresh, nothing to report yet); a read
