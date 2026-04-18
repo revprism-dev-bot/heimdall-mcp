@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
 
 // testEnv builds a minimal env map that pins HOME (and HEIMDALL_TEST_HOME)
@@ -1087,8 +1088,17 @@ type prewarmCall struct {
 // returns success, error, or simulates a timeout outcome as needed per
 // test. The Cleanup hook restores the original prewarmFn so tests don't
 // leak state into each other when run with -count=N or under -race.
+//
+// It also pre-stubs skillsImportFn with a harmless no-op so tests that
+// exercise the post-install path don't accidentally open the real
+// ~/.config/heimdall-mcp/memories.db. Individual tests that need to
+// observe or drive the skills-import step should call stubSkillsImport
+// explicitly — their cleanup runs after this helper's.
 func stubPrewarm(t *testing.T, fn func(ctx context.Context, endpoint, model string) prewarmResult) *[]prewarmCall {
 	t.Helper()
+	stubSkillsImport(t, func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult {
+		return skillsImportResult{}
+	})
 	calls := &[]prewarmCall{}
 	prev := prewarmFn
 	prewarmFn = func(ctx context.Context, endpoint, model string) prewarmResult {
@@ -1102,6 +1112,40 @@ func stubPrewarm(t *testing.T, fn func(ctx context.Context, endpoint, model stri
 		return fn(ctx, endpoint, model)
 	}
 	t.Cleanup(func() { prewarmFn = prev })
+	return calls
+}
+
+// skillsImportCall records one invocation of the stubbed skills import so
+// tests can assert what was passed. Keeps the helper shape symmetric with
+// prewarmCall.
+type skillsImportCall struct {
+	endpoint string
+	model    string
+	dir      string // resolved at call time via heimdall.ResolveClaudeSkillsDir(env)
+}
+
+// stubSkillsImport swaps skillsImportFn for a recording fake during a single
+// test. Mirrors stubPrewarm: the supplied function drives behavior; Cleanup
+// restores the original. The returned slice records every call with the
+// cfg endpoint/model the install handler passed so timeout / arg-shape
+// assertions stay localized.
+func stubSkillsImport(t *testing.T, fn skillsImportFunc) *[]skillsImportCall {
+	t.Helper()
+	calls := &[]skillsImportCall{}
+	prev := skillsImportFn
+	skillsImportFn = func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult {
+		*calls = append(*calls, skillsImportCall{
+			endpoint: cfg.OllamaEndpoint,
+			model:    cfg.Model,
+			// env passed through verbatim; snapshotting HEIMDALL_CLAUDE_SKILLS_DIR
+			// (or the default HOME-based fallback) would double-resolve and
+			// give tests no new information. Tests assert by inspecting
+			// stdout or the length of this slice instead.
+			dir: env["HEIMDALL_CLAUDE_SKILLS_DIR"],
+		})
+		return fn(ctx, cfg, env)
+	}
+	t.Cleanup(func() { skillsImportFn = prev })
 	return calls
 }
 
@@ -1332,3 +1376,282 @@ func TestPrewarm_FiresOnForce(t *testing.T) {
 		t.Fatalf("--force should still trigger one prewarm call, got %d", len(*calls))
 	}
 }
+
+// ----- skills import on install-hooks -----
+
+// TestSkillsImport_DefaultRunsImport verifies that a clean install (no
+// --no-skills-import flag) invokes the skills-import step exactly once
+// with the config's endpoint + model and renders the success line.
+func TestSkillsImport_DefaultRunsImport(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{OllamaEndpoint: "http://stub:11434", Model: "test-model"}
+
+	// Prewarm stub keeps the install isolated; its cleanup runs first.
+	stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		return prewarmResult{model: model, duration: 3 * time.Millisecond}
+	})
+	// Override the default no-op skills-import stub so we can observe +
+	// drive its return value.
+	calls := stubSkillsImport(t, func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult {
+		return skillsImportResult{
+			dir: filepath.Join(home, ".claude", "skills"),
+			result: heimdallSkillImportOK(t, 3, 1, 0),
+			duration: 42 * time.Millisecond,
+		}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user"})
+	if code != 0 {
+		t.Fatalf("install exit=%d stderr=%s", code, stderr.String())
+	}
+	if got := len(*calls); got != 1 {
+		t.Fatalf("expected exactly 1 skills-import call, got %d", got)
+	}
+	c := (*calls)[0]
+	if c.endpoint != cfg.OllamaEndpoint {
+		t.Errorf("skills import endpoint = %q, want %q", c.endpoint, cfg.OllamaEndpoint)
+	}
+	if c.model != cfg.Model {
+		t.Errorf("skills import model = %q, want %q", c.model, cfg.Model)
+	}
+	out := stdout.String()
+	// 3 created + 1 updated = 4 imported.
+	if !strings.Contains(out, "skills import: imported 4 skills in 42ms") {
+		t.Errorf("expected success line in stdout, got: %s", out)
+	}
+	if !strings.Contains(out, "created=3 updated=1 unchanged=0") {
+		t.Errorf("expected breakdown in stdout, got: %s", out)
+	}
+}
+
+// TestSkillsImport_NoSkillsImportFlagSkips verifies that --no-skills-import
+// bypasses the skills-import step entirely (no recorded calls) and prints
+// the disabled status line.
+func TestSkillsImport_NoSkillsImportFlagSkips(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{OllamaEndpoint: "http://stub:11434", Model: "test-model"}
+
+	stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		return prewarmResult{model: model, duration: 1 * time.Millisecond}
+	})
+	calls := stubSkillsImport(t, func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult {
+		t.Errorf("skills import must not be called when --no-skills-import is set")
+		return skillsImportResult{}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user", "--no-skills-import"})
+	if code != 0 {
+		t.Fatalf("install exit=%d stderr=%s", code, stderr.String())
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("expected zero skills-import calls under --no-skills-import, got %d", len(*calls))
+	}
+	if !strings.Contains(stdout.String(), "skills import: skipped (--no-skills-import)") {
+		t.Errorf("expected --no-skills-import skip line in stdout: %s", stdout.String())
+	}
+}
+
+// TestSkillsImport_DryRunAnnouncesIntent verifies that --dry-run does not
+// invoke the import function but does announce the resolved skills dir so
+// the user can preview the planned side-effect.
+func TestSkillsImport_DryRunAnnouncesIntent(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{OllamaEndpoint: "http://stub:11434", Model: "test-model"}
+
+	// Pin the skills dir so the assertion is robust.
+	skillsDir := filepath.Join(home, "my-skills")
+	env["HEIMDALL_CLAUDE_SKILLS_DIR"] = skillsDir
+
+	stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		return prewarmResult{model: model, duration: 1 * time.Millisecond}
+	})
+	calls := stubSkillsImport(t, func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult {
+		t.Errorf("skills import must not be called in --dry-run mode")
+		return skillsImportResult{}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("dry-run install exit=%d stderr=%s", code, stderr.String())
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("expected zero skills-import calls in --dry-run, got %d", len(*calls))
+	}
+	out := stdout.String()
+	// Dry-run announces intent — not the success line, which the import
+	// never produced.
+	if !strings.Contains(out, "Would run skills import from "+skillsDir) {
+		t.Errorf("expected dry-run announcement in stdout, got: %s", out)
+	}
+	if strings.Contains(out, "imported") {
+		t.Errorf("dry-run must not print a success line, got: %s", out)
+	}
+}
+
+// TestSkillsImport_DryRunWithNoSkillsImportSuppresses verifies that a
+// --dry-run + --no-skills-import combo does not even announce the intent.
+func TestSkillsImport_DryRunWithNoSkillsImportSuppresses(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{OllamaEndpoint: "http://stub:11434", Model: "test-model"}
+
+	stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		return prewarmResult{model: model, duration: 1 * time.Millisecond}
+	})
+	stubSkillsImport(t, func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult {
+		t.Errorf("skills import must not be called")
+		return skillsImportResult{}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user", "--dry-run", "--no-skills-import"})
+	if code != 0 {
+		t.Fatalf("dry-run install exit=%d stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "Would run skills import") {
+		t.Errorf("--no-skills-import should suppress the dry-run announcement, got: %s", out)
+	}
+}
+
+// TestSkillsImport_FailureDoesNotFailInstall checks that an erroring
+// import surfaces a one-line "(non-fatal)" message but lets the install
+// succeed with exit 0 and a valid settings.json on disk.
+func TestSkillsImport_FailureDoesNotFailInstall(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{OllamaEndpoint: "http://stub:11434", Model: "test-model"}
+
+	stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		return prewarmResult{model: model, duration: 1 * time.Millisecond}
+	})
+	stubSkillsImport(t, func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult {
+		return skillsImportResult{
+			err:      errors.New("ollama not reachable at http://stub:11434: connection refused"),
+			duration: 5 * time.Millisecond,
+		}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user"})
+	if code != 0 {
+		t.Fatalf("install must not fail on skills-import error: exit=%d stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "skills import: ") {
+		t.Errorf("expected skills-import status line, got: %s", out)
+	}
+	if !strings.Contains(out, "(non-fatal)") {
+		t.Errorf("expected (non-fatal) marker on error, got: %s", out)
+	}
+	if !strings.Contains(out, "connection refused") {
+		t.Errorf("expected error reason surfaced in status line, got: %s", out)
+	}
+	// Hooks must still be installed.
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if _, err := os.Stat(settingsPath); err != nil {
+		t.Errorf("settings.json should be created even when skills import fails: %v", err)
+	}
+}
+
+// TestSkillsImport_NoModelConfiguredSkips verifies that an empty cfg.Model
+// is treated as a soft skip with no call to the import function, mirroring
+// the prewarm behavior. The install should still succeed since we cannot
+// embed without a model.
+func TestSkillsImport_NoModelConfiguredSkips(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	cfg := config.Config{} // Model intentionally empty
+
+	stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		t.Errorf("prewarm must not be called when cfg.Model is empty")
+		return prewarmResult{}
+	})
+	calls := stubSkillsImport(t, func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult {
+		t.Errorf("skills import must not be called when cfg.Model is empty")
+		return skillsImportResult{}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user"})
+	if code != 0 {
+		t.Fatalf("install exit=%d stderr=%s", code, stderr.String())
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("expected zero skills-import calls when no model configured, got %d", len(*calls))
+	}
+	if !strings.Contains(stdout.String(), "skills import: skipped (no model configured)") {
+		t.Errorf("expected no-model skip line in stdout: %s", stdout.String())
+	}
+}
+
+// TestSkillsImport_FiresOnForce verifies the skills-import step runs under
+// --force, matching the spec: re-installing should always end with both a
+// warm model and a synced skills memory store.
+func TestSkillsImport_FiresOnForce(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(settingsPath), 0o755)
+
+	// Pre-existing foreign hook so --force has something to replace.
+	conflicting := map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "/usr/local/bin/other-tool"},
+					},
+				},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(conflicting, "", "  ")
+	os.WriteFile(settingsPath, b, 0o600)
+
+	cfg := config.Config{OllamaEndpoint: "http://stub:11434", Model: "test-model"}
+	stubPrewarm(t, func(ctx context.Context, endpoint, model string) prewarmResult {
+		return prewarmResult{model: model, duration: 5 * time.Millisecond}
+	})
+	calls := stubSkillsImport(t, func(ctx context.Context, cfg config.Config, env map[string]string) skillsImportResult {
+		return skillsImportResult{result: heimdallSkillImportOK(t, 0, 0, 5), duration: 8 * time.Millisecond}
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := CLIInstallHooks(cfg, nil, &stdout, &stderr, env, []string{"--scope=user", "--force"})
+	if code != 0 {
+		t.Fatalf("install --force exit=%d stderr=%s", code, stderr.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("--force should still trigger one skills-import call, got %d", len(*calls))
+	}
+	if !strings.Contains(stdout.String(), "skills import: imported 0 skills in 8ms") {
+		t.Errorf("expected skills-import success line on --force, got: %s", stdout.String())
+	}
+}
+
+// heimdallSkillImportOK constructs a populated SkillImportResult without
+// pulling in the full heimdall package surface area for every test. Keeping
+// it local avoids a test-only shim in the heimdall package.
+func heimdallSkillImportOK(t *testing.T, created, updated, unchanged int) heimdallSkillImportResultAlias {
+	t.Helper()
+	return heimdallSkillImportResultAlias{
+		ScannedDirs: created + updated + unchanged,
+		FilesFound:  created + updated + unchanged,
+		Created:     created,
+		Updated:     updated,
+		Unchanged:   unchanged,
+	}
+}
+
+// heimdallSkillImportResultAlias re-exports the heimdall struct under a
+// test-local name so the helper signature above reads cleanly. Using the
+// real type directly would force every call site to `import heimdall`,
+// which is fine but noisier.
+type heimdallSkillImportResultAlias = heimdall.SkillImportResult
