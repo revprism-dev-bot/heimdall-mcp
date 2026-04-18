@@ -373,7 +373,10 @@ func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.Oll
 	}
 
 	// Sub-repo pass: index each discovered sub-repo as its own project.
-	subResults, subErr := indexer.IndexSubRepos(ctx, modelName, heimdall.SubRepoOpts{})
+	// Wire CLI callbacks so the user sees per-sub-repo progress instead of
+	// minutes of silence while 60k+ files quietly embed (PR #67 regression).
+	subOpts := newSubRepoCLIOpts(os.Stdout, startTime)
+	subResults, subErr := indexer.IndexSubRepos(ctx, modelName, subOpts)
 	if subErr != nil {
 		fmt.Fprintf(os.Stderr, "Warning: sub-repo discovery failed: %v\n", subErr)
 	}
@@ -457,6 +460,62 @@ func renderIndexSummary(w io.Writer, model string, elapsed time.Duration, dbDir 
 
 	fmt.Fprintf(w, "  Chunks:   %d\n", r.ChunksCreated)
 	fmt.Fprintf(w, "  Database: %s\n", dbDir)
+}
+
+// newSubRepoCLIOpts builds a heimdall.SubRepoOpts wired to write per-
+// sub-repo progress to w. Used by indexWithModel so users see
+// "Indexing sub-repo i/N: <name>" lines between the outer summary and
+// each sub-repo's own summary, plus periodic heartbeats while each
+// sub-repo runs (fixes the minutes-of-silence regression from PR #67).
+//
+// The outerStart parameter is accepted for future use (e.g. showing a
+// cumulative wall-clock in the start line). Currently unused — per-sub-
+// repo elapsed is measured from OnSubRepoStart → OnSubRepoDone.
+//
+// OnProgress emits at most one line every ~2 seconds so even a 60k-file
+// sub-repo shows activity without flooding stdout. The line is
+// overwritten in-place with \r just like the outer pass to keep output
+// tidy — the \r style only works on a real TTY but degrades gracefully
+// to repeated lines when w is a buffer or pipe (acceptable for tests).
+func newSubRepoCLIOpts(w io.Writer, outerStart time.Time) heimdall.SubRepoOpts {
+	_ = outerStart // reserved for future cumulative-elapsed display
+	var (
+		subStart  time.Time
+		lastPrint time.Time
+	)
+	return heimdall.SubRepoOpts{
+		OnSubRepoStart: func(name string, i, total int) {
+			subStart = time.Now()
+			lastPrint = time.Time{} // reset so first progress event prints
+			fmt.Fprintf(w, "\nIndexing sub-repo %d/%d: %s\n", i, total, name)
+		},
+		OnProgress: func(p heimdall.IndexProgress) {
+			now := time.Now()
+			// Throttle to ~2s cadence; always print the final event so the
+			// trailing state is visible before OnSubRepoDone's summary.
+			if !lastPrint.IsZero() && now.Sub(lastPrint) < 2*time.Second && p.Current != p.Total {
+				return
+			}
+			lastPrint = now
+			elapsed := now.Sub(subStart).Round(time.Second)
+			pct := ""
+			if p.BytesTotal > 0 {
+				pct = fmt.Sprintf(" %d%%", p.BytesDone*100/p.BytesTotal)
+			}
+			fmt.Fprintf(w, "\r  [%s] %d/%d files%s (%d chunks) — %s\033[K",
+				elapsed, p.Current, p.Total, pct, p.ChunksSoFar, p.FilePath)
+		},
+		OnSubRepoDone: func(res heimdall.SubRepoResult) {
+			elapsed := time.Since(subStart).Round(time.Second)
+			fmt.Fprintln(w) // end the \r progress line
+			if res.Err != nil || res.Result == nil {
+				fmt.Fprintf(w, "  FAILED after %s: %v\n", elapsed, res.Err)
+				return
+			}
+			fmt.Fprintf(w, "  Done: %d files, %d chunks, %s elapsed\n",
+				res.Result.FilesIndexed, res.Result.ChunksCreated, elapsed)
+		},
+	}
 }
 
 // cliSearch parses `search <query> [--out <dir>] [--format text|hook-md]

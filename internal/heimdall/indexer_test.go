@@ -1211,3 +1211,227 @@ func TestIndexer_NoFileSizeCap(t *testing.T) {
 		t.Errorf("ChunksCreated = %d, want >=100 for a 200 KB file at 1500-char chunks", result.ChunksCreated)
 	}
 }
+
+// --- sub-repo incremental + progress regression tests ---
+
+// buildSubRepoFixture builds a fixture with an outer repo and a single
+// sub-repo "child" containing N go files. Returns the outer root path.
+func buildSubRepoFixture(t *testing.T, childFiles int) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < childFiles; i++ {
+		name := fmt.Sprintf("f%d.go", i)
+		body := fmt.Sprintf("package c\nfunc F%d() {}\n", i)
+		if err := os.WriteFile(filepath.Join(sub, name), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// TestIndexSubRepos_IncrementalByDefault is the primary regression for
+// PR #67: sub-repo indexing used to call IndexAll, re-embedding every file
+// on every run. The sub-repo pass MUST be incremental — a second run over
+// unchanged files indexes ZERO files.
+func TestIndexSubRepos_IncrementalByDefault(t *testing.T) {
+	root := buildSubRepoFixture(t, 3)
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	// First pass: sub-repo store is empty — all files get indexed.
+	first, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Err != nil || first[0].Result == nil {
+		t.Fatalf("first pass: unexpected results %+v", first)
+	}
+	if first[0].Result.FilesIndexed != 3 {
+		t.Fatalf("first pass: FilesIndexed = %d, want 3", first[0].Result.FilesIndexed)
+	}
+
+	// Second pass: nothing changed on disk. Incremental contract says we
+	// MUST skip all 3 files as unchanged and index zero.
+	second, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].Err != nil || second[0].Result == nil {
+		t.Fatalf("second pass: unexpected results %+v", second)
+	}
+	if got := second[0].Result.FilesIndexed; got != 0 {
+		t.Errorf("second pass: FilesIndexed = %d, want 0 (incremental should skip unchanged)", got)
+	}
+	if got := second[0].Result.Skip.Unchanged; got != 3 {
+		t.Errorf("second pass: Skip.Unchanged = %d, want 3 (all files unchanged)", got)
+	}
+}
+
+// TestIndexSubRepos_InvokesOnSubRepoStartCallback asserts the callback
+// fires before each sub-repo with the correct name, index (1-based), and
+// total, in order.
+func TestIndexSubRepos_InvokesOnSubRepoStartCallback(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Two sub-repos — discovered in lexical order by filepath.WalkDir.
+	for _, name := range []string{"alpha", "beta"} {
+		sub := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	type startEvent struct {
+		name       string
+		idx, total int
+	}
+	var events []startEvent
+	opts := SubRepoOpts{
+		OnSubRepoStart: func(name string, i, total int) {
+			events = append(events, startEvent{name, i, total})
+		},
+	}
+	if _, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", opts); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("got %d start events, want 2: %+v", len(events), events)
+	}
+	want := []startEvent{
+		{"alpha", 1, 2},
+		{"beta", 2, 2},
+	}
+	for i, e := range events {
+		if e != want[i] {
+			t.Errorf("event[%d] = %+v, want %+v", i, e, want[i])
+		}
+	}
+}
+
+// TestIndexSubRepos_InvokesOnSubRepoDoneCallback asserts OnSubRepoDone
+// fires after each sub-repo with the matching SubRepoResult.
+func TestIndexSubRepos_InvokesOnSubRepoDoneCallback(t *testing.T) {
+	root := buildSubRepoFixture(t, 2)
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	var doneEvents []SubRepoResult
+	opts := SubRepoOpts{
+		OnSubRepoDone: func(res SubRepoResult) {
+			doneEvents = append(doneEvents, res)
+		},
+	}
+	results, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+	if len(doneEvents) != 1 {
+		t.Fatalf("done events: got %d, want 1", len(doneEvents))
+	}
+	if doneEvents[0].Name != results[0].Name ||
+		doneEvents[0].Path != results[0].Path ||
+		doneEvents[0].Err != results[0].Err {
+		t.Errorf("done event mismatch: got %+v, want %+v", doneEvents[0], results[0])
+	}
+	if doneEvents[0].Result == nil || doneEvents[0].Result.FilesIndexed != 2 {
+		t.Errorf("done event Result: got %+v, want FilesIndexed=2", doneEvents[0].Result)
+	}
+}
+
+// TestIndexSubRepos_OnProgressForwardsEvents asserts that when
+// OnProgress is set, per-file progress events from the sub-repo's
+// indexFiles pass are forwarded to the caller.
+func TestIndexSubRepos_OnProgressForwardsEvents(t *testing.T) {
+	root := buildSubRepoFixture(t, 3)
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	var progress []IndexProgress
+	opts := SubRepoOpts{
+		OnProgress: func(p IndexProgress) {
+			progress = append(progress, p)
+		},
+	}
+	if _, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", opts); err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) == 0 {
+		t.Fatalf("OnProgress received zero events; expected per-file progress updates")
+	}
+	// The final non-done event's Current should match the total file count.
+	last := progress[len(progress)-1]
+	if last.Total != 3 {
+		t.Errorf("last progress Total = %d, want 3", last.Total)
+	}
+	if last.Current != 3 {
+		t.Errorf("last progress Current = %d, want 3", last.Current)
+	}
+}
+
+// TestIndexSubRepos_NilCallbacksAreSafe is the back-compat regression:
+// passing an empty SubRepoOpts (all-nil callbacks) must behave exactly
+// as before — no panics, sub-repo gets indexed.
+func TestIndexSubRepos_NilCallbacksAreSafe(t *testing.T) {
+	root := buildSubRepoFixture(t, 1)
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	results, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 || results[0].Err != nil || results[0].Result == nil {
+		t.Fatalf("results: %+v", results)
+	}
+	if results[0].Result.FilesIndexed != 1 {
+		t.Errorf("FilesIndexed = %d, want 1", results[0].Result.FilesIndexed)
+	}
+}

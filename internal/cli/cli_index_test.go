@@ -2,12 +2,65 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
+
+// TestSubRepoOpts_PrintsStartLine asserts the CLI-owned SubRepoOpts
+// factory emits an "Indexing sub-repo i/N: <name>" line on start so users
+// see progress during the sub-repo pass (regression for the silent-minutes
+// bug in PR #67).
+func TestSubRepoOpts_PrintsStartLine(t *testing.T) {
+	var buf bytes.Buffer
+	opts := newSubRepoCLIOpts(&buf, time.Now())
+	opts.OnSubRepoStart("payments-analyzer-app", 1, 3)
+	got := buf.String()
+	if !strings.Contains(got, "Indexing sub-repo 1/3: payments-analyzer-app") {
+		t.Errorf("OnSubRepoStart output missing expected line.\nGot: %q", got)
+	}
+}
+
+// TestSubRepoOpts_PrintsDoneSummary asserts that after each sub-repo the
+// factory emits a summary line (files, chunks, elapsed).
+func TestSubRepoOpts_PrintsDoneSummary(t *testing.T) {
+	var buf bytes.Buffer
+	opts := newSubRepoCLIOpts(&buf, time.Now())
+	opts.OnSubRepoStart("svc", 1, 1)
+	opts.OnSubRepoDone(heimdall.SubRepoResult{
+		Name: "svc",
+		Result: &heimdall.IndexResult{
+			FilesIndexed:  12,
+			ChunksCreated: 84,
+			Duration:      3 * time.Second,
+		},
+	})
+	got := buf.String()
+	for _, want := range []string{"Indexing sub-repo 1/1: svc", "12 files", "84 chunks"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q.\nGot:\n%s", want, got)
+		}
+	}
+}
+
+// TestSubRepoOpts_PrintsFailureSummary asserts failed sub-repos emit a
+// FAILED line instead of a success summary.
+func TestSubRepoOpts_PrintsFailureSummary(t *testing.T) {
+	var buf bytes.Buffer
+	opts := newSubRepoCLIOpts(&buf, time.Now())
+	opts.OnSubRepoStart("bad", 1, 1)
+	opts.OnSubRepoDone(heimdall.SubRepoResult{
+		Name: "bad",
+		Err:  errors.New("boom"),
+	})
+	got := buf.String()
+	if !strings.Contains(got, "FAILED") {
+		t.Errorf("expected FAILED marker for error sub-repo, got: %s", got)
+	}
+}
 
 // TestRenderIndexSummary_CategorizedSkips asserts the new summary format
 // splits FilesSkipped into category-labelled indent lines and shows no
