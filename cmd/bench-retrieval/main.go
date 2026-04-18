@@ -17,9 +17,16 @@
 //
 // Usage:
 //
+//	bench-retrieval                                # auto-detect from CWD
 //	bench-retrieval --db=/path/to/.heimdall_db/<model>/ [flags]
-//	bench-retrieval --db=... --format=json
-//	bench-retrieval --db=... --queries=queries.txt --top-k=10 --expand-rate=0.2
+//	bench-retrieval --format=json
+//	bench-retrieval --queries=queries.txt --top-k=10 --expand-rate=0.2
+//
+// When --db is omitted, the binary walks up from the current working
+// directory the same way retrieval hooks do (heimdall.FindRepoRoot) and
+// resolves the model-specific index directory via heimdall.ModelDBDir. This
+// lets `make bench` work from any project that's been indexed, not just
+// heimdall-mcp itself. Pass --db explicitly in CI / scripts.
 //
 // The DB is opened read-only via a snapshot copy so the production index
 // is never mutated by search-side last_accessed updates the underlying
@@ -419,6 +426,45 @@ func renderText(w io.Writer, r *Report) {
 	fmt.Fprintf(w, "\nDuration: %d ms\n", r.DurationMs)
 }
 
+// resolveDBDir picks the DB directory to benchmark against. Priority:
+//  1. If explicitDB is non-empty, use it verbatim (the caller pinned a path,
+//     typically from --db in a script/CI). We still validate that
+//     vectors.db exists inside so we fail fast with a clean error rather
+//     than crashing in OpenStore.
+//  2. Else walk up from cwd via heimdall.FindRepoRoot — same logic the
+//     hooks and MCP server use — and compose <repoRoot>/.heimdall_db, then
+//     pass through heimdall.ModelDBDir(baseDir, model) to land on the
+//     right per-model subdirectory (including the "_latest" legacy
+//     fallback).
+//  3. Else error out pointing the user at the --db flag.
+//
+// All errors are user-facing strings — main() prints them straight to
+// stderr with no wrapping.
+func resolveDBDir(explicitDB, cwd, model string) (string, error) {
+	if explicitDB != "" {
+		if _, err := os.Stat(filepath.Join(explicitDB, "vectors.db")); err != nil {
+			return "", fmt.Errorf("cannot find %s/vectors.db: %v", explicitDB, err)
+		}
+		return explicitDB, nil
+	}
+
+	repoRoot := heimdall.FindRepoRoot(cwd)
+	if repoRoot == "" {
+		return "", fmt.Errorf("no --db flag and CWD is not inside a repo with an .heimdall_db/ — pass --db to benchmark a specific database")
+	}
+
+	baseDir := filepath.Join(repoRoot, ".heimdall_db")
+	modelDir := heimdall.ModelDBDir(baseDir, model)
+	if _, err := os.Stat(filepath.Join(modelDir, "vectors.db")); err != nil {
+		available := heimdall.ListAvailableModels(baseDir)
+		if len(available) == 0 {
+			return "", fmt.Errorf("no index found under %s (auto-detected repo root %s); run `heimdall-mcp index` or pass --db explicitly", baseDir, repoRoot)
+		}
+		return "", fmt.Errorf("no index for model %q under %s; available: %v — pass --model to match one of these or --db to point at a specific vectors.db", model, baseDir, available)
+	}
+	return modelDir, nil
+}
+
 // loadQueriesFile reads one query per line, skipping blanks and
 // '#'-prefixed comments.
 func loadQueriesFile(path string) ([]string, error) {
@@ -442,23 +488,20 @@ func loadQueriesFile(path string) ([]string, error) {
 
 func main() {
 	var (
-		dbFlag       = flag.String("db", "", "path to .heimdall_db/<model>/ directory (must contain vectors.db)")
-		queriesFile  = flag.String("queries", "", "optional file with one query per line; default uses built-in list")
-		topK         = flag.Int("top-k", 10, "results per search")
-		expandRate   = flag.Float64("expand-rate", 0.2, "fraction of results the caller would expand")
-		format       = flag.String("format", "text", "text|json")
-		ollamaHost   = flag.String("ollama", "http://localhost:11434", "Ollama endpoint")
-		modelFlag    = flag.String("model", "nomic-embed-text", "embedding model name")
+		dbFlag      = flag.String("db", "", "path to .heimdall_db/<model>/ directory (must contain vectors.db); when empty, auto-detects from CWD via FindRepoRoot")
+		queriesFile = flag.String("queries", "", "optional file with one query per line; default uses built-in list")
+		topK        = flag.Int("top-k", 10, "results per search")
+		expandRate  = flag.Float64("expand-rate", 0.2, "fraction of results the caller would expand")
+		format      = flag.String("format", "text", "text|json")
+		ollamaHost  = flag.String("ollama", "http://localhost:11434", "Ollama endpoint")
+		modelFlag   = flag.String("model", "nomic-embed-text", "embedding model name")
 	)
 	flag.Parse()
 
-	if *dbFlag == "" {
-		fmt.Fprintln(os.Stderr, "--db is required (e.g. --db=.heimdall_db/nomic-embed-text)")
-		flag.Usage()
-		os.Exit(2)
-	}
-	if _, err := os.Stat(filepath.Join(*dbFlag, "vectors.db")); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot find %s/vectors.db: %v\n", *dbFlag, err)
+	cwd, _ := os.Getwd()
+	dbDir, err := resolveDBDir(*dbFlag, cwd, *modelFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
@@ -482,7 +525,7 @@ func main() {
 	embedder := heimdall.NewOllamaEmbedder(client, *modelFlag)
 
 	report, err := runBench(ctx, BenchConfig{
-		DBDir:      *dbFlag,
+		DBDir:      dbDir,
 		Queries:    queries,
 		TopK:       *topK,
 		ExpandRate: *expandRate,

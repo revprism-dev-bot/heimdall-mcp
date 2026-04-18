@@ -26,7 +26,7 @@ mode with the same top-k — and tallies per-mode output size.
 CLI surface:
 
 ```
-bench-retrieval --db=<path>                     # required
+bench-retrieval [--db=<path>]                   # optional; auto-detects from CWD
                 [--queries=<file>]              # one per line; default built-in
                 [--top-k=10]                    # results per search
                 [--expand-rate=0.2]             # fraction caller would expand
@@ -34,6 +34,14 @@ bench-retrieval --db=<path>                     # required
                 [--ollama=http://localhost:11434]
                 [--model=nomic-embed-text]
 ```
+
+When `--db` is omitted, the binary walks up from the current working
+directory using `heimdall.FindRepoRoot` (same logic the hooks and MCP
+server use) and resolves `<repoRoot>/.heimdall_db/<model>/` via
+`heimdall.ModelDBDir`. Pass `--db` explicitly in CI, scripts, or when
+benchmarking a database outside the current repo. If neither a `--db`
+flag nor a repo-root `.heimdall_db/` can be found, the bench fails with
+an actionable error listing the available models (if any).
 
 ### Token estimation
 
@@ -170,20 +178,29 @@ Duration: 2196 ms
 # Smoke test (fixture + stub embedder; no Ollama needed)
 make bench-test
 
-# Real bench against the local index (needs Ollama + indexed DB)
+# Real bench against the local index (needs Ollama + indexed DB).
+# Auto-detects .heimdall_db/<model>/ from the current repo — works in any
+# indexed project, not just heimdall-mcp itself.
 make bench
 
 # Or invoke the binary directly for custom parameters
 go run ./cmd/bench-retrieval \
-  --db=.heimdall_db/nomic-embed-text \
   --top-k=10 \
   --expand-rate=0.2 \
   --format=text
+
+# Pin a specific DB (CI / scripts / benchmarking another project's index)
+go run ./cmd/bench-retrieval \
+  --db=/path/to/.heimdall_db/nomic-embed-text \
+  --top-k=10 \
+  --expand-rate=0.2
 ```
 
-The `make bench` target uses `.heimdall_db/nomic-embed-text/` at the
-repo root — if you've indexed with a different model, point `--db=` at
-the matching subdirectory.
+By default the bench walks up from the current working directory via
+`heimdall.FindRepoRoot` and picks `<repoRoot>/.heimdall_db/<model>/`.
+If you've indexed with a non-default model, pass `--model=<name>` so
+the resolver lands on the matching subdirectory, or override the path
+entirely with `--db=<path>`.
 
 ## Reproducing
 
