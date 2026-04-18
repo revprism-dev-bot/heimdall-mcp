@@ -268,6 +268,163 @@ func TestHooksAudit_ModeCounts(t *testing.T) {
 	}
 }
 
+// TestHooksAudit_MixedClassCountsIncludeUnknown seeds a synthetic log
+// with every classifier bucket (allow/warn/block/unknown) and verifies
+// the audit report counts each bucket separately. Regression guard for
+// the ClassUnknown prerequisite shipped in plan 11 §2.1 / PR #45 — the
+// audit tool landed in PR #44 before Unknown existed, so we need
+// explicit coverage that the fourth bucket is tracked end-to-end.
+func TestHooksAudit_MixedClassCountsIncludeUnknown(t *testing.T) {
+	// Old timestamps (≥24h ago) so the window-too-short escape hatch
+	// doesn't mask the block-count signal and we can reason about the
+	// promotion recommendation cleanly.
+	old := time.Now().UTC().Add(-36 * time.Hour).Format(time.RFC3339)
+	seedAuditLog(t, []string{
+		old + " INFO event=pre-tool-use class=allow   mode=shadow rule_id=- session=S1 reason=-",
+		old + " INFO event=pre-tool-use class=allow   mode=shadow rule_id=- session=S1 reason=-",
+		old + " INFO event=pre-tool-use class=allow   mode=shadow rule_id=- session=S1 reason=-",
+		old + " WARN event=pre-tool-use class=warn    mode=shadow rule_id=KUBECTL_DELETE_PROD session=S1 reason=warn",
+		old + " INFO event=pre-tool-use class=unknown mode=shadow rule_id=- session=S1 reason=-",
+		old + " INFO event=pre-tool-use class=unknown mode=shadow rule_id=- session=S1 reason=-",
+	})
+
+	out, errBuf, code := runAudit(t)
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errBuf)
+	}
+
+	// Every bucket must appear in the text report — including unknown=N
+	// (N > 0 here) and block=0 (seeded default, no entries).
+	for _, needle := range []string{"allow=3", "warn=1", "block=0", "unknown=2"} {
+		if !strings.Contains(out, needle) {
+			t.Errorf("expected %q in counts-by-class; got:\n%s", needle, out)
+		}
+	}
+
+	// Total should match — 3 + 1 + 0 + 2 = 6.
+	if !strings.Contains(out, "total_events=6") {
+		t.Errorf("expected total_events=6; got:\n%s", out)
+	}
+
+	// Unknown must NOT appear in the FP candidate list — that's
+	// strictly `class=block mode=shadow` territory per the spec.
+	if strings.Contains(out, "class=unknown") {
+		// (The audit output doesn't echo `class=unknown` anywhere;
+		// this is a belt-and-suspenders check against someone later
+		// misclassifying unknown as an FP candidate.)
+		t.Errorf("unknown must not leak into FP candidate lines; got:\n%s", out)
+	}
+}
+
+// TestHooksAudit_UnknownDoesNotBlockPromotion pins down the semantic:
+// Unknown verdicts are neutral. `promote_to_warn` still flips on
+// (block_count == 0 OR window < 24h). A pile of unknowns is not a
+// promotion blocker.
+func TestHooksAudit_UnknownDoesNotBlockPromotion(t *testing.T) {
+	// Window spans ≥24h so we're past the "window too short" escape
+	// hatch — the recommendation must come from the block-count rule
+	// alone (zero blocks → promote).
+	now := time.Now().UTC()
+	first := now.Add(-48 * time.Hour).Format(time.RFC3339)
+	last := now.Add(-1 * time.Hour).Format(time.RFC3339)
+	lines := []string{
+		first + " INFO event=pre-tool-use class=allow   mode=shadow rule_id=- session=S1 reason=-",
+		last + " INFO event=pre-tool-use class=allow   mode=shadow rule_id=- session=S1 reason=-",
+	}
+	// Pile on unknowns — they must not influence the recommendation.
+	for i := 0; i < 50; i++ {
+		lines = append(lines, first+" INFO event=pre-tool-use class=unknown mode=shadow rule_id=- session=S1 reason=-")
+	}
+	seedAuditLog(t, lines)
+
+	out, errBuf, code := runAudit(t)
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errBuf)
+	}
+	if !strings.Contains(out, "promote_to_warn=true") {
+		t.Errorf("many unknowns + zero blocks must still recommend promotion; got:\n%s", out)
+	}
+	if !strings.Contains(out, "unknown=50") {
+		t.Errorf("expected unknown=50 in counts; got:\n%s", out)
+	}
+	if !strings.Contains(out, "zero block verdicts") {
+		t.Errorf("expected promotion reason to be the zero-blocks clause; got:\n%s", out)
+	}
+}
+
+// TestHooksAudit_JSONCountsByClassIncludesUnknownKey asserts the JSON
+// payload carries the `unknown` key explicitly — even on a fresh log
+// with zero unknown verdicts. This guarantees downstream tooling
+// (dashboards, promotion scripts) can always read
+// `counts_by_class.unknown` without a presence check.
+func TestHooksAudit_JSONCountsByClassIncludesUnknownKey(t *testing.T) {
+	old := time.Now().UTC().Add(-36 * time.Hour).Format(time.RFC3339)
+	seedAuditLog(t, []string{
+		old + " INFO event=pre-tool-use class=allow mode=shadow rule_id=- session=S1 reason=-",
+	})
+
+	out, errBuf, code := runAudit(t, "--format=json")
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errBuf)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v (raw output:\n%s)", err, out)
+	}
+	counts, ok := payload["counts_by_class"].(map[string]any)
+	if !ok {
+		t.Fatalf("counts_by_class not a map: %T", payload["counts_by_class"])
+	}
+	// All four buckets must be present — zero-valued keys included.
+	for _, k := range []string{"allow", "warn", "block", "unknown"} {
+		if _, present := counts[k]; !present {
+			t.Errorf("counts_by_class[%q] missing from JSON payload; got keys=%v (raw=%s)", k, counts, out)
+		}
+	}
+	// And schema_version stays v1 — additive change only.
+	if v, _ := payload["schema_version"].(string); v != "v1" {
+		t.Errorf("schema_version must stay v1 for additive changes; got %q", v)
+	}
+}
+
+// TestHooksAudit_JSONCountsByClassUnknownValue seeds real unknown
+// verdicts and verifies the JSON count matches. Companion to the
+// zero-value presence test above.
+func TestHooksAudit_JSONCountsByClassUnknownValue(t *testing.T) {
+	now := time.Now().UTC()
+	first := now.Add(-36 * time.Hour).Format(time.RFC3339)
+	seedAuditLog(t, []string{
+		first + " INFO event=pre-tool-use class=unknown mode=shadow rule_id=- session=S1 reason=-",
+		first + " INFO event=pre-tool-use class=unknown mode=shadow rule_id=- session=S1 reason=-",
+		first + " INFO event=pre-tool-use class=unknown mode=shadow rule_id=- session=S1 reason=-",
+	})
+
+	out, errBuf, code := runAudit(t, "--format=json")
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errBuf)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v (raw output:\n%s)", err, out)
+	}
+	counts, ok := payload["counts_by_class"].(map[string]any)
+	if !ok {
+		t.Fatalf("counts_by_class not a map: %T", payload["counts_by_class"])
+	}
+	// JSON numbers decode as float64 through map[string]any.
+	got, _ := counts["unknown"].(float64)
+	if int(got) != 3 {
+		t.Errorf("counts_by_class.unknown want 3, got %v (raw=%s)", counts["unknown"], out)
+	}
+	// FP candidate list must not include unknown entries even when
+	// that's all the window holds.
+	if fp, ok := payload["false_positive_candidates"].([]any); !ok || len(fp) != 0 {
+		t.Errorf("unknown verdicts must not populate false_positive_candidates; got %v", payload["false_positive_candidates"])
+	}
+}
+
 // Routing: DispatchHooks must register the new subcommand and its help text.
 func TestDispatchHooks_RoutesAuditGuardrails(t *testing.T) {
 	seedAuditLog(t, nil)
