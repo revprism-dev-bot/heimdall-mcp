@@ -572,6 +572,86 @@ func TestSessionsReport_TextFormat_UserPromptCacheCountersZeroSafe(t *testing.T)
 	}
 }
 
+// TestSessionsReport_CacheHitsAliasMatchesTopLevel verifies that the
+// deprecated back-compat alias heimdall_contribution.cache_hits always
+// emits the same integer as the canonical top-level user_prompt_cache_hits.
+// This is the contract for the alias: both read from the same counter, and
+// if they ever diverge something has been broken. Keeping this test makes
+// the invariant explicit for future readers who might wonder if the two
+// fields have different semantics (they don't — see sessions.go toJSON
+// doc comment).
+func TestSessionsReport_CacheHitsAliasMatchesTopLevel(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "hooks.log")
+	t.Setenv("HEIMDALL_HOOK_LOG", logPath)
+	// Realistic session: 2 cache hits, 3 fresh retrievals (ok), 1 skip, 1
+	// degraded stage (ollama_ping). Expected: hits=2, total=5 (skip and
+	// degraded excluded).
+	lines := strings.Join([]string{
+		"2026-04-16T20:00:00Z INFO event=user-prompt session=AL stage=cache_hit bytes=100",
+		"2026-04-16T20:00:01Z INFO event=user-prompt session=AL stage=ok bytes=200",
+		"2026-04-16T20:00:02Z INFO event=user-prompt session=AL stage=cache_hit bytes=150",
+		"2026-04-16T20:00:03Z INFO event=user-prompt session=AL stage=ok bytes=300",
+		"2026-04-16T20:00:04Z INFO event=user-prompt session=AL stage=skip reason=prompt_too_short",
+		"2026-04-16T20:00:05Z INFO event=user-prompt session=AL stage=ok bytes=250",
+		"2026-04-16T20:00:06Z INFO event=user-prompt session=AL stage=ollama_ping",
+		"",
+	}, "\n")
+	_ = os.WriteFile(logPath, []byte(lines), 0o600)
+
+	home := filepath.Join(tmp, "home")
+	slugDir := filepath.Join(home, ".claude", "projects", "-tmp-proj")
+	_ = os.MkdirAll(slugDir, 0o755)
+	_ = os.WriteFile(filepath.Join(slugDir, "AL.jsonl"),
+		[]byte(`{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"AL"}`+"\n"), 0o600)
+
+	t.Setenv("HOME", home)
+	var out, errBuf bytes.Buffer
+	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},
+		[]string{"report", "--session-id=AL", "--cwd=/tmp/proj", "--format=json"})
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, errBuf.String())
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+
+	topHits, ok := parsed["user_prompt_cache_hits"].(float64)
+	if !ok {
+		t.Fatalf("user_prompt_cache_hits missing or wrong type: %T %v",
+			parsed["user_prompt_cache_hits"], parsed["user_prompt_cache_hits"])
+	}
+	topTotal, ok := parsed["user_prompt_cache_total"].(float64)
+	if !ok {
+		t.Fatalf("user_prompt_cache_total missing or wrong type: %T %v",
+			parsed["user_prompt_cache_total"], parsed["user_prompt_cache_total"])
+	}
+	contrib, ok := parsed["heimdall_contribution"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("heimdall_contribution missing or wrong type: %T %v",
+			parsed["heimdall_contribution"], parsed["heimdall_contribution"])
+	}
+	nestedHits, ok := contrib["cache_hits"].(float64)
+	if !ok {
+		t.Fatalf("heimdall_contribution.cache_hits missing or wrong type: %T %v",
+			contrib["cache_hits"], contrib["cache_hits"])
+	}
+
+	// Invariant: the deprecated alias mirrors the canonical top-level field.
+	if int(nestedHits) != int(topHits) {
+		t.Errorf("alias mismatch: heimdall_contribution.cache_hits=%v, user_prompt_cache_hits=%v; these must be equal (back-compat alias)",
+			nestedHits, topHits)
+	}
+	// Sanity check that we actually exercised a non-trivial session.
+	if int(topHits) != 2 {
+		t.Errorf("user_prompt_cache_hits: got %v want 2", topHits)
+	}
+	if int(topTotal) != 5 {
+		t.Errorf("user_prompt_cache_total: got %v want 5 (3 ok + 2 cache_hit; skip and ollama_ping excluded)", topTotal)
+	}
+}
+
 func TestSessionsReport_NeitherFlagFails(t *testing.T) {
 	var out, errBuf bytes.Buffer
 	rc := DispatchSessions(config.Config{}, nil, &out, &errBuf, map[string]string{},

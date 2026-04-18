@@ -341,9 +341,19 @@ func (r SessionReport) toJSON() map[string]interface{} {
 			"session_start_events": r.Transcript.HookSuccessCountByEvent["SessionStart"],
 			"prompt_bytes":         r.Transcript.HookSuccessBytesByEvent["UserPromptSubmit"],
 			"prompt_events":        r.Transcript.HookSuccessCountByEvent["UserPromptSubmit"],
-			"cache_hits":           r.Hooks.UserPromptCacheHits,
-			"skips":                r.Hooks.UserPromptSkips,
-			"bytes_injected":       r.Hooks.UserPromptBytesInjected,
+			// Deprecated: heimdall_contribution.cache_hits is a back-compat
+			// alias for the top-level user_prompt_cache_hits. Both read from
+			// the same SessionHookAggregate.UserPromptCacheHits counter (the
+			// count of hooks.log user-prompt events with stage=cache_hit for
+			// the session). New consumers should read user_prompt_cache_hits
+			// alongside user_prompt_cache_total so they have both numerator
+			// and denominator for the hit-ratio. This alias predates PR #43
+			// (shipped in PR #28) and is retained to avoid breaking existing
+			// downstream readers without a schema_version bump. Safe to drop
+			// on a future v2 schema revision.
+			"cache_hits":     r.Hooks.UserPromptCacheHits,
+			"skips":          r.Hooks.UserPromptSkips,
+			"bytes_injected": r.Hooks.UserPromptBytesInjected,
 		},
 		"guardrails": map[string]interface{}{
 			"events":   r.Hooks.PreToolUseEvents,
@@ -353,11 +363,19 @@ func (r SessionReport) toJSON() map[string]interface{} {
 			"events":     r.Hooks.PostEditEvents,
 			"reindex_ok": r.Hooks.PostEditReindexes,
 		},
-		// Top-level cache-hit counters (numerator + denominator). Kept at
-		// top level so consumers can compute hit-ratio without reaching
-		// into the heimdall_contribution sub-object (which already emits
-		// cache_hits under a different semantic — all hooks.log cache_hit
-		// lines for the session). Additive fields; schema_version stays "v1".
+		// Canonical cache-hit counters: numerator + denominator at the top
+		// level so consumers can compute the cache-hit ratio without
+		// reaching into heimdall_contribution. user_prompt_cache_hits is
+		// the count of hooks.log user-prompt events with stage=cache_hit;
+		// user_prompt_cache_total is stage=ok + stage=cache_hit (the
+		// "reached the cache layer" denominator). Degraded stages
+		// (ollama_ping, embed errors, verify_hook_index, ...) and
+		// stage=skip (prompt_too_short) are deliberately excluded from
+		// both — the cache layer never observed them.
+		//
+		// Note: user_prompt_cache_hits has the same numeric value as the
+		// deprecated heimdall_contribution.cache_hits alias above. The
+		// alias is kept for back-compat only. Schema stays v1 (additive).
 		"user_prompt_cache_hits":  r.Hooks.UserPromptCacheHits,
 		"user_prompt_cache_total": r.Hooks.UserPromptCacheTotal,
 		"transcript_error":        r.TranscriptError,
