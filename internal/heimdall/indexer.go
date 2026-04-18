@@ -16,10 +16,17 @@ import (
 //
 // No per-file or per-project caps live here anymore. Back-pressure comes from:
 //   - excludePatterns (.git, node_modules, vendor, .heimdall_db, __pycache__,
-//     .idea, .claude/worktrees by default; user-configurable)
+//     .idea, .claude/worktrees by default; user-configurable via
+//     cfg.ExcludePatterns, CLI --exclude, or the MCP exclude_patterns key)
 //   - isBinaryFile NUL-byte sniff (first 512 bytes)
 //   - the chunker, which slices every file into MaxChunkSize (~1500-char)
 //     pieces — well under nomic-embed-text's 8192-token context window
+//
+// Nested sub-repos (immediate subdirs with their own .git entry) are skipped
+// during the outer walk and recorded in IndexResult.SubRepos so the caller
+// can spawn a separate Indexer per sub-repo via IndexSubRepos. That pass
+// shares the same exclude rules — a sub-repo whose relative path matches a
+// user pattern is skipped at discovery time too.
 //
 // A pathological multi-GB text file will be read whole via os.ReadFile in
 // chunkFile, which is the only remaining memory cliff. If that ever matters
@@ -42,28 +49,197 @@ func NewIndexer(root string, embedder Embedder, store *VectorStore, opts Chunker
 	}
 }
 
+// SkipBreakdown classifies skipped files by reason.
+//
+// UserExcluded counts ONLY user-configured exclusions (cfg.ExcludePatterns
+// + CLI --exclude + MCP exclude_patterns). Default hygiene dirs (.git,
+// node_modules, .heimdall_db, vendor, __pycache__, .idea) are NOT counted —
+// the user cares about what THEY excluded, not about always-on cleanup.
+// See plan §G6 for the contract and §10.3 TestExclude_DefaultHygieneNotCounted
+// for the regression test.
+//
+// Invariant: UserExcluded + SubRepo + Binary + Unchanged == IndexResult.FilesSkipped.
+type SkipBreakdown struct {
+	UserExcluded int `json:"user_excluded"`
+	SubRepo      int `json:"sub_repo"`
+	Binary       int `json:"binary"`
+	Unchanged    int `json:"unchanged"`
+}
+
 // IndexResult holds statistics from an indexing run.
 type IndexResult struct {
-	FilesScanned  int
-	FilesIndexed  int
-	FilesSkipped  int
+	FilesScanned int
+	FilesIndexed int
+	// FilesSkipped is the sum of Skip.UserExcluded + Skip.SubRepo + Skip.Binary
+	// + Skip.Unchanged. Retained for backward compat with existing callers.
+	FilesSkipped int
+	// Skip is the per-reason breakdown. New callers should prefer reading this.
+	Skip          SkipBreakdown
 	ChunksCreated int
-	Duration      time.Duration
-	Errors        []string
+	// SubRepos is the list of immediate sub-repo directory names (relative to
+	// idx.root) that were discovered during the outer walk and skipped by
+	// filepath.SkipDir. These are the sub-repos that the orchestrator (CLI or
+	// MCP runIndex) should index separately as their own projects.
+	SubRepos []string
+	Duration time.Duration
+	Errors   []string
 }
 
 // IndexProgress reports progress from an async indexing run.
 type IndexProgress struct {
-	Current      int    // files processed so far
-	Total        int    // total files discovered
-	FilePath     string // current file being indexed
-	ChunksSoFar  int    // total chunks created so far
-	FileChunks   int    // chunks created for this file
-	BytesDone    int64  // bytes processed so far
-	BytesTotal   int64  // total bytes to process
-	Done         bool   // true when indexing is complete
-	Result       *IndexResult // non-nil when Done is true
-	Err          error        // non-nil if indexing failed
+	Current     int          // files processed so far
+	Total       int          // total files discovered
+	FilePath    string       // current file being indexed
+	ChunksSoFar int          // total chunks created so far
+	FileChunks  int          // chunks created for this file
+	BytesDone   int64        // bytes processed so far
+	BytesTotal  int64        // total bytes to process
+	Done        bool         // true when indexing is complete
+	Result      *IndexResult // non-nil when Done is true
+	Err         error        // non-nil if indexing failed
+}
+
+// SubRepoOpts parameterises IndexSubRepos. Currently empty — kept as a
+// named struct so we can grow the knob surface (e.g. parallelism, explicit
+// model-override) without breaking callers. Exclude patterns are already
+// inherited through the indexer's ChunkerOpts.
+type SubRepoOpts struct{}
+
+// SubRepoResult describes one sub-repo's indexing outcome.
+//
+// Invariant: Err != nil implies Result may be nil. Callers MUST gate on
+// Err == nil && Result != nil before dereferencing Result.FilesIndexed etc.
+// Failures are surfaced per-entry rather than aborting the whole sub-repo
+// pass, so one bad sub-repo does not block the rest.
+type SubRepoResult struct {
+	// Path is the absolute path to the sub-repo root. Always populated.
+	Path string
+	// Name is filepath.Base(Path). Always populated.
+	Name string
+	// DBPath is the absolute path to <sub>/.heimdall_db (no model subdir).
+	// Always populated so callers can register even partial-failure entries
+	// if they so choose.
+	DBPath string
+	// Model is the effective embedding model used (the pinned model if the
+	// sub-repo had a prior store, otherwise the caller's requested model).
+	// Populated iff store-open succeeded.
+	Model string
+	// PinnedModel is true iff Model came from a pre-existing sub-repo store
+	// rather than the caller's requested model. The CLI summary surfaces
+	// this via `[<model> — pinned]`.
+	PinnedModel bool
+	// Result is the indexing result. Nil iff Err != nil or store-open failed.
+	Result *IndexResult
+	// Err is non-nil iff this sub-repo failed (discover, open, or index).
+	Err error
+}
+
+// IndexSubRepos discovers immediate sub-repos of idx.root and indexes each
+// one as a separate project rooted at itself, writing to that sub-repo's
+// own `.heimdall_db`.
+//
+// model is the caller's requested model (typically the outer's). If a
+// sub-repo already has a store at <sub>/.heimdall_db/<M>/vectors.db for
+// some model M, then M is preserved — the caller's model does NOT overwrite
+// a pinned store. See plan §G4 rule 1.
+//
+// The returned error is non-nil ONLY for discovery-level failures (root
+// unreadable). Per-sub-repo failures are reported via out[i].Err and do NOT
+// cause this function to return a non-nil error. This preserves the
+// "outer-indexed-successfully" contract even if every sub-repo fails.
+//
+// Sub-repos whose relative path matches a user-configured exclude pattern
+// (idx.opts.ExcludeGlobs) are filtered out before indexing. Default
+// hygiene excludes do not apply here because DiscoverSubReposAbs never
+// descends into them in the first place.
+func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, _ SubRepoOpts) ([]SubRepoResult, error) {
+	subs, err := DiscoverSubReposAbs(idx.root)
+	if err != nil {
+		return nil, fmt.Errorf("discover sub-repos: %w", err)
+	}
+	var out []SubRepoResult
+	for _, subAbs := range subs {
+		relName, relErr := filepath.Rel(idx.root, subAbs)
+		if relErr != nil {
+			// Shouldn't happen — idx.root is absolute and subAbs is built
+			// via filepath.Join(root, basename). Fail loudly anyway so a
+			// pathological path does not get silently dropped.
+			out = append(out, SubRepoResult{
+				Path:   subAbs,
+				Name:   filepath.Base(subAbs),
+				DBPath: filepath.Join(subAbs, ".heimdall_db"),
+				Err:    fmt.Errorf("relpath %s: %w", subAbs, relErr),
+			})
+			continue
+		}
+		if idx.isUserExcluded(relName) {
+			// User explicitly excluded this sub-repo — do not index or
+			// report it in the results slice (the orchestrator counted it
+			// via Skip.UserExcluded during the outer walk; double-counting
+			// would confuse the summary renderer).
+			continue
+		}
+
+		subRes := SubRepoResult{
+			Path:   subAbs,
+			Name:   filepath.Base(subAbs),
+			DBPath: filepath.Join(subAbs, ".heimdall_db"),
+		}
+
+		// Resolve model: pinned prior store wins over the caller's request.
+		effectiveModel := model
+		pinned := false
+		if existing := ListAvailableModels(subRes.DBPath); len(existing) > 0 {
+			effectiveModel = existing[0]
+			pinned = effectiveModel != model
+		}
+		subRes.Model = effectiveModel
+		subRes.PinnedModel = pinned
+
+		// Open / create the sub-repo store. A failure here is captured and
+		// the sub-repo moves on — no panics, no partial writes to stale
+		// stores.
+		subDBDir := ModelDBDir(subRes.DBPath, effectiveModel)
+		subStore, err := OpenStore(subDBDir)
+		if err != nil {
+			subRes.Err = fmt.Errorf("open sub-repo store %s: %w", subDBDir, err)
+			// Clear Model to keep the contract "populated iff store-open
+			// succeeded" precise.
+			subRes.Model = ""
+			subRes.PinnedModel = false
+			out = append(out, subRes)
+			continue
+		}
+
+		// Spawn a fresh indexer rooted at the sub-repo, inheriting the
+		// parent's ChunkerOpts (exclude patterns in particular) and the
+		// same embedder. The embedder choice is the orchestrator's
+		// responsibility — if the pinned model differs from the embedder's
+		// native model, the caller is expected to rebuild the embedder
+		// before calling IndexSubRepos (see CLI integration in cliIndex).
+		subIdx := NewIndexer(subAbs, idx.embedder, subStore, idx.opts)
+		r, indexErr := subIdx.IndexAll(ctx)
+		subRes.Result = r
+		subRes.Err = indexErr
+		if indexErr == nil {
+			subStore.SetMetadata("embedding_model", effectiveModel)
+			// Also stamp embedding_dim so VerifyHookIndexDim accepts this
+			// store on the hook path. Missing dim metadata is a
+			// hard-fail there (returns ErrIndexDimMismatch). One test
+			// embed is cheap and matches the outer-indexer pattern at
+			// cli.go:352-354 and tools.go:336-340.
+			if subStore.GetMetadata("embedding_dim") == "" {
+				if vec, embedErr := idx.embedder.Embed(ctx, "test"); embedErr == nil {
+					subStore.SetMetadata("embedding_dim", fmt.Sprintf("%d", len(vec)))
+				}
+			}
+		}
+		if closeErr := subStore.Close(); closeErr != nil && subRes.Err == nil {
+			subRes.Err = fmt.Errorf("close sub-repo store %s: %w", subDBDir, closeErr)
+		}
+		out = append(out, subRes)
+	}
+	return out, nil
 }
 
 // IndexAll performs a full re-index of the project synchronously.
@@ -119,6 +295,10 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 	}
 
 	var files []string
+	// subRepoSeen dedupes entries in result.SubRepos. The walker only visits
+	// each directory once but using a set makes the post-pass loop cheap to
+	// reason about and future-proofs against nested walks.
+	subRepoSeen := make(map[string]bool)
 	for _, walkRoot := range walkRoots {
 		err := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -134,25 +314,55 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 			}
 
 			if d.IsDir() {
-				if idx.shouldExclude(relPath) {
+				// User-configured excludes are counted and skipped.
+				if idx.isUserExcluded(relPath) {
+					result.Skip.UserExcluded++
 					return filepath.SkipDir
 				}
-				// Skip directories that are their own git repos (sub-repos)
+				// Default hygiene is silent (not counted — H1 resolution).
+				if idx.isDefaultExcluded(relPath) {
+					return filepath.SkipDir
+				}
+				// Skip directories that are their own git repos (sub-repos).
+				// Accept .git as either a directory or a regular file (gitlink
+				// for git worktrees) — matches hasRepoMarker in scope.go.
+				// Record the sub-repo's relative path so the orchestrator can
+				// index it as a separate project after the outer walk.
+				//
+				// IMPORTANT (M2 regression): only record IMMEDIATE children of
+				// idx.root. DiscoverSubReposAbs and IndexSubRepos only handle
+				// direct children; recording a deeply-nested sub-repo (e.g.
+				// outer/services/payments/.git) would surface it in
+				// result.SubRepos and Skip.SubRepo even though nothing ever
+				// indexes it. Deeper sub-repos are still SkipDir'd so their
+				// files do not leak into the outer store — they are simply
+				// not reported as "sub-repo candidates".
 				if path != walkRoot {
 					gitDir := filepath.Join(path, ".git")
-					if info, err := os.Stat(gitDir); err == nil && info.IsDir() {
+					if _, err := os.Stat(gitDir); err == nil {
+						immediate := filepath.Dir(path) == idx.root
+						if immediate && !subRepoSeen[relPath] {
+							subRepoSeen[relPath] = true
+							result.SubRepos = append(result.SubRepos, relPath)
+							result.Skip.SubRepo++
+						}
 						return filepath.SkipDir
 					}
 				}
 				return nil
 			}
 
-			if idx.shouldExclude(relPath) {
+			if idx.isUserExcluded(relPath) {
+				result.Skip.UserExcluded++
+				return nil
+			}
+			if idx.isDefaultExcluded(relPath) {
 				return nil
 			}
 
 			// Skip binary files
 			if isBinaryFile(path) {
+				result.Skip.Binary++
 				return nil
 			}
 
@@ -198,18 +408,18 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 					progress <- IndexProgress{
 						Current: i + 1, Total: len(files), FilePath: relPath,
 						ChunksSoFar: result.ChunksCreated,
-						BytesDone: bytesDone, BytesTotal: totalBytes,
+						BytesDone:   bytesDone, BytesTotal: totalBytes,
 					}
 				}
 				continue
 			}
 			if idx.isUpToDate(relPath, info.ModTime(), path) {
-				result.FilesSkipped++
+				result.Skip.Unchanged++
 				if progress != nil {
 					progress <- IndexProgress{
 						Current: i + 1, Total: len(files), FilePath: relPath,
 						ChunksSoFar: result.ChunksCreated,
-						BytesDone: bytesDone, BytesTotal: totalBytes,
+						BytesDone:   bytesDone, BytesTotal: totalBytes,
 					}
 				}
 				continue
@@ -221,7 +431,7 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 			progress <- IndexProgress{
 				Current: i + 1, Total: len(files), FilePath: relPath,
 				ChunksSoFar: result.ChunksCreated,
-				BytesDone: bytesDone, BytesTotal: totalBytes,
+				BytesDone:   bytesDone, BytesTotal: totalBytes,
 			}
 		}
 
@@ -316,6 +526,11 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 		result.Errors = append(result.Errors, fmt.Sprintf("store save: %v", saveErr))
 	}
 
+	// Keep the legacy FilesSkipped counter consistent with the breakdown
+	// so both old and new readers observe the same totals. Invariant in
+	// SkipBreakdown godoc.
+	result.FilesSkipped = result.Skip.UserExcluded + result.Skip.SubRepo + result.Skip.Binary + result.Skip.Unchanged
+
 	result.Duration = time.Since(start)
 	return result, nil
 }
@@ -389,20 +604,48 @@ func (idx *Indexer) chunkFile(path, relPath string) ([]Chunk, error) {
 	return chunks, nil
 }
 
-// shouldExclude checks if a relative path matches any exclude pattern.
-func (idx *Indexer) shouldExclude(relPath string) bool {
-	// Always exclude common directories
-	defaultExcludes := []string{".git", "node_modules", ".heimdall_db", "vendor", "__pycache__", ".idea"}
-	allExcludes := append(defaultExcludes, idx.opts.ExcludeGlobs...)
+// defaultExcludes names directories that are always skipped for hygiene.
+// Hits against this list are NOT counted in Skip.UserExcluded — see
+// SkipBreakdown doc and plan §G6 (H1 resolution).
+var defaultExcludes = []string{".git", "node_modules", ".heimdall_db", "vendor", "__pycache__", ".idea"}
 
-	parts := strings.Split(filepath.ToSlash(relPath), "/")
-	for _, pattern := range allExcludes {
+// isDefaultExcluded reports whether relPath matches one of the always-on
+// hygiene patterns. Does NOT consult user config. Hits here are silent —
+// the user did not opt into them and should not see them in summary counts.
+func (idx *Indexer) isDefaultExcluded(relPath string) bool {
+	return matchesAnyPattern(relPath, defaultExcludes)
+}
+
+// isUserExcluded reports whether relPath matches a user-configured pattern
+// from ChunkerOpts.ExcludeGlobs (sourced from cfg.ExcludePatterns + CLI
+// --exclude + MCP exclude_patterns). Hits bump Skip.UserExcluded.
+func (idx *Indexer) isUserExcluded(relPath string) bool {
+	return matchesAnyPattern(relPath, idx.opts.ExcludeGlobs)
+}
+
+// shouldExclude is the union of default and user excludes. Retained for the
+// remaining callers (e.g. legacy tests / sub-repo orchestration helpers) so
+// behaviour is identical when a counter update is not required.
+func (idx *Indexer) shouldExclude(relPath string) bool {
+	return idx.isDefaultExcluded(relPath) || idx.isUserExcluded(relPath)
+}
+
+// matchesAnyPattern tests relPath against each pattern, matching both each
+// path component and the full slash-joined relative path — same semantics as
+// the previous shouldExclude body.
+func matchesAnyPattern(relPath string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	slashed := filepath.ToSlash(relPath)
+	parts := strings.Split(slashed, "/")
+	for _, pattern := range patterns {
 		for _, part := range parts {
 			if matched, _ := filepath.Match(pattern, part); matched {
 				return true
 			}
 		}
-		if matched, _ := filepath.Match(pattern, filepath.ToSlash(relPath)); matched {
+		if matched, _ := filepath.Match(pattern, slashed); matched {
 			return true
 		}
 	}

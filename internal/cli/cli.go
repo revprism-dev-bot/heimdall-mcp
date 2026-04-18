@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -85,9 +86,13 @@ func envToMap(environ []string) map[string]string {
 // RunCLI dispatches the CLI subcommand.
 func RunCLI(cfg config.Config, args []string) {
 	cmd := args[0]
-	// Parse --out and --model flags from anywhere in args
+	// Parse --out, --model, and repeatable --exclude flags from anywhere
+	// in args. Keep the hand-rolled loop (rest of cli.go relies on the
+	// same shape) but factor --exclude into a small helper so the MCP /
+	// CLI validation path is shared.
 	outPath := ""
 	modelFlag := ""
+	var excludeFlags []string
 	var cleanArgs []string
 	for i := 1; i < len(args); i++ {
 		if (args[i] == "--out" || args[i] == "-o") && i+1 < len(args) {
@@ -95,6 +100,9 @@ func RunCLI(cfg config.Config, args []string) {
 			i++
 		} else if args[i] == "--model" && i+1 < len(args) {
 			modelFlag = args[i+1]
+			i++
+		} else if args[i] == "--exclude" && i+1 < len(args) {
+			excludeFlags = append(excludeFlags, args[i+1])
 			i++
 		} else {
 			cleanArgs = append(cleanArgs, args[i])
@@ -104,10 +112,14 @@ func RunCLI(cfg config.Config, args []string) {
 	switch cmd {
 	case "index":
 		if len(cleanArgs) < 1 {
-			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp index <path> [--out /path/to/output/dir] [--model <name>]\n")
+			fmt.Fprintf(os.Stderr, "Usage: heimdall-mcp index <path> [--out /path/to/output/dir] [--model <name>] [--exclude <pattern>]...\n")
 			os.Exit(1)
 		}
-		cliIndex(cfg, cleanArgs[0], outPath, modelFlag)
+		if err := config.ValidateExcludePatterns(excludeFlags); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid --exclude: %v\n", err)
+			os.Exit(1)
+		}
+		cliIndex(cfg, cleanArgs[0], outPath, modelFlag, excludeFlags)
 	case "status":
 		// Status handler parses its own flags (including --out/-o and --format).
 		os.Exit(CLIStatus(os.Stdin, os.Stdout, os.Stderr, envToMap(os.Environ()), args[1:], StatusDeps{}))
@@ -160,8 +172,14 @@ func RunCLI(cfg config.Config, args []string) {
 		fmt.Println("heimdall-mcp — local semantic code search + memory")
 		fmt.Println()
 		fmt.Println("CLI usage:")
-		fmt.Println("  heimdall-mcp index <path> [--out <dir>] [--model <name>]")
-		fmt.Println("                                                   Index a directory")
+		fmt.Println("  heimdall-mcp index <path> [--out <dir>] [--model <name>] [--exclude <pat>]...")
+		fmt.Println("                                                   Index a directory.")
+		fmt.Println("                                                   Nested git repos are indexed")
+		fmt.Println("                                                   as separate projects, each")
+		fmt.Println("                                                   with its own .heimdall_db/.")
+		fmt.Println("                                                   --exclude is repeatable; it")
+		fmt.Println("                                                   takes a glob or relative path,")
+		fmt.Println("                                                   not an absolute path.")
 		fmt.Println("  heimdall-mcp status [--out <dir>] [--format]     Show index stats")
 		fmt.Println("  heimdall-mcp search <query> [--out <dir>]        Search indexed files")
 		fmt.Println("  heimdall-mcp recall --query <text> [--format]    Recall memories")
@@ -193,7 +211,7 @@ func RunCLI(cfg config.Config, args []string) {
 	}
 }
 
-func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string) {
+func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string, excludeFlags []string) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid path: %v\n", err)
@@ -244,17 +262,37 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string) {
 		baseDir = filepath.Join(absPath, ".heimdall_db")
 	}
 
-	// Index with each selected model
+	// Effective exclude list: global config + this invocation's --exclude
+	// flags. Per-invocation flags are additive, never persisted — users who
+	// want global excludes run `heimdall-mcp config set exclude_patterns ...`.
+	effectiveExcludes := append([]string{}, cfg.ExcludePatterns...)
+	effectiveExcludes = append(effectiveExcludes, excludeFlags...)
+
+	reg := registry.LoadRegistry()
+	name := filepath.Base(absPath)
+
+	// Index with each selected model. For each model, we ALSO run the
+	// sub-repo pass so every sub-repo gets a store under that same model
+	// (unless pinned to a different one). This mirrors how the outer pass
+	// loops over models.
 	for i, modelName := range selectedModels {
 		if i > 0 {
 			fmt.Println()
 		}
-		indexWithModel(ctx, cfg, client, absPath, baseDir, modelName)
+		subResults := indexWithModel(ctx, cfg, client, absPath, baseDir, modelName, effectiveExcludes)
+
+		// Register each successful sub-repo in the project registry. Failures
+		// are surfaced in the summary but do not get registered (otherwise
+		// `heimdall-mcp projects` would list broken entries).
+		for _, sr := range subResults {
+			if sr.Err != nil || sr.Result == nil {
+				continue
+			}
+			reg.Register(sr.Name, sr.Path, sr.DBPath)
+		}
 	}
 
-	// Register project in registry (uses base dir)
-	name := filepath.Base(absPath)
-	reg := registry.LoadRegistry()
+	// Register outer project in registry (uses base dir)
 	reg.Register(name, absPath, baseDir)
 	if err := reg.Save(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save project registry: %v\n", err)
@@ -270,7 +308,10 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string) {
 	}
 }
 
-func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.OllamaClient, absPath, baseDir, modelName string) {
+// indexWithModel runs the outer indexing pass followed by a sub-repo pass
+// and prints the categorized summary (plan §G6). Returns the sub-repo
+// results so the caller can register them.
+func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.OllamaClient, absPath, baseDir, modelName string, excludeGlobs []string) []heimdall.SubRepoResult {
 	heimdall.MigrateToModelDir(baseDir, modelName)
 	dbDir := heimdall.ModelDBDir(baseDir, modelName)
 	store, err := heimdall.OpenStore(dbDir)
@@ -281,11 +322,12 @@ func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.Oll
 	defer store.Close()
 
 	embedder := heimdall.NewOllamaEmbedder(client, modelName)
-	indexer := heimdall.NewIndexer(absPath, embedder, store, heimdall.ChunkerOpts{
+	chunkerOpts := heimdall.ChunkerOpts{
 		MaxChunkSize: 1500,
 		ContextDepth: cfg.ContextDepth,
-		ExcludeGlobs: cfg.ExcludePatterns,
-	})
+		ExcludeGlobs: excludeGlobs,
+	}
+	indexer := heimdall.NewIndexer(absPath, embedder, store, chunkerOpts)
 
 	startTime := time.Now()
 	fmt.Printf("Indexing %s...\n", absPath)
@@ -296,30 +338,21 @@ func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.Oll
 	progressCh := make(chan heimdall.IndexProgress, 64)
 	indexer.IndexProjectAsync(ctx, progressCh)
 
+	var outerResult *heimdall.IndexResult
 	lastPrint := time.Now()
 	for p := range progressCh {
 		if p.Done {
 			if p.Err != nil {
 				fmt.Fprintf(os.Stderr, "\nIndexing failed: %v\n", p.Err)
-				return
+				return nil
 			}
-			r := p.Result
-			elapsed := time.Since(startTime).Round(time.Second)
-			fmt.Printf("\n\nDone.\n")
-			fmt.Printf("  Model:    %s\n", modelName)
-			fmt.Printf("  Elapsed:  %s\n", elapsed)
-			fmt.Printf("  Scanned:  %d files\n", r.FilesScanned)
-			fmt.Printf("  Indexed:  %d files\n", r.FilesIndexed)
-			fmt.Printf("  Skipped:  %d files (unchanged)\n", r.FilesSkipped)
-			fmt.Printf("  Chunks:   %d\n", r.ChunksCreated)
-			fmt.Printf("  Database: %s\n", dbDir)
-
+			outerResult = p.Result
 			// Stamp model metadata
 			store.SetMetadata("embedding_model", modelName)
 			if vec, err := embedder.Embed(ctx, "test"); err == nil {
 				store.SetMetadata("embedding_dim", fmt.Sprintf("%d", len(vec)))
 			}
-			return
+			break
 		}
 
 		now := time.Now()
@@ -335,6 +368,95 @@ func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.Oll
 			lastPrint = now
 		}
 	}
+	if outerResult == nil {
+		return nil
+	}
+
+	// Sub-repo pass: index each discovered sub-repo as its own project.
+	subResults, subErr := indexer.IndexSubRepos(ctx, modelName, heimdall.SubRepoOpts{})
+	if subErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: sub-repo discovery failed: %v\n", subErr)
+	}
+
+	elapsed := time.Since(startTime).Round(time.Second)
+	renderIndexSummary(os.Stdout, modelName, elapsed, dbDir, outerResult, subResults)
+	return subResults
+}
+
+// renderIndexSummary prints the categorized outer-pass summary followed by
+// the sub-repo list (plan §G6). The writer is abstracted so tests can
+// capture the output without stubbing os.Stdout.
+func renderIndexSummary(w io.Writer, model string, elapsed time.Duration, dbDir string, r *heimdall.IndexResult, subs []heimdall.SubRepoResult) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Done.")
+	fmt.Fprintf(w, "  Model:    %s\n", model)
+	fmt.Fprintf(w, "  Elapsed:  %s\n", elapsed)
+	fmt.Fprintf(w, "  Scanned:  %d files\n", r.FilesScanned)
+	fmt.Fprintf(w, "  Indexed:  %d files\n", r.FilesIndexed)
+	fmt.Fprintf(w, "  Skipped:  %d files\n", r.FilesSkipped)
+	if r.Skip.Unchanged > 0 {
+		fmt.Fprintf(w, "    └─ %d unchanged (incremental)\n", r.Skip.Unchanged)
+	}
+	if r.Skip.UserExcluded > 0 {
+		fmt.Fprintf(w, "    └─ %d excluded by pattern\n", r.Skip.UserExcluded)
+	}
+	if r.Skip.Binary > 0 {
+		fmt.Fprintf(w, "    └─ %d binary\n", r.Skip.Binary)
+	}
+	if r.Skip.SubRepo > 0 {
+		// Sub-repo skip counts only reflect that a dir was NOT walked into
+		// the outer store; the sub-repo pass indexes them separately.
+		fmt.Fprintf(w, "    └─ %d sub-repo directories (indexed separately below)\n", r.Skip.SubRepo)
+	}
+
+	// Count successes, failures, and detect first-time sub-repo indexing so
+	// we can emit the "may take longer" hint from plan §G6.
+	var succeeded, failed, firstTime int
+	for _, s := range subs {
+		if s.Err != nil || s.Result == nil {
+			failed++
+			continue
+		}
+		succeeded++
+		// "First time" heuristic: if the sub-repo had no pre-existing pinned
+		// model, its store didn't exist before this run.
+		if !s.PinnedModel {
+			// If the caller's model equals the outer model, this run just
+			// created the store — approximate "first time" as the store
+			// having exactly one indexed file count equal to FilesIndexed
+			// with no Unchanged hits (no prior run could produce Unchanged
+			// records). Conservative: treat any non-pinned sub-repo with
+			// Skip.Unchanged == 0 as newly created.
+			if s.Result.Skip.Unchanged == 0 {
+				firstTime++
+			}
+		}
+	}
+	if len(subs) > 0 {
+		fmt.Fprintf(w, "  Sub-repos: %d indexed separately\n", succeeded)
+		for _, s := range subs {
+			if s.Err != nil || s.Result == nil {
+				fmt.Fprintf(w, "    └─ %s  FAILED: %v\n", s.Name, s.Err)
+				continue
+			}
+			pinnedSuffix := ""
+			if s.PinnedModel {
+				pinnedSuffix = " — pinned"
+			}
+			fmt.Fprintf(w, "    └─ %s  [%s%s]  (%d files, %d chunks)  → %s\n",
+				s.Name, s.Model, pinnedSuffix, s.Result.FilesIndexed, s.Result.ChunksCreated, s.DBPath)
+		}
+		if failed > 0 {
+			fmt.Fprintf(w, "    (note: %d sub-repo(s) failed — see entries above)\n", failed)
+		}
+		if firstTime > 0 {
+			fmt.Fprintln(w, "  Note: first indexing of sub-repos may take longer; subsequent runs are incremental.")
+		}
+	}
+
+	fmt.Fprintf(w, "  Chunks:   %d\n", r.ChunksCreated)
+	fmt.Fprintf(w, "  Database: %s\n", dbDir)
 }
 
 // cliSearch parses `search <query> [--out <dir>] [--format text|hook-md]
@@ -635,7 +757,7 @@ func cliConfigure(args []string) {
 		fmt.Fprintf(os.Stderr, "\nKeys: model, git.enabled, git.depth, git.include_diffs, git.branches,\n")
 		fmt.Fprintf(os.Stderr, "      stale_timeout_minutes, lifecycle.active_days,\n")
 		fmt.Fprintf(os.Stderr, "      lifecycle.archive_days, max_chunks_per_project,\n")
-		fmt.Fprintf(os.Stderr, "      llm_classifier_model\n")
+		fmt.Fprintf(os.Stderr, "      llm_classifier_model, exclude_patterns\n")
 		os.Exit(1)
 	}
 
@@ -722,6 +844,8 @@ func getConfigKey(cfg *config.Config, key string) (any, bool) {
 		return cfg.MaxChunksPerProject, true
 	case "llm_classifier_model":
 		return cfg.LLMClassifierModel, true
+	case "exclude_patterns":
+		return cfg.ExcludePatterns, true
 	default:
 		return nil, false
 	}
@@ -773,6 +897,15 @@ func setConfigKey(cfg *config.Config, key, rawVal string) error {
 		cfg.MaxChunksPerProject = n
 	case "llm_classifier_model":
 		cfg.LLMClassifierModel = rawVal
+	case "exclude_patterns":
+		var patterns []string
+		if err := json.Unmarshal([]byte(rawVal), &patterns); err != nil {
+			return fmt.Errorf("exclude_patterns requires a JSON array: %w", err)
+		}
+		if err := config.ValidateExcludePatterns(patterns); err != nil {
+			return err
+		}
+		cfg.ExcludePatterns = patterns
 	default:
 		return fmt.Errorf("unknown config key: %s", key)
 	}

@@ -330,9 +330,6 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 				if p.Err == nil {
 					name := filepath.Base(absPath)
 					s.Registry.Register(name, absPath, baseDir)
-					if err := s.Registry.Save(); err != nil {
-						log.Printf("failed to save registry: %v", err)
-					}
 
 					// Stamp model metadata so we can detect mismatches later
 					store.SetMetadata("embedding_model", s.Cfg.Model)
@@ -343,7 +340,7 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 						}
 					}
 
-					// 4.2: Auto-detect git repo and index commits
+					// 4.2: Auto-detect git repo and index commits (outer)
 					gitDir := filepath.Join(absPath, ".git")
 					if info, err := os.Stat(gitDir); err == nil && info.IsDir() {
 						gitResult, gitErr := heimdall.IndexGitCommits(ctx, absPath, 200, embedder, store)
@@ -354,17 +351,51 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 						}
 					}
 
-					// Also index git commits from immediate sub-repos discovered
-					// by the same helper the indexer uses, so both paths stay in
-					// sync on what counts as a sub-repo.
-					for subName := range heimdall.DiscoverSubRepos(absPath) {
-						subPath := filepath.Join(absPath, subName)
-						gitResult, gitErr := heimdall.IndexGitCommits(ctx, subPath, 200, embedder, store)
-						if gitErr != nil {
-							log.Printf("git commit indexing for %s failed: %v", subName, gitErr)
-						} else if gitResult.CommitsIndexed > 0 {
-							log.Printf("git commit indexing for %s: %d commits, %d chunks", subName, gitResult.CommitsIndexed, gitResult.ChunksCreated)
+					// Sub-repo pass: index each immediate sub-repo as its own
+					// project, register each, and index its git commits INTO
+					// ITS OWN STORE (fixes the tools.go:362 bug where sub-repo
+					// commits were being written to the outer store).
+					subResults, subErr := indexer.IndexSubRepos(ctx, s.Cfg.Model, heimdall.SubRepoOpts{})
+					if subErr != nil {
+						log.Printf("sub-repo discovery failed: %v", subErr)
+					}
+					for _, sr := range subResults {
+						if sr.Err != nil || sr.Result == nil {
+							log.Printf("sub-repo %s failed: %v", sr.Path, sr.Err)
+							continue
 						}
+						s.Registry.Register(sr.Name, sr.Path, sr.DBPath)
+
+						// Open the sub-repo's OWN store for git-commit indexing.
+						subDBDir := heimdall.ModelDBDir(sr.DBPath, sr.Model)
+						subStore, err := heimdall.OpenStore(subDBDir)
+						if err != nil {
+							log.Printf("open sub-repo store for git commits %s: %v", subDBDir, err)
+							continue
+						}
+						subGitDir := filepath.Join(sr.Path, ".git")
+						if _, err := os.Stat(subGitDir); err == nil {
+							subEmbedder := embedder
+							if sr.Model != s.Cfg.Model {
+								// Rebuild the embedder for the pinned model so
+								// we do not embed with a model whose dims
+								// mismatch the sub-repo's store.
+								subEmbedder = heimdall.NewOllamaEmbedder(client, sr.Model)
+							}
+							gitResult, gitErr := heimdall.IndexGitCommits(ctx, sr.Path, 200, subEmbedder, subStore)
+							if gitErr != nil {
+								log.Printf("git commit indexing for %s failed: %v", sr.Name, gitErr)
+							} else if gitResult.CommitsIndexed > 0 {
+								log.Printf("git commit indexing for %s: %d commits, %d chunks", sr.Name, gitResult.CommitsIndexed, gitResult.ChunksCreated)
+							}
+						}
+						if closeErr := subStore.Close(); closeErr != nil {
+							log.Printf("close sub-repo store %s: %v", subDBDir, closeErr)
+						}
+					}
+
+					if err := s.Registry.Save(); err != nil {
+						log.Printf("failed to save registry: %v", err)
 					}
 				}
 				return
@@ -691,4 +722,3 @@ func (s *Server) toolLs(args json.RawMessage) MCPToolResult {
 	out, _ := json.MarshalIndent(entries, "", "  ")
 	return TextResult(string(out))
 }
-

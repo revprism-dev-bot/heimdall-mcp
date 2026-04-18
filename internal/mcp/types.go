@@ -104,7 +104,7 @@ type SearchResultEnriched struct {
 	EndLine        int     `json:"endLine"`
 	Content        string  `json:"content"`
 	Score          float64 `json:"score"`
-	Source         string  `json:"source"`         // "code", "external", "memory"
+	Source         string  `json:"source"` // "code", "external", "memory"
 	ChunkID        string  `json:"chunkId"`
 	EmbeddingModel string  `json:"embeddingModel"`
 	Summary        string  `json:"summary,omitempty"`
@@ -172,7 +172,7 @@ type RelatedItem struct {
 type rememberInput struct {
 	Content     string   `json:"content"`
 	Tags        []string `json:"tags"`
-	Type        string   `json:"type"`         // "preference", "decision", "fact", "context", "skill"
+	Type        string   `json:"type"` // "preference", "decision", "fact", "context", "skill"
 	Project     string   `json:"project"`
 	ContextPath string   `json:"context_path"` // optional slash-separated subpath within the project; auto-derived from CWD when empty
 	// SkillName is the human-readable skill name. Used (when WriteFile

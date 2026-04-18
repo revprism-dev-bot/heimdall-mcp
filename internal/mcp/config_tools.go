@@ -26,9 +26,9 @@ type managePathsInput struct {
 // --- Config key definitions ---
 
 type configKeyDef struct {
-	Type    string // "bool", "int", "[]string"
-	Get     func(c *config.Config) any
-	Set     func(c *config.Config, v any) error
+	Type string // "bool", "int", "[]string"
+	Get  func(c *config.Config) any
+	Set  func(c *config.Config, v any) error
 }
 
 var configKeys = map[string]configKeyDef{
@@ -140,6 +140,23 @@ var configKeys = map[string]configKeyDef{
 				return fmt.Errorf("expected int for max_chunks_per_project: %w", err)
 			}
 			c.MaxChunksPerProject = n
+			return nil
+		},
+	},
+	"exclude_patterns": {
+		Type: "[]string",
+		Get:  func(c *config.Config) any { return c.ExcludePatterns },
+		Set: func(c *config.Config, v any) error {
+			s, err := toStringSlice(v)
+			if err != nil {
+				return fmt.Errorf("expected []string for exclude_patterns: %w", err)
+			}
+			// Reject absolute paths at the MCP boundary, same as the CLI
+			// `--exclude` surface (plan §6 M6 resolution).
+			if err := config.ValidateExcludePatterns(s); err != nil {
+				return err
+			}
+			c.ExcludePatterns = s
 			return nil
 		},
 	},

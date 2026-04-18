@@ -249,7 +249,15 @@ func TestIndexAll_DoesNotSkip(t *testing.T) {
 	}
 }
 
-func TestIndexAll_SkipsSubRepoDirectories(t *testing.T) {
+// TestIndexAll_SubRepoFilesNotInOuterStore verifies that immediate sub-repos
+// (directories containing a .git entry) are NOT merged into the outer store.
+// Previously named TestIndexAll_SkipsSubRepoDirectories — renamed because
+// the plan now indexes sub-repos as separate projects (see IndexSubRepos).
+// The outer-store contract is unchanged: outer files land here, sub-repo
+// files do not. Also asserts Skip.SubRepo counts discovered sub-repo
+// directories (2) and that default-hygiene (.git inside each sub-repo) does
+// NOT leak into UserExcluded.
+func TestIndexAll_SubRepoFilesNotInOuterStore(t *testing.T) {
 	// Create a parent project with a sub-repo (directory containing .git/)
 	root := t.TempDir()
 
@@ -311,6 +319,18 @@ func TestIndexAll_SkipsSubRepoDirectories(t *testing.T) {
 	if !store.HasFile("pkg/lib.go") {
 		t.Error("regular subdir file pkg/lib.go should be indexed")
 	}
+
+	// NEW: sub-repo discovery is surfaced on the result.
+	if result.Skip.SubRepo != 2 {
+		t.Errorf("Skip.SubRepo = %d, want 2 (sub-service, sub-infra)", result.Skip.SubRepo)
+	}
+	if len(result.SubRepos) != 2 {
+		t.Errorf("SubRepos = %v, want 2 entries", result.SubRepos)
+	}
+	// INVARIANT: default-excluded hygiene dirs DO NOT bump UserExcluded.
+	if result.Skip.UserExcluded != 0 {
+		t.Errorf("Skip.UserExcluded = %d, want 0 (no user patterns configured)", result.Skip.UserExcluded)
+	}
 }
 
 func TestIndexAll_SubProjectTagging(t *testing.T) {
@@ -367,6 +387,257 @@ func TestIndexAll_SubProjectTagging(t *testing.T) {
 	}
 }
 
+// TestIndexResult_SkipBinaryCounted asserts the walker bumps Skip.Binary
+// when the NUL-byte sniff trips, not the generic FilesSkipped counter alone.
+func TestIndexResult_SkipBinaryCounted(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "bin.dat"), []byte{0x00, 0x01, 0x02, 0x03}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "ok.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Skip.Binary != 1 {
+		t.Errorf("Skip.Binary = %d, want 1 (result=%+v)", result.Skip.Binary, result)
+	}
+	if result.FilesIndexed != 1 {
+		t.Errorf("FilesIndexed = %d, want 1 (only ok.go)", result.FilesIndexed)
+	}
+}
+
+// TestIndexResult_SkipUnchangedCounted asserts the incremental path bumps
+// Skip.Unchanged (not just FilesSkipped) so the summary can label it.
+func TestIndexResult_SkipUnchangedCounted(t *testing.T) {
+	files := map[string]string{
+		"a.go": "package main\nfunc a() {}",
+		"b.go": "package main\nfunc b() {}",
+	}
+	root := createTestProject(t, files)
+	store, err := OpenStore(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+	if _, err := idx.IndexAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := idx.IndexIncremental(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Skip.Unchanged != 2 {
+		t.Errorf("Skip.Unchanged = %d, want 2", result.Skip.Unchanged)
+	}
+	if result.Skip.UserExcluded != 0 || result.Skip.SubRepo != 0 || result.Skip.Binary != 0 {
+		t.Errorf("other counters should be 0, got %+v", result.Skip)
+	}
+}
+
+// TestIndexResult_UserExcludedCountsOnlyUserPatterns is the H1 regression —
+// only user-configured patterns bump Skip.UserExcluded; default hygiene
+// (.git, node_modules) stays silent.
+func TestIndexResult_UserExcludedCountsOnlyUserPatterns(t *testing.T) {
+	root := t.TempDir()
+	// User pattern: "generated" — files under generated/ should be counted.
+	if err := os.MkdirAll(filepath.Join(root, "generated"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "generated", "x.go"), []byte("package g\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Default-excluded: node_modules — must NOT bump the counter.
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "node_modules", "y.go"), []byte("package y\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Regular file.
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{
+		MaxChunkSize: 1500,
+		ExcludeGlobs: []string{"generated"},
+	})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Skip.UserExcluded != 1 {
+		t.Errorf("Skip.UserExcluded = %d, want 1 (only 'generated' dir)", result.Skip.UserExcluded)
+	}
+	if result.FilesIndexed != 1 {
+		t.Errorf("FilesIndexed = %d, want 1 (just a.go)", result.FilesIndexed)
+	}
+}
+
+// TestExclude_DefaultHygieneNotCounted is the H1 regression test: a fixture
+// containing only default-excluded dirs + one regular file must produce
+// FilesSkipped == 0 (matches TestIndexAll_DoesNotSkip semantics).
+func TestExclude_DefaultHygieneNotCounted(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "config"), []byte("[core]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "node_modules", "a.js"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Skip.UserExcluded != 0 {
+		t.Errorf("Skip.UserExcluded = %d, want 0 (only default hygiene)", result.Skip.UserExcluded)
+	}
+	if result.Skip.SubRepo != 0 {
+		t.Errorf("Skip.SubRepo = %d, want 0 (.git is default-exclude, not sub-repo)", result.Skip.SubRepo)
+	}
+	if result.FilesSkipped != 0 {
+		t.Errorf("FilesSkipped = %d, want 0 (default hygiene is silent)", result.FilesSkipped)
+	}
+	if result.FilesIndexed != 1 {
+		t.Errorf("FilesIndexed = %d, want 1 (just a.go)", result.FilesIndexed)
+	}
+}
+
+// TestDiscoverSubRepos_GitlinkFile covers the git-worktree case where `.git`
+// is a regular file ("gitlink") rather than a directory. The existing walker
+// guarded sub-repo detection with info.IsDir(), which silently ignored
+// worktrees and indexed them into the outer DB.
+func TestDiscoverSubRepos_GitlinkFile(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "wt")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// .git is a FILE (gitlink), not a directory
+	if err := os.WriteFile(filepath.Join(sub, ".git"), []byte("gitdir: /some/worktrees/wt\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got := DiscoverSubRepos(root)
+	if !got["wt"] {
+		t.Errorf("expected wt in subRepoDirs, got %v", got)
+	}
+}
+
+// TestDiscoverSubReposAbs_ReturnsAbsolutePaths exercises the plan's §4
+// helper: scan immediate subdirectories and return absolute paths of those
+// containing a `.git` entry (dir OR file).
+func TestDiscoverSubReposAbs_ReturnsAbsolutePaths(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "a", ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "b", ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Not a sub-repo — plain directory.
+	if err := os.MkdirAll(filepath.Join(root, "plain"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := DiscoverSubReposAbs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d, want 2 (%v)", len(got), got)
+	}
+	for _, p := range got {
+		if !filepath.IsAbs(p) {
+			t.Errorf("expected absolute path, got %q", p)
+		}
+	}
+}
+
+// TestDiscoverSubReposAbs_ReadErrorPropagates is the L1 regression: an
+// unreadable root must return an error rather than a silent empty slice.
+func TestDiscoverSubReposAbs_ReadErrorPropagates(t *testing.T) {
+	_, err := DiscoverSubReposAbs("/definitely/not/a/real/path/abc123xyz")
+	if err == nil {
+		t.Fatal("expected error for nonexistent root, got nil")
+	}
+}
+
+// TestDiscoverSubReposAbs_IgnoresSymlinks is the M4 regression: symlinks to
+// git repos are NOT auto-discovered (matches git, fd, ripgrep defaults and
+// avoids double-indexing when `outer-a/child -> outer-b/child`).
+func TestDiscoverSubReposAbs_IgnoresSymlinks(t *testing.T) {
+	realRepo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(realRepo, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.Symlink(realRepo, filepath.Join(root, "linked-sub")); err != nil {
+		t.Skipf("symlink unsupported on this platform: %v", err)
+	}
+	got, err := DiscoverSubReposAbs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 discovered (symlinks ignored), got %v", got)
+	}
+}
+
+// TestDiscoverSubReposAbs_GitlinkFile mirrors the gitlink test for the new
+// helper: worktrees must be detected.
+func TestDiscoverSubReposAbs_GitlinkFile(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "wt")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, ".git"), []byte("gitdir: /some/worktrees/wt\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := DiscoverSubReposAbs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1 (%v)", len(got), got)
+	}
+	if filepath.Base(got[0]) != "wt" {
+		t.Errorf("got %q, want basename 'wt'", got[0])
+	}
+}
+
 func TestDiscoverSubRepoDirs_Empty(t *testing.T) {
 	root := t.TempDir()
 	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
@@ -382,6 +653,338 @@ func TestDiscoverSubRepoDirs_Empty(t *testing.T) {
 	subRepoDirs := DiscoverSubRepos(root)
 	if len(subRepoDirs) != 0 {
 		t.Errorf("expected empty subRepoDirs, got %v", subRepoDirs)
+	}
+}
+
+// TestIndexResult_SkipBreakdownSums asserts the invariant that the four
+// SkipBreakdown counters sum to FilesSkipped. This is the contract that lets
+// the CLI render the categorized summary without a discrepancy against the
+// legacy counter.
+func TestIndexResult_SkipBreakdownSums(t *testing.T) {
+	files := map[string]string{"a.go": "package a\n"}
+	root := createTestProject(t, files)
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.Skip.UserExcluded + result.Skip.SubRepo + result.Skip.Binary + result.Skip.Unchanged
+	if got != result.FilesSkipped {
+		t.Errorf("breakdown sum %d != FilesSkipped %d (Skip=%+v)", got, result.FilesSkipped, result.Skip)
+	}
+}
+
+// TestIndexSubRepos_CreatesSeparateDBs verifies that the sub-repo pass
+// creates a distinct .heimdall_db under each immediate sub-repo.
+func TestIndexSubRepos_CreatesSeparateDBs(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	if _, err := idx.IndexAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	subResults, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subResults) != 1 {
+		t.Fatalf("got %d sub-results, want 1", len(subResults))
+	}
+	subDB := filepath.Join(sub, ".heimdall_db", "nomic-embed-text", "vectors.db")
+	if _, err := os.Stat(subDB); err != nil {
+		t.Errorf("sub DB not created at %s: %v", subDB, err)
+	}
+	sr := subResults[0]
+	if sr.Err != nil {
+		t.Errorf("sub %s: unexpected Err = %v", sr.Path, sr.Err)
+	}
+	if sr.Result == nil {
+		t.Fatalf("sub %s: expected non-nil Result", sr.Path)
+	}
+	if sr.Result.FilesIndexed != 1 {
+		t.Errorf("sub %s: FilesIndexed = %d, want 1", sr.Path, sr.Result.FilesIndexed)
+	}
+	if sr.Name != "child" {
+		t.Errorf("sub Name = %q, want 'child'", sr.Name)
+	}
+}
+
+// TestIndexSubRepos_OuterWrapperStillIndexed is the G1 regression: the outer
+// DB contains the outer files and NONE of the sub-repo files; the sub-repo
+// DB contains only its own files.
+func TestIndexSubRepos_OuterWrapperStillIndexed(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "pkg"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "pkg", "lib.go"), []byte("package pkg\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	if _, err := idx.IndexAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !outerStore.HasFile("main.go") {
+		t.Error("outer store missing main.go")
+	}
+	if !outerStore.HasFile("pkg/lib.go") {
+		t.Error("outer store missing pkg/lib.go")
+	}
+	if outerStore.HasFile("child/c.go") {
+		t.Error("outer store must NOT contain child/c.go (sub-repo contents)")
+	}
+
+	// Sub-repo pass: opens a fresh store under child/.heimdall_db.
+	if _, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	subStore, err := OpenStore(filepath.Join(sub, ".heimdall_db", "nomic-embed-text"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subStore.Close()
+	if !subStore.HasFile("c.go") {
+		t.Error("sub store missing c.go")
+	}
+	if subStore.HasFile("main.go") {
+		t.Error("sub store must NOT contain main.go (outer contents)")
+	}
+}
+
+// TestIndexSubRepos_PinnedModelNotClobbered is the G4 rule 1 regression:
+// if a sub-repo already has an index under a different model, that pinned
+// model is preserved and the caller's requested model is ignored.
+func TestIndexSubRepos_PinnedModelNotClobbered(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-create a bge-m3 store to pin the sub-repo to that model.
+	pinnedDir := filepath.Join(sub, ".heimdall_db", "bge-m3")
+	if err := os.MkdirAll(pinnedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	pinnedStore, err := OpenStore(pinnedDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedStore.Close()
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	subResults, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subResults) != 1 {
+		t.Fatalf("got %d sub-results, want 1", len(subResults))
+	}
+	if subResults[0].Model != "bge-m3" {
+		t.Errorf("Model = %q, want 'bge-m3' (pinned beats caller)", subResults[0].Model)
+	}
+	if !subResults[0].PinnedModel {
+		t.Errorf("PinnedModel = false, want true (store pre-existed)")
+	}
+	// The caller's nomic-embed-text store must NOT have been created.
+	if _, err := os.Stat(filepath.Join(sub, ".heimdall_db", "nomic-embed-text")); err == nil {
+		t.Error("nomic-embed-text dir should NOT exist (pinned bge-m3 won)")
+	}
+}
+
+// TestIndexSubRepos_ExcludedSubRepoSkipped verifies that a sub-repo matching
+// a user-exclude pattern is NOT indexed separately (and thus no .heimdall_db
+// is created under it).
+func TestIndexSubRepos_ExcludedSubRepoSkipped(t *testing.T) {
+	root := t.TempDir()
+	subA := filepath.Join(root, "sub-a")
+	subB := filepath.Join(root, "sub-b")
+	for _, s := range []string{subA, subB} {
+		if err := os.MkdirAll(filepath.Join(s, ".git"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(s, "f.go"), []byte("package x\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{
+		MaxChunkSize: 1500,
+		ExcludeGlobs: []string{"sub-b"},
+	})
+
+	subResults, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subResults) != 1 {
+		t.Fatalf("got %d sub-results, want 1 (sub-a only)", len(subResults))
+	}
+	if subResults[0].Name != "sub-a" {
+		t.Errorf("sub Name = %q, want 'sub-a'", subResults[0].Name)
+	}
+	if _, err := os.Stat(filepath.Join(subB, ".heimdall_db")); err == nil {
+		t.Error("sub-b/.heimdall_db should NOT exist (excluded by user)")
+	}
+}
+
+// TestIndexSubRepos_NestedSubRepoInSubRepo covers edge case 6: a sub-repo
+// that itself contains another sub-repo. The orchestrator is expected to
+// recurse logically — once IndexSubRepos is called on the outer, the
+// sub-repo indexer will see its own child sub-repos when its caller (the
+// orchestrator) runs IndexSubRepos on it. This test exercises the direct
+// recursion step: calling IndexSubRepos at level 1 leaves level-2 to be
+// picked up by the orchestrator, so we verify only that the level-1
+// sub-repo's own outer store has been populated but the level-2 sub-repo's
+// files are NOT merged into level-1.
+func TestIndexSubRepos_NestedSubRepoInSubRepo(t *testing.T) {
+	root := t.TempDir()
+	subA := filepath.Join(root, "a")
+	if err := os.MkdirAll(filepath.Join(subA, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subA, "a.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	subB := filepath.Join(subA, "b")
+	if err := os.MkdirAll(filepath.Join(subB, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subB, "b.go"), []byte("package b\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	subResults, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subResults) != 1 {
+		t.Fatalf("got %d sub-results at level 1, want 1 (sub-a only)", len(subResults))
+	}
+	// The sub-a store exists and holds a.go but NOT b/b.go (skip-dir fired).
+	subAStore, err := OpenStore(filepath.Join(subA, ".heimdall_db", "nomic-embed-text"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subAStore.Close()
+	if !subAStore.HasFile("a.go") {
+		t.Error("sub-a store missing a.go")
+	}
+	if subAStore.HasFile("b/b.go") {
+		t.Error("sub-a store must NOT contain b/b.go (b is itself a sub-repo)")
+	}
+	// level-1 result should record the inner sub-repo discovery so an
+	// orchestrator can recurse.
+	if len(subResults[0].Result.SubRepos) != 1 {
+		t.Errorf("sub-a Result.SubRepos = %v, want 1 entry (b)", subResults[0].Result.SubRepos)
+	}
+}
+
+// TestSubRepoResult_NilResultOnStoreOpenFailure is the L2 regression: if the
+// store cannot be opened, the SubRepoResult has Err != nil and Result == nil.
+// Callers must gate on Err before dereffing Result.
+func TestSubRepoResult_NilResultOnStoreOpenFailure(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Put a regular FILE where OpenStore wants to create a directory. The
+	// model subdir join (<sub>/.heimdall_db/<model>) will fail when mkdirall
+	// hits this file, yielding a store-open error.
+	if err := os.WriteFile(filepath.Join(sub, ".heimdall_db"), []byte("blocker"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	subResults, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{})
+	if err != nil {
+		t.Fatalf("discovery-level err = %v; expected nil (failures are per-entry)", err)
+	}
+	if len(subResults) != 1 {
+		t.Fatalf("got %d sub-results, want 1", len(subResults))
+	}
+	r := subResults[0]
+	if r.Err == nil {
+		t.Error("expected Err != nil for store-open failure")
+	}
+	if r.Result != nil {
+		t.Errorf("Result must be nil on store-open failure, got %+v", r.Result)
+	}
+	if r.Path == "" || r.Name == "" || r.DBPath == "" {
+		t.Errorf("Path/Name/DBPath must be populated even on failure: %+v", r)
 	}
 }
 
@@ -420,6 +1023,156 @@ func TestIndexer_NoFileCountCap(t *testing.T) {
 	}
 	if result.FilesIndexed != n {
 		t.Errorf("FilesIndexed = %d, want %d", result.FilesIndexed, n)
+	}
+}
+
+// TestIndexAll_SubReposOnlyImmediateChildrenRecorded is the M2 regression:
+// the outer walker previously recorded any dir with a `.git` inside at
+// ARBITRARY depth, but DiscoverSubReposAbs/IndexSubRepos only handle
+// immediate children. The mismatch meant a deeply-nested repo (e.g.
+// outer/services/payments/.git) appeared in result.SubRepos /
+// Skip.SubRepo but was never actually indexed as a separate project.
+//
+// Fix: the walker now records only IMMEDIATE sub-repos of idx.root,
+// matching DiscoverSubReposAbs. Sub-repos deeper than one level are
+// still skipped by filepath.SkipDir (so their files do NOT leak into
+// the outer store) but are not reported in result.SubRepos — the
+// orchestrator never claimed to handle them and the plan's "sub-repo-
+// inside-sub-repo" guarantee only kicks in when each intermediate is
+// itself a sub-repo.
+func TestIndexAll_SubReposOnlyImmediateChildrenRecorded(t *testing.T) {
+	root := t.TempDir()
+
+	// Outer file at root.
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deep sub-repo: outer/services/payments/.git
+	deep := filepath.Join(root, "services", "payments")
+	if err := os.MkdirAll(filepath.Join(deep, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deep, "p.go"), []byte("package p\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Immediate sub-repo: outer/libx/.git
+	shallow := filepath.Join(root, "libx")
+	if err := os.MkdirAll(filepath.Join(shallow, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shallow, "x.go"), []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the IMMEDIATE sub-repo should be recorded. services/payments
+	// (depth 2) must NOT appear — the orchestrator cannot index it
+	// anyway, and surfacing it in the summary would be misleading.
+	if len(result.SubRepos) != 1 {
+		t.Fatalf("SubRepos = %v, want exactly 1 entry (immediate child 'libx'); deeper repos must not be recorded",
+			result.SubRepos)
+	}
+	if result.SubRepos[0] != "libx" {
+		t.Errorf("SubRepos[0] = %q, want 'libx'", result.SubRepos[0])
+	}
+
+	// Skip.SubRepo counter must match len(SubRepos) — invariant that keeps
+	// the CLI summary renderer consistent.
+	if result.Skip.SubRepo != 1 {
+		t.Errorf("Skip.SubRepo = %d, want 1", result.Skip.SubRepo)
+	}
+
+	// Sanity: neither sub-repo's files leaked into the outer store.
+	if outerStore.HasFile("services/payments/p.go") {
+		t.Error("outer store must NOT contain services/payments/p.go (deep sub-repo files)")
+	}
+	if outerStore.HasFile("libx/x.go") {
+		t.Error("outer store must NOT contain libx/x.go (shallow sub-repo files)")
+	}
+
+	// And the outer file IS indexed.
+	if !outerStore.HasFile("main.go") {
+		t.Error("outer store missing main.go")
+	}
+}
+
+// TestIndexSubRepos_StampsEmbeddingDim is the H2 regression test:
+// IndexSubRepos MUST stamp both embedding_model AND embedding_dim on the
+// sub-repo store, matching what the outer indexer (cli.go:352-354 and
+// tools.go:336-340) does for the outer store.
+//
+// Without embedding_dim, VerifyHookIndexDim rejects the store with
+// ErrIndexDimMismatch, breaking the hook path for any search scoped to a
+// sub-repo.
+func TestIndexSubRepos_StampsEmbeddingDim(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+
+	const dim = 5
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: dim}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	subResults, err := idx.IndexSubRepos(context.Background(), "test-model", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subResults) != 1 {
+		t.Fatalf("got %d sub-results, want 1", len(subResults))
+	}
+	if subResults[0].Err != nil {
+		t.Fatalf("sub-repo failed: %v", subResults[0].Err)
+	}
+
+	// Open the sub-repo store and verify both metadata fields are populated.
+	subDBDir := ModelDBDir(subResults[0].DBPath, "test-model")
+	subStore, err := OpenStore(subDBDir)
+	if err != nil {
+		t.Fatalf("open sub-store: %v", err)
+	}
+	defer subStore.Close()
+
+	if got := subStore.GetMetadata("embedding_model"); got != "test-model" {
+		t.Errorf("embedding_model = %q, want %q", got, "test-model")
+	}
+	gotDim := subStore.GetMetadata("embedding_dim")
+	if gotDim == "" {
+		t.Fatalf("embedding_dim metadata missing — hook verification will reject this store")
+	}
+	wantDim := fmt.Sprintf("%d", dim)
+	if gotDim != wantDim {
+		t.Errorf("embedding_dim = %q, want %q", gotDim, wantDim)
+	}
+
+	// Cross-check by invoking VerifyHookIndexDim directly — this is the
+	// real consumer that was failing before the fix.
+	if err := VerifyHookIndexDim(subStore, dim); err != nil {
+		t.Errorf("VerifyHookIndexDim(sub-store, %d) = %v, want nil", dim, err)
 	}
 }
 

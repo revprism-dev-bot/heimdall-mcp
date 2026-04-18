@@ -279,10 +279,10 @@ func TestToolExplain_RelationshipTraversal(t *testing.T) {
 func TestToolIndexText_TypedContent(t *testing.T) {
 	// Test the validation and parsing of typed content input
 	validInput := indexTextInput{
-		Content: "ticket content",
-		Source:  "JIRA-123",
-		Type:    "ticket",
-		Metadata: json.RawMessage(`{"status":"open","priority":"high"}`),
+		Content:       "ticket content",
+		Source:        "JIRA-123",
+		Type:          "ticket",
+		Metadata:      json.RawMessage(`{"status":"open","priority":"high"}`),
 		Relationships: json.RawMessage(`[{"type":"implements","target":"EPIC-1"}]`),
 	}
 
