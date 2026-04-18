@@ -230,6 +230,26 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string, e
 	// Migrate legacy .viking_db directory to .heimdall_db
 	heimdall.MigrateDBDir(absPath)
 
+	baseDir := dbPath
+	if baseDir == "" {
+		baseDir = filepath.Join(absPath, ".heimdall_db")
+	}
+
+	// Resume-marker check runs BEFORE Ollama discovery so a Cancel exits
+	// fast without flapping the user through a network ping. Result of
+	// "continue" means we skip model selection entirely; "restart" means
+	// the marker is already deleted and we run normal model selection;
+	// "cancel" exits cleanly with the marker preserved.
+	decision, resumeModels, err := resolveResume(baseDir, absPath, os.Stdin, os.Stdout, isStdinTTY())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Resume check failed: %v\n", err)
+		os.Exit(1)
+	}
+	if decision == resumeCancel {
+		fmt.Println("Cancelled.")
+		return
+	}
+
 	ctx := context.Background()
 	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
 	fmt.Printf("Connecting to Ollama at %s...\n", cfg.OllamaEndpoint)
@@ -240,26 +260,40 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string, e
 	}
 	fmt.Println("Ollama: connected")
 
-	// Discover available embedding models
-	fmt.Println("\nDiscovering embedding models...")
-	discovered, err := discoverEmbeddingModels(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Model discovery failed: %v\n", err)
-		os.Exit(1)
-	}
-	formatDiscoveryResults(discovered)
-	fmt.Println()
+	var selectedModels []string
+	if decision == resumeContinue {
+		// Skip discovery prompts — the marker is the source of truth for
+		// which models the interrupted run was touching.
+		selectedModels = resumeModels
+		fmt.Printf("Resuming with models: %v\n", selectedModels)
+	} else {
+		// resumeProceedFresh or resumeRestart — both go through normal flow.
+		fmt.Println("\nDiscovering embedding models...")
+		discovered, err := discoverEmbeddingModels(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Model discovery failed: %v\n", err)
+			os.Exit(1)
+		}
+		formatDiscoveryResults(discovered)
+		fmt.Println()
 
-	// Pick models: explicit --model wins, then auto-pick from config, else prompt.
-	selectedModels, err := resolveIndexModels(discovered, modelFlag, cfg.Model)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "\n%v\n", err)
-		os.Exit(1)
+		// Pick models: explicit --model wins, then auto-pick from config, else prompt.
+		selectedModels, err = resolveIndexModels(discovered, modelFlag, cfg.Model)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\n%v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	baseDir := dbPath
-	if baseDir == "" {
-		baseDir = filepath.Join(absPath, ".heimdall_db")
+	// Write the resume marker BEFORE the first indexWithModel call so an
+	// interruption mid-indexing leaves a marker for the next run. Writing
+	// after model selection means restarts pick up exactly the set the
+	// user picked this time. If writing fails we surface the error but
+	// continue — missing a marker is worse than a silent-write bug, not
+	// fatal to indexing itself. (If marker write ever fails, the next run
+	// will just look like a fresh start.)
+	if err := heimdall.WriteResumeMarker(baseDir, selectedModels, time.Now()); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to write resume marker: %v\n", err)
 	}
 
 	// Effective exclude list: global config + this invocation's --exclude
@@ -272,9 +306,9 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string, e
 	name := filepath.Base(absPath)
 
 	// Index with each selected model. For each model, we ALSO run the
-	// sub-repo pass so every sub-repo gets a store under that same model
-	// (unless pinned to a different one). This mirrors how the outer pass
-	// loops over models.
+	// sub-repo pass so every sub-repo gets a store under that same model.
+	// The sub-repo pass uses caller-wins semantics — existing subdirs for
+	// OTHER models coexist untouched (see heimdall.IndexSubRepos doc).
 	for i, modelName := range selectedModels {
 		if i > 0 {
 			fmt.Println()
@@ -296,6 +330,14 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlag string, e
 	reg.Register(name, absPath, baseDir)
 	if err := reg.Save(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save project registry: %v\n", err)
+	}
+
+	// Clean completion: remove the resume marker. Any future run starts
+	// fresh. If the delete fails (permissions, fs race) we surface a
+	// warning but do not exit non-zero — indexing succeeded, the stale
+	// marker will just prompt on the next run.
+	if err := heimdall.DeleteResumeMarker(baseDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to remove resume marker: %v\n", err)
 	}
 
 	if len(selectedModels) > 1 {

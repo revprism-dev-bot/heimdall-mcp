@@ -794,9 +794,17 @@ func TestIndexSubRepos_OuterWrapperStillIndexed(t *testing.T) {
 	}
 }
 
-// TestIndexSubRepos_PinnedModelNotClobbered is the G4 rule 1 regression:
-// if a sub-repo already has an index under a different model, that pinned
-// model is preserved and the caller's requested model is ignored.
+// TestIndexSubRepos_PinnedModelNotClobbered (contract rewritten for the
+// multi-model fix): passing a DIFFERENT model adds a new per-model subdir
+// under the sub-repo and does NOT clobber the pre-existing one. Both
+// subdirs must coexist under <sub>/.heimdall_db/.
+//
+// Previous contract: pinned model won, caller's model was silently ignored.
+// That broke multi-model indexing — the second model in the CLI loop never
+// got indexed into any sub-repo because the first model's freshly-created
+// subdir "pinned" every subsequent iteration. New contract: caller wins,
+// and existing other-model subdirs survive untouched. See fix/sub-repo-
+// multi-model-and-resume.
 func TestIndexSubRepos_PinnedModelNotClobbered(t *testing.T) {
 	root := t.TempDir()
 	sub := filepath.Join(root, "child")
@@ -807,7 +815,8 @@ func TestIndexSubRepos_PinnedModelNotClobbered(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pre-create a bge-m3 store to pin the sub-repo to that model.
+	// Pre-create a bge-m3 store. Write a marker file so we can assert
+	// later that the subdir survived the second-model indexing run.
 	pinnedDir := filepath.Join(sub, ".heimdall_db", "bge-m3")
 	if err := os.MkdirAll(pinnedDir, 0755); err != nil {
 		t.Fatal(err)
@@ -817,6 +826,10 @@ func TestIndexSubRepos_PinnedModelNotClobbered(t *testing.T) {
 		t.Fatal(err)
 	}
 	pinnedStore.Close()
+	pinnedMarker := filepath.Join(pinnedDir, "preexisting-marker.txt")
+	if err := os.WriteFile(pinnedMarker, []byte("keep me"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
 	if err != nil {
@@ -833,15 +846,216 @@ func TestIndexSubRepos_PinnedModelNotClobbered(t *testing.T) {
 	if len(subResults) != 1 {
 		t.Fatalf("got %d sub-results, want 1", len(subResults))
 	}
-	if subResults[0].Model != "bge-m3" {
-		t.Errorf("Model = %q, want 'bge-m3' (pinned beats caller)", subResults[0].Model)
+	if subResults[0].Model != "nomic-embed-text" {
+		t.Errorf("Model = %q, want 'nomic-embed-text' (caller wins)", subResults[0].Model)
 	}
-	if !subResults[0].PinnedModel {
-		t.Errorf("PinnedModel = false, want true (store pre-existed)")
+	if subResults[0].PinnedModel {
+		t.Errorf("PinnedModel = true, want false (pinning semantics retired)")
 	}
-	// The caller's nomic-embed-text store must NOT have been created.
-	if _, err := os.Stat(filepath.Join(sub, ".heimdall_db", "nomic-embed-text")); err == nil {
-		t.Error("nomic-embed-text dir should NOT exist (pinned bge-m3 won)")
+	// The caller's nomic-embed-text store MUST have been created.
+	nomicDir := filepath.Join(sub, ".heimdall_db", "nomic-embed-text")
+	if _, err := os.Stat(filepath.Join(nomicDir, "vectors.db")); err != nil {
+		t.Errorf("nomic-embed-text store not created at %s: %v", nomicDir, err)
+	}
+	// The pre-existing bge-m3 subdir MUST still exist untouched.
+	if _, err := os.Stat(pinnedDir); err != nil {
+		t.Errorf("bge-m3 subdir should still exist: %v", err)
+	}
+	if _, err := os.Stat(pinnedMarker); err != nil {
+		t.Errorf("bge-m3 preexisting marker should not be touched: %v", err)
+	}
+}
+
+// TestIndexSubRepos_MultiModelCreatesBothSubdirs verifies the primary
+// multi-model regression: calling IndexSubRepos twice with two different
+// models produces both `.heimdall_db/<model-a>/` AND `.heimdall_db/<model-b>/`
+// under every sub-repo, each populated with indexed chunks. This is the
+// behaviour the CLI's model-loop (cli.go) relies on when the user picks
+// multiple embedders at index time.
+func TestIndexSubRepos_MultiModelCreatesBothSubdirs(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "svc")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "svc.go"), []byte("package svc\nfunc Hi() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+
+	for _, model := range []string{"nomic-embed-text", "bge-m3"} {
+		outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-"+model))
+		if err != nil {
+			t.Fatal(err)
+		}
+		idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+		subResults, err := idx.IndexSubRepos(context.Background(), model, SubRepoOpts{})
+		outerStore.Close()
+		if err != nil {
+			t.Fatalf("IndexSubRepos(%s): %v", model, err)
+		}
+		if len(subResults) != 1 {
+			t.Fatalf("[%s] got %d sub-results, want 1", model, len(subResults))
+		}
+		if subResults[0].Err != nil {
+			t.Fatalf("[%s] sub err: %v", model, subResults[0].Err)
+		}
+		if subResults[0].Model != model {
+			t.Errorf("[%s] Model = %q, want %q (caller wins)", model, subResults[0].Model, model)
+		}
+		if subResults[0].Result == nil || subResults[0].Result.FilesIndexed == 0 {
+			t.Errorf("[%s] expected files indexed, got %+v", model, subResults[0].Result)
+		}
+	}
+
+	for _, model := range []string{"nomic-embed-text", "bge-m3"} {
+		dbPath := filepath.Join(sub, ".heimdall_db", model, "vectors.db")
+		if _, err := os.Stat(dbPath); err != nil {
+			t.Errorf("expected %s store at %s: %v", model, dbPath, err)
+		}
+		s, err := OpenStore(filepath.Join(sub, ".heimdall_db", model))
+		if err != nil {
+			t.Errorf("[%s] OpenStore: %v", model, err)
+			continue
+		}
+		if stats := s.Stats(); stats.TotalRecords == 0 {
+			t.Errorf("[%s] expected records in %s store, got 0", model, model)
+		}
+		s.Close()
+	}
+}
+
+// TestIndexSubRepos_ExplicitModelOverridesExisting asserts that when the
+// sub-repo already has a model-a subdir and the caller requests model-b,
+// the model-b subdir is created and the model-a subdir is left alone.
+// Mirrors the rewritten PinnedModelNotClobbered test but with pre-existing
+// + new model roles swapped for belt-and-braces coverage.
+func TestIndexSubRepos_ExplicitModelOverridesExisting(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	existingDir := filepath.Join(sub, ".heimdall_db", "model-a")
+	if err := os.MkdirAll(existingDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenStore(existingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	results, err := idx.IndexSubRepos(context.Background(), "model-b", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d sub-results, want 1", len(results))
+	}
+	if results[0].Model != "model-b" {
+		t.Errorf("Model = %q, want 'model-b'", results[0].Model)
+	}
+	if results[0].PinnedModel {
+		t.Errorf("PinnedModel = true, want false")
+	}
+	if _, err := os.Stat(filepath.Join(sub, ".heimdall_db", "model-b", "vectors.db")); err != nil {
+		t.Errorf("model-b store not created: %v", err)
+	}
+	if _, err := os.Stat(existingDir); err != nil {
+		t.Errorf("pre-existing model-a subdir was removed: %v", err)
+	}
+}
+
+// TestIndexSubRepos_EmptyModelFallsBackToExisting covers the legacy-caller
+// back-compat path: a caller that passes an empty model string falls back
+// to whichever existing model subdir is present. Useful for tools that
+// don't know the model ahead of time and just want to refresh whatever's
+// already there.
+func TestIndexSubRepos_EmptyModelFallsBackToExisting(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	existingDir := filepath.Join(sub, ".heimdall_db", "legacy-model")
+	if err := os.MkdirAll(existingDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenStore(existingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	results, err := idx.IndexSubRepos(context.Background(), "", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d sub-results, want 1", len(results))
+	}
+	if results[0].Err != nil {
+		t.Errorf("unexpected Err: %v", results[0].Err)
+	}
+	if results[0].Model != "legacy-model" {
+		t.Errorf("Model = %q, want 'legacy-model' (empty-caller fallback)", results[0].Model)
+	}
+}
+
+// TestIndexSubRepos_EmptyModelNoExistingIsError covers the new error path:
+// a caller that passes empty model AND the sub-repo has no prior store
+// must surface an error in SubRepoResult.Err instead of silently creating
+// an "" subdir.
+func TestIndexSubRepos_EmptyModelNoExistingIsError(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	results, err := idx.IndexSubRepos(context.Background(), "", SubRepoOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d sub-results, want 1", len(results))
+	}
+	if results[0].Err == nil {
+		t.Errorf("expected per-sub Err when no model + no existing store, got nil")
 	}
 }
 

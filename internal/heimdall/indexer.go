@@ -157,10 +157,20 @@ type SubRepoResult struct {
 // one as a separate project rooted at itself, writing to that sub-repo's
 // own `.heimdall_db`.
 //
-// model is the caller's requested model (typically the outer's). If a
-// sub-repo already has a store at <sub>/.heimdall_db/<M>/vectors.db for
-// some model M, then M is preserved — the caller's model does NOT overwrite
-// a pinned store. See plan §G4 rule 1.
+// Model resolution (caller-wins semantics — replaces the old "pinning"
+// semantics that broke multi-model indexing):
+//
+//   - If `model` is non-empty, it ALWAYS wins. The sub-repo gets a subdir
+//     `<sub>/.heimdall_db/<model>/`, created or updated in place. Existing
+//     subdirs for other models are NOT touched — they coexist under the
+//     same `.heimdall_db/` just like they do at the outer level.
+//   - If `model` is empty (legacy-caller path: a tool that doesn't know
+//     which model to use), fall back to the first existing model subdir
+//     under `<sub>/.heimdall_db/`. If neither is present, the sub-repo
+//     entry carries an Err explaining that no model could be resolved.
+//
+// SubRepoResult.PinnedModel is retired — always false. The API field is
+// kept so callers continue to compile; the concept no longer exists.
 //
 // The returned error is non-nil ONLY for discovery-level failures (root
 // unreadable). Per-sub-repo failures are reported via out[i].Err and do NOT
@@ -226,15 +236,30 @@ func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, opts SubRep
 			opts.OnSubRepoStart(subRes.Name, i+1, total)
 		}
 
-		// Resolve model: pinned prior store wins over the caller's request.
+		// Resolve model (caller-wins). Non-empty caller model ALWAYS wins,
+		// so two consecutive calls with different models both produce their
+		// own per-model subdirs under <sub>/.heimdall_db/. Empty model
+		// falls back to the first existing subdir (legacy callers). When
+		// neither is available, surface a per-sub-repo error rather than
+		// silently creating an "" directory.
+		existing := ListAvailableModels(subRes.DBPath)
 		effectiveModel := model
-		pinned := false
-		if existing := ListAvailableModels(subRes.DBPath); len(existing) > 0 {
+		if effectiveModel == "" {
+			if len(existing) == 0 {
+				subRes.Err = fmt.Errorf("no model specified and no existing index in %s", subRes.DBPath)
+				out = append(out, subRes)
+				if opts.OnSubRepoDone != nil {
+					opts.OnSubRepoDone(subRes)
+				}
+				continue
+			}
 			effectiveModel = existing[0]
-			pinned = effectiveModel != model
 		}
 		subRes.Model = effectiveModel
-		subRes.PinnedModel = pinned
+		// PinnedModel is retired — caller-wins semantics eliminate the
+		// concept. Always false. Keep the field so callers still compile;
+		// the CLI summary code treats `false` as "no pinning suffix".
+		subRes.PinnedModel = false
 
 		// Open / create the sub-repo store. A failure here is captured and
 		// the sub-repo moves on — no panics, no partial writes to stale
