@@ -1,5 +1,6 @@
 /heimdall-mcp
 /bench-retrieval
+/calibrate-drift
 .heimdall_db/
 *.log
 dist/
