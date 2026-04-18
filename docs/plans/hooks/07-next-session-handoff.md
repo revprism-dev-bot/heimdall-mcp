@@ -9,17 +9,20 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> **Status at `main` @ commit `54966b8` (2026-04-18 late evening):** clean
-> tree, **12 more PRs merged this session (#52–#63)** on top of the
-> earlier 2026-04-18 afternoon batch (#39–#49). Full suite green under
-> `go test ./... -race -count=1`. `go vet ./...` clean.
-> `heimdall-mcp hooks smoke --fake-ollama` → **6/6 PASS**. Binary at
-> `/home/noname/.local/bin/heimdall-mcp` → symlink →
-> `/home/noname/Code/heimdall-mcp/heimdall-mcp`, reports `(54966b8)`
-> after rebuild. **First action: rebuild, then pick an item from the
-> priority list below. All seven human sign-offs are recorded and every
-> code follow-up they spawned has shipped — the remaining work is
-> telemetry collection and calibration-gated rollouts.**
+> **Status at `main` @ commit `9f9e885` (2026-04-18 late evening, post
+> indexer-cap removal):** clean tree, **13 PRs merged in the 2026-04-18
+> evening batch (#52–#65)** on top of the earlier afternoon batch
+> (#39–#49). Full suite green under `go test ./... -race -count=1` with
+> the Makefile's per-package timeout bumped 60 s → 180 s (PR #65).
+> `go vet ./...` clean. `heimdall-mcp hooks smoke --fake-ollama` →
+> **6/6 PASS**. Binary at `/home/noname/.local/bin/heimdall-mcp` →
+> symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`, reports
+> `(9f9e885)` after rebuild. Gitea mirror at `192.168.1.167:3000` is
+> fully synced across all 5 repos (see §Gitea mirror). **First action:
+> rebuild, then pick an item from the priority list below. All seven
+> human sign-offs are recorded and every code follow-up they spawned has
+> shipped — the remaining work is telemetry collection and
+> calibration-gated rollouts.**
 >
 > **Priority punch list (pick in order, none are blocking each other):**
 >
@@ -102,6 +105,19 @@ point at this file.
 > - **#63** `refactor(sessions): nest heimdall_non_search_when_hits_present
 >   in companion_counters` (`54966b8`) — implements HD-7 / 12a §6
 >   item 4 (F5).
+> - **#65** `feat(indexer): remove hard caps on file count and file size`
+>   (`9f9e885`) — deletes `MaxFiles = 5000` and `MaxFileSize = 100 KB`
+>   from `internal/heimdall/indexer.go`. Both were silent truncation
+>   bugs: projects with >5000 files or source files >100 KB had content
+>   dropped from the index with no warning. Back-pressure now relies on
+>   `excludePatterns` + `isBinaryFile` sniff + chunker (1500-char slices
+>   fit comfortably under nomic-embed-text's 8192-token window). Two
+>   regression tests (`TestIndexer_NoFileCountCap` indexes 5001 files,
+>   `TestIndexer_NoFileSizeCap` indexes a 200 KB file). Makefile
+>   per-package timeout bumped 60 s → 180 s to fit the new coverage.
+>   Only remaining memory cliff: `os.ReadFile` inside `chunkFile` —
+>   exclude pathological multi-GB files via `excludePatterns` if ever
+>   relevant; streaming reader is a theoretical follow-up, not scoped.
 >
 > **Prior merged work (reference only, don't re-litigate):**
 > 2026-04-18 afternoon shipped PRs #39–#49 (Wave F follow-ups,
@@ -265,6 +281,27 @@ shipped as #63. F1/F2/F3 (Plan 11 follow-ups) shipped as #61.
 | **~2026-05-02** (14 days after #55) | Calibration sample draw: 100-turn stratified sample from `hooks.log`. Follow with ~5 h of operator labeling (gated on 12a §6 item 1 sign-off) | 12a §3.2 |
 
 No other time-gated items are in flight.
+
+---
+
+## Gitea mirror (2026-04-18 late evening)
+
+All five repos on the local Gitea instance at `http://192.168.1.167:3000/`
+are in sync with the local working copies, pushed at end-of-session so
+another machine can clone + index from scratch.
+
+| Repo | HEAD | Notes |
+|---|---|---|
+| `admin/heimdall-mcp` | `9f9e885` | main, PR #65 merged |
+| `admin/payments-analyzer` | `38e8e7d` | main (monorepo root) |
+| `admin/payments-analyzer-app` | `1fdc095` | nested at `payments-analyzer/payments-analyzer-app/` |
+| `admin/payments-analyzer-service` | `593b73c` | nested at `payments-analyzer/payments-analyzer-service/` |
+| `admin/payments-analyzer-infra` | `e73e6fe` | nested at `payments-analyzer/payments-analyzer-infra/` |
+
+Push remote on each local repo is `gitea` →
+`http://admin:TOKEN@localhost:3000/admin/<repo>.git`. The three
+`payments-analyzer-*` sub-repos are nested git repos inside the
+monorepo working tree, not submodules.
 
 ---
 
@@ -463,10 +500,12 @@ From `docs/plans/hooks/06-decisions.md`:
 
 ---
 
-## Final git state at session end (2026-04-18 late evening)
+## Final git state at session end (2026-04-18 late evening, post-#65)
 
 ```
-$ git log --oneline -13
+$ git log --oneline -14
+9f9e885 feat(indexer): remove hard caps on file count and file size (#65)
+b341ff1 docs(handoff): reflect follow-up PRs #60-#63 (12 PRs total this session) (#64)
 54966b8 refactor(sessions): nest heimdall_non_search_when_hits_present in companion_counters (#63)
 7a5933e chore: plan 11/12 follow-ups (calibrate-drift refactor, hooks doctor, README) (#61)
 c78309d chore(hooks): bump hooks.log rotation cap 5 MB → 10 MB (HD-5) (#62)
@@ -479,16 +518,16 @@ b3524c4 feat(calibrate-drift): T1xT2 threshold-sweep harness for semantic-drift 
 daae783 chore(sessions): consolidate cache-hit counters + deprecate nested alias (#52)
 6930ad4 docs(hooks): design decisions for plan 12 (semantic-drift + calibrate-drift) (#54)
 e6b2490 docs(hooks): design decisions for plan 11 (LLM classifier fallback) (#53)
-3701954 docs(handoff): refresh for 2026-04-18 session (PRs #39-#49) (#51)
 ```
 
-Main is **in sync with `origin/main`** at `54966b8`. All 12 of
-2026-04-18's evening+late-evening PRs (#52–#63) merged. Binary at
+Main is **in sync with `origin/main`** at `9f9e885`. All 13 of
+2026-04-18's evening+late-evening PRs (#52–#65) merged. Binary at
 `/home/noname/.local/bin/heimdall-mcp` rebuilt and reports
-`(54966b8)`. Hooks installed at
+`(9f9e885)`. Hooks installed at
 `/home/noname/Code/heimdall-mcp/.claude/settings.json` (6 hooks,
 template envelope `wave2-phase3`). Plan 11 Stage 0 code path present
-but OFF by default.
+but OFF by default. Gitea mirror at `192.168.1.167:3000` fully synced
+across all 5 repos (see §Gitea mirror).
 
 **Open known-unknowns (ordered by urgency):**
 
