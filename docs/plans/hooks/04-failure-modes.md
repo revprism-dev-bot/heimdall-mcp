@@ -135,7 +135,7 @@ Users will have other hooks — from other MCPs, from their own dotfiles, from t
 2026-04-14T15:04:33Z INFO hook.degraded tier=B code=ollama_unreachable suppressed=false
 ```
 
-**Rotation:** size-capped at 5 MB. On write, if the file exceeds 5 MB the hook renames `hooks.log` → `hooks.log.1` (replacing any prior `.1`) and starts fresh. One generation only — we're not building logrotate. Total disk footprint ≤ 10 MB. Rotation runs in the hook's main path (not a background daemon), with the rename as an atomic syscall, so it can't leave a half-state.
+**Rotation:** size-capped at 10 MB (bumped from 5 MB in HD-5, 2026-04-18). On write, if the file exceeds the cap the hook renames `hooks.log` → `hooks.log.1` (replacing any prior `.1`) and starts fresh. One generation only — we're not building logrotate. Total disk footprint ≤ 20 MB. Rotation runs in the hook's main path (not a background daemon), with the rename as an atomic syscall, so it can't leave a half-state.
 
 **Failure modes of the log itself:** if the log file cannot be opened (permissions, disk full), the hook silently writes nothing. We never abort the hook because logging failed.
 

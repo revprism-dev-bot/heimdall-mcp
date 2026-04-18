@@ -163,8 +163,20 @@ func TestRedactLogString_PosixStillRedacts(t *testing.T) {
 	}
 }
 
+// HD-5 (2026-04-18): default rotation threshold is 10 MB. Bumped from
+// 5 MB prophylactically after Plan 12 Stage 1 added prompt_embed_b64 +
+// hit_ids to user-prompt logs (~2 MB / 14 days, 20–25% of old cap). New
+// ceiling: 10 MB live + 1 rotation = 20 MB total. Lock the default so
+// any accidental downsizing trips a test.
+func TestHookLogMaxBytes_DefaultIs10MB(t *testing.T) {
+	const want int64 = 10 * 1024 * 1024
+	if hookLogMaxBytes != want {
+		t.Errorf("hookLogMaxBytes default: got %d, want %d (10 MB per HD-5)", hookLogMaxBytes, want)
+	}
+}
+
 // QUAL-001: end-to-end rotation against a real (tiny) threshold. Uses
-// SetHookLogMaxBytesForTest to avoid writing 5 MB per test run.
+// SetHookLogMaxBytesForTest to avoid writing 10 MB per test run.
 func TestLogRotationAtRealBoundary(t *testing.T) {
 	path := setupTmpHookLog(t)
 	restore := SetHookLogMaxBytesForTest(4096)
@@ -301,9 +313,9 @@ func TestOpenHookLog_HandlesPartialLastLine(t *testing.T) {
 	}
 }
 
-func TestLogHookEvent_RotationAt5MB(t *testing.T) {
+func TestLogHookEvent_RotationAtCap(t *testing.T) {
 	path := setupTmpHookLog(t)
-	// Pre-fill the log to just under 5 MB so a single subsequent write
+	// Pre-fill the log to just under the cap so a single subsequent write
 	// triggers rotation.
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
@@ -313,7 +325,7 @@ func TestLogHookEvent_RotationAt5MB(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// This one write should push past 5 MB and trigger rotation.
+	// This one write should push past the cap and trigger rotation.
 	LogHookEvent("INFO", "rotate-trigger", map[string]any{
 		"k": strings.Repeat("z", 200), // ensures overflow
 	})

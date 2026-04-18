@@ -693,13 +693,14 @@ additional map entries. Consumers of specific keys keep working.
 - ~30 chars per `hit_ids` value (≤5 hit ids × 6 chars each).
 - At 50 prompts/day × 14 days ≈ 2 MB of new log bytes over the
   Stage 1 soak window.
-- 5 MB hooks.log cap with 1 rotation = 10 MB total ceiling.
-- ~20–25% of total budget. Under cap.
+- 10 MB hooks.log cap with 1 rotation = 20 MB total ceiling (cap
+  bumped from 5 MB to 10 MB in HD-5, 2026-04-18).
+- ~10–12% of total budget. Well under cap.
 
 **Telemetry to watch** (plan 12 §10 Stage 1 promotion criteria):
 
 - `ls -la $XDG_STATE_HOME/heimdall/hooks.log*` over the 14-day window —
-  size should stay under 5 MB + one rotation.
+  size should stay under 10 MB + one rotation.
 - `hooks doctor` — no new warnings introduced.
 - `hooks smoke --fake-ollama` — PASS on all 6 hooks after the Stage 1
   change.

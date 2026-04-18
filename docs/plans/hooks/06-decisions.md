@@ -135,7 +135,7 @@ authoritative design and the full mode/classification matrix.
 
 4. **Logging goes through `heimdall.LogHookEvent`:** never write to stderr
    from a hook retrieval handler. Logs must be redacted (§5.9) and bounded
-   (§5.8 5 MB cap + one rotation).
+   (§5.8 10 MB cap + one rotation, bumped from 5 MB in HD-5, 2026-04-18).
 
 5. **No destructive git operations.** No `reset --hard`, no `push --force`,
    no `branch -D`, no `worktree remove --force`. If you encounter a
