@@ -128,8 +128,9 @@ point at this file.
 >   (Plan 12 Stage 2, #58) `tool_use.semantic_drift` block when
 >   `--verbose`.
 > - Plan 12 Stage 1 log size budget: **~2 MB over a 14-day soak**
->   (well under the shared 5 MB `hooks.log` cap with 1 rotation). If
->   rotation starts firing >1×/14 days, revisit (12a §6 item 2).
+>   (well under the shared 10 MB `hooks.log` cap with 1 rotation; cap
+>   bumped from 5 MB in HD-5, 2026-04-18). If rotation starts firing
+>   >1×/14 days, revisit (12a §6 item 2).
 > - `heimdall-mcp hooks smoke --fake-ollama` (#47) validates the full
 >   6-hook pipeline after a change; expect "PASS" on all six events.
 >
@@ -379,9 +380,10 @@ From `docs/plans/hooks/06-decisions.md`:
   `user_prompt_cache_hits` / `user_prompt_cache_total` (#43), and the
   `tool_use.semantic_drift` block when `--verbose` (#58).
 - **Plan 12 Stage 1 log size budget: ~2 MB over a 14-day soak**
-  (12a §4.4). Well under the shared 5 MB `hooks.log` cap (+1
-  rotation = 10 MB ceiling). If rotation fires >1×/14 days, revisit
-  per 12a §6 item 2.
+  (12a §4.4). Well under the shared 10 MB `hooks.log` cap (+1
+  rotation = 20 MB ceiling; cap bumped from 5 MB in HD-5,
+  2026-04-18). If rotation fires >1×/14 days, revisit per 12a §6
+  item 2.
 - **`hooks smoke --fake-ollama` (PR #47)** validates all 6 hooks
   end-to-end without a real Claude Code restart. 6/6 PASS at `c3d28ca`.
 

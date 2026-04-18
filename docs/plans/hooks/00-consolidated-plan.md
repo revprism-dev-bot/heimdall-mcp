@@ -144,7 +144,7 @@ Presence of `<project>/.heimdall/hooks.disabled` (empty file) → every hook exi
 
 ### 5.8 Logging & observability
 
-`${XDG_STATE_HOME:-~/.local/state}/heimdall/hooks.log`, 5 MB size cap, one rotation generation (`hooks.log.1`), single-line `grep`-friendly format with timestamps + level + event + key=value pairs. `hooks-doctor` and `hooks tail` consume it. Log failures never abort the hook.
+`${XDG_STATE_HOME:-~/.local/state}/heimdall/hooks.log`, 10 MB size cap (bumped from 5 MB in HD-5, 2026-04-18), one rotation generation (`hooks.log.1`), single-line `grep`-friendly format with timestamps + level + event + key=value pairs. `hooks-doctor` and `hooks tail` consume it. Log failures never abort the hook.
 
 ### 5.9 Stderr safety
 
@@ -168,7 +168,7 @@ Effort: **S** = ~½ day, **M** = 1–2 days, **L** = 3–5 days. Every task inhe
 | T10 | `hook_cache` table + `store_metadata.index_version` bump | Migration adds the table + index. `Upsert`/`RemoveByFile` bumps integer in one transaction. | 03 §3 | M | T6 |
 | T11 | Ollama embed `keep_alive: "10m"` | One-field JSON addition on hook-path embed calls. | 03 §5 | S | T6 |
 | T12 | Tier B suppression store | 5-min-per-(project, failure_code) suppression keyed in `~/.local/state/heimdall/suppress.db`. | 04 §2 | S | T5, T6 |
-| T13 | Hook log file + rotation | `${XDG_STATE_HOME}/heimdall/hooks.log`, 5 MB cap, one rotation, atomic rename. Safe-on-failure. | 04 §6 | S | all hooks |
+| T13 | Hook log file + rotation | `${XDG_STATE_HOME}/heimdall/hooks.log`, 10 MB cap (bumped from 5 MB in HD-5, 2026-04-18), one rotation, atomic rename. Safe-on-failure. | 04 §6 | S | all hooks |
 | T14 | `heimdall-mcp install-hooks` | Atomic merge into `~/.claude/settings.json` or `.claude/settings.json` (scope). Primary marker `"source": "heimdall"` + secondary `x-heimdall` nested object. Conflict-report-and-exit default; `--merge`, `--force`, `--dry-run`, `--only`, `--disable`, `--scope`. | 02 §install-hooks, 04 §4–5, 05 §Install UX | L | Phase 1a |
 | T15 | `heimdall-mcp uninstall-hooks` | Symmetric to T14. Idempotent. Removes empty `hooks` key entirely. | 02 §uninstall-hooks, 05 §uninstall | S | Phase 1a |
 | T16 | `heimdall-mcp hooks doctor` | 11-check pass/fail table (synthesis of 04 §6 and 05 §doctor). Dry-fires each installed hook with canned event JSON. Exit 0 OK/WARN, 1 on any FAIL. | 02, 04 §6, 05 §doctor | M | Phase 1a gate |

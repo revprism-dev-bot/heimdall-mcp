@@ -188,8 +188,9 @@ inside the 250 ms budget with ~99% slack. Not on the guardrail
 surface — no OQ-5 implications.
 
 **Size:** 3 KB per prompt × ~50 prompts/session × many sessions into
-the 5 MB `hooks.log` cap. At 50 prompts/day × 14 days ≈ 2 MB, well
-under cap. Rotation behavior unchanged.
+the 10 MB `hooks.log` cap (bumped from 5 MB in HD-5, 2026-04-18). At
+50 prompts/day × 14 days ≈ 2 MB, well under cap. Rotation behavior
+unchanged.
 
 **Why not log to a separate table/file:** `hooks.log` already
 has the machinery (rotation, session=<uuid> tagging from Wave A,
@@ -634,7 +635,7 @@ co-existence there's no way to compute that delta.
 
 **Promotion criteria — Stage 1 → 2:**
 - Hook log size stays under cap over 14 days (3 KB × ~50
-  prompts/day × 14 ≈ 2 MB, well under 5 MB cap).
+  prompts/day × 14 ≈ 2 MB, well under 10 MB cap).
 - No panics / parse regressions in `hooks tail` with new keys.
 - Dry-fire `sessions report` against a logged session returns a
   non-null `semantic_drift` block validating §6.1.
