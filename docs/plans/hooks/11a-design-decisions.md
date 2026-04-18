@@ -346,6 +346,8 @@ art, (iii) recommendation, (iv) rationale + trade-offs.
 
 ### HD-1 — Acceptable false-block rate for stage-2 → stage-3 promotion
 
+**Status (2026-04-18): RESOLVED — 5% FP / last 100 `would_have=block` fires / operator-discretion rollback.**
+
 Plan 11 §8.2 proposes <5 % FP on `would_have=block` LLM verdicts
 before promoting from warn to block. The 5 % figure is *my
 recommendation* — based on "static rules got 1 % because we
@@ -366,6 +368,8 @@ rollback, but none of those are decisions the agent can make.
 
 ### HD-2 — Model-pull invitation UX on first `HEIMDALL_LLM_CLASSIFIER=1`
 
+**Status (2026-04-18): RESOLVED — Never auto-pull. Surface a one-line hint via the Tier-B suppressor pointing at `ollama pull <model>`. Fall back to static classifier if model missing.**
+
 Plan 11 §7 / §8.3 describes a `hooks doctor` hint that says
 "run `ollama pull qwen2.5-coder:3b`." That UX call — automatic pull
 on first use vs. manual pull with banner — is a defaults-and-
@@ -376,6 +380,8 @@ That matches the embeddings story. But a user who *wanted* auto-pull
 would read that as friction. **Flag for sign-off.**
 
 ### HD-3 — Default `prompt_version` bump policy
+
+**Status (2026-04-18): RESOLVED — Bump on any non-whitespace, non-comment character change. Pair bump with a CHANGELOG entry.**
 
 Per OQ-5, we bump the integer on any edit. But "any edit" vs.
 "semantic edit" is a judgment call: whitespace changes don't

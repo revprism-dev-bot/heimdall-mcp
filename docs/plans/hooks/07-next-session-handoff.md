@@ -60,9 +60,11 @@ point at this file.
 >    - README guardrails paragraph: one-paragraph note on the LLM
 >      fallback with a link to `docs/reference/llm-classifier.md`.
 >
-> 6. **Human sign-off queue (7 items).** Until these are decided,
->    Stage 3 of both Plan 11 and Plan 12 stays parked. See the
->    §Human sign-off queue table below.
+> 6. **Human sign-off queue (7 items).** **All 7 resolved 2026-04-18.**
+>    HD-5 + HD-7 spawn code follow-ups (F4 `hooks.log` cap bump 5 MB
+>    → 10 MB; F5 nest `heimdall_non_search_when_hits_present` under
+>    `tool_use.semantic_drift.companion_counters`) shipping as separate
+>    PRs. See the §Human sign-off queue table below for each decision.
 >
 > **This session's shipped PRs (afternoon → evening, 2026-04-18):**
 > Morning/afternoon batch #39–#49 (prior handoff, for context).
@@ -236,18 +238,21 @@ by the agent alone. Until they clear, Stage 3 of Plan 11 and Stage 3
 of Plan 12 remain parked (this is by design — the agent is not
 allowed to pick the FP rate or commit operator hours to labeling).
 
-| ID | Topic | Recommendation (from design doc) | Source |
+| ID | Topic | Status | Source |
 |---|---|---|---|
-| **11a HD-1** | Stage 2→3 false-block-rate threshold | 5 % FP on `would_have=block` LLM verdicts, last-100-fires denominator, operator-discretion rollback | `docs/plans/hooks/11a-design-decisions.md` §4 |
-| **11a HD-2** | Auto-pull UX on first `HEIMDALL_LLM_CLASSIFIER=1` | Never auto-pull; surface the `ollama pull <model>` hint via plan 04 Tier-B suppressor | 11a §4 |
-| **11a HD-3** | `prompt_version` bump policy | Bump on any character change that is not pure whitespace or comment; pair with a CHANGELOG entry | 11a §4 |
-| **12a §6 item 1** | Operator labeling commitment (~5 h for 100 turns) | Commit at Stage 2 shipping point. If hard no, defer Stage 3 indefinitely (v1+v2 co-exist forever — not a correctness problem) | `docs/plans/hooks/12a-design-decisions.md` §6 |
-| **12a §6 item 2** | Stage 1 log-cap sharing (hit_ids + prompt_embed_b64) | Ship now. Re-litigate if `hooks.log` rotates >1×/14 days | 12a §6 |
-| **12a §6 item 3** | Embedding-model migration ownership | Post-v2 follow-up: `embedding_model_version` in `store_metadata` + pre-flight warn in `sessions report` | 12a §6 |
-| **12a §6 item 4** | `heimdall_non_search_when_hits_present` placement | Inside `semantic_drift` under a `companion_counters` sub-map — keeps drift block self-contained and makes the "companion, not semantic" distinction explicit via structure | 12a §6 |
+| **11a HD-1** | Stage 2→3 false-block-rate threshold | **Resolved 2026-04-18: 5% FP / last 100 `would_have=block` fires / operator-discretion rollback** | `docs/plans/hooks/11a-design-decisions.md` §4 |
+| **11a HD-2** | Auto-pull UX on first `HEIMDALL_LLM_CLASSIFIER=1` | **Resolved 2026-04-18: Never auto-pull. Surface a one-line hint via the Tier-B suppressor pointing at `ollama pull <model>`. Fall back to static classifier if model missing.** | 11a §4 |
+| **11a HD-3** | `prompt_version` bump policy | **Resolved 2026-04-18: Bump on any non-whitespace, non-comment character change. Pair bump with a CHANGELOG entry.** | 11a §4 |
+| **12a §6 item 1** | Operator labeling commitment (~5 h for 100 turns) | **Resolved 2026-04-18: Commit to a 5-hour labeling block ~2026-05-02 (after 2-week Stage 1 soak). Do not ship Stage 3 without labels.** | `docs/plans/hooks/12a-design-decisions.md` §6 |
+| **12a §6 item 2** | Stage 1 log-cap sharing (hit_ids + prompt_embed_b64) | **Resolved 2026-04-18: Prophylactic cap bump: 5 MB → 10 MB. Executed as code follow-up F4.** | 12a §6 |
+| **12a §6 item 3** | Embedding-model migration ownership | **Resolved 2026-04-18: Post-v2 follow-up: record `embedding_model` in the calibration artifact and add a pre-flight warn in `sessions report` when the artifact's model ≠ current store's model.** | 12a §6 |
+| **12a §6 item 4** | `heimdall_non_search_when_hits_present` placement | **Resolved 2026-04-18: Nest inside `tool_use.semantic_drift.companion_counters` sub-map. Executed as code follow-up F5.** | 12a §6 |
 
-When the operator replies, update the relevant design doc to record
-the decision, then file the implementation PR.
+All seven decisions were recorded in the design docs on 2026-04-18.
+HD-5 (12a §6 item 2) and HD-7 (12a §6 item 4) spawn code follow-ups
+(F4 raises the `hooks.log` cap to 10 MB; F5 nests the companion
+counter under `tool_use.semantic_drift.companion_counters`); both
+ship as separate PRs.
 
 ---
 
@@ -485,7 +490,8 @@ but OFF by default.
 2. **Plan 12 Stage 1 data accumulation** — no action; just let
    traffic flow. Calibration window opens ~2026-05-02.
 3. **Human sign-off queue** (7 items, see §Human sign-off queue).
-   Until these clear, Stage 3 of both plans stays parked.
+   **All 7 resolved 2026-04-18.** HD-5 + HD-7 spawn follow-up PRs
+   F4 + F5.
 4. **PreToolUse shadow-mode audit** — run `hooks audit-guardrails`
    ~2026-04-25, flip `shadow → warn` if report recommends promotion.
 5. **UserPromptSubmit cache-hit ratio over sessions** — surfaced in
