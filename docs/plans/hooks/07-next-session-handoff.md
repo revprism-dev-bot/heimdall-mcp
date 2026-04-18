@@ -9,131 +9,130 @@ point at this file.
 
 ## Opening prompt for the next session
 
-> **Status at `main` @ commit `11366e9` (2026-04-17 evening):** clean
-> tree, 5 PRs merged this session (#33–#37 on heimdall-mcp + #89 on
-> payments-analyzer). Full suite green under
-> `go test ./... -race -count=1` (~23s cli / ~32s heimdall / ~7s mcp /
-> 1s config). `go vet ./...` clean. **First action: rebuild the binary
-> and run the Wave F punch list below — three promoted must-implement
-> items that were deferred from earlier phases.**
+> **Status at `main` @ commit `1b9e92e` (2026-04-18 evening):** clean
+> tree, 11 PRs merged this session (#39–#49). Full suite green under
+> `go test ./... -race -count=1`. `go vet ./...` clean. Binary at
+> `/home/noname/.local/bin/heimdall-mcp` → symlink →
+> `/home/noname/Code/heimdall-mcp/heimdall-mcp`, reports `(1b9e92e)`
+> after rebuild. **First action: rebuild, then pick an item from the
+> priority list below. The two biggest open tracks — semantic-drift
+> metric and LLM classifier fallback — both have design docs in
+> `docs/plans/hooks/` with open questions in §9 that need resolving
+> before code lands.**
 >
-> **Wave F — next-session must-implement (promoted from "optional post-Phase-3 ideas"):**
-> 1. **Dedup `part-*` skill chunks in `surfaceRelevantSkills`** — SHIPPED
->    this session as PR #36 (merge pending review). If already merged,
->    rebuild and verify via the UserPromptSubmit context: each skill
->    should now appear ≤ 1 time. Helper: `baseSkillID` in
->    `internal/cli/hook_skills.go`.
-> 2. **Post-edit actor session attribution** — SHIPPED as PR #37. Before
->    this fix, `sessions report --current` showed `reindex_ok=0` even
->    when the actor succeeded (actor logs had no `session=` field).
->    Verify after merge: any PostToolUse(Edit) should yield matching
->    `post_edit_events` and `reindex_ok` counts per session.
-> 3. **Tool-use tracking instrumentation** — NOT YET SHIPPED. Two
->    signals to instrument:
->    - **(A) Missed tool-call opportunity.** For each UserPromptSubmit
->      with hits, score the drift between the injected chunks and the
->      assistant's subsequent heimdall tool calls that turn. If hits
->      already covered the answer but the model called heimdall again,
->      log `redundant_call`. If the model didn't call heimdall but the
->      prompt was semantically close to indexed content (search-hit
->      similarity above a threshold), log `missed_call`.
->    - **(B) Redundant tool call.** Already derivable from
->      `sessions report` (`total` vs `heimdall` tool-call counts), but
->      expose it as a first-class metric in `SessionReport` JSON.
->    Start with (B) — cheap, queryable today. Defer (A) until we have
->    a semantic-drift score design.
+> **Priority punch list (pick in order, none are blocking each other):**
 >
-> **Other remaining work (no blocking, pick from "Next steps" below):**
-> - Shadow-mode PreToolUse guardrail audit (wait ≥1 week of real
->   traffic, then grep `hooks tail --event=pre-tool-use --since=168h`
->   for false `class=block`; promote default `shadow → warn` if zero).
-> - `bench-retrieval` binary: auto-scope to the currently-opened
->   project (today hard-coded to heimdall-mcp's DB).
-> - LLM-based classification fallback for PreToolUse when static rules
->   can't decide (extension point reserved in
->   `docs/plans/hooks/08-destructive-op-primitive.md`).
-> - Fold `skills import` into `install-hooks` as a best-effort step
->   alongside Ollama pre-warm.
+> 1. **`bench-retrieval` auto-scope verification.** PR #41 made
+>    `cmd/bench-retrieval` pick up the CWD repo's DB via
+>    `FindRepoRoot`; `--db` override still works. Trivial to verify:
+>    `cd` into any indexed project, run the binary, confirm it finds
+>    the right DB without a flag. 5 minutes of work.
 >
-> **This session's shipped PRs (for reference — already merged unless noted):**
-> - PR #33 — Wave-E polish pass (sessions `--since`, JSON `schema_version`,
->   doctor check #14, skill-body chunking).
-> - PR #34 — `sessions report --current` (auto-pick most-recent session).
-> - PR #35 — README factual audit (27 edits across 9 blocks: default model,
->   Network Interactions section, MCP tools table, hook log paths, etc.
->   Final orchestrator score 99.67/100).
-> - PR #36 — dedup `part-*` skill chunks in hook context (open — may need merge).
-> - PR #37 — post-edit actor session attribution (open — may need merge).
-> - payments-analyzer PR #89 — reduced orchestrator reviewer count 10 → 3.
-> - `~/.claude/CLAUDE.md` + `code-improvement-orchestrator` skill: agent counts
->   lowered 5 → 3 and 30 → 3 for cost. Not git-managed; applied in-place.
+> 2. **Smoke-harness re-run.** `heimdall-mcp hooks smoke --fake-ollama`
+>    (PR #47) now exercises all 6 hooks end-to-end without a real
+>    Claude Code restart. Last live run at end of 2026-04-18: **all 6
+>    PASS.** Re-run after any hook change before merging.
 >
-> **Pre-polish-pass history (reference only, don't re-litigate):** PRs #25–#29
-> shipped the per-session savings feature
-> (`docs/plans/hooks/10-per-session-savings-report.md`) — Wave A session_id
-> on hook logs, Wave B transcript parser, Wave C hooklog reader+aggregator,
-> Wave D `sessions list` / `sessions report` CLI, Wave E docs. PR #31
-> bumped the first-turn `UserPromptSubmit` budget 250→450ms. PR #32 was
-> the handoff refresh.
+> 3. **Semantic-drift metric implementation** per
+>    `docs/plans/hooks/12-semantic-drift-metric.md` (PR #46 design, 705
+>    lines, 3-stage rollout). Stage 1 is log-only: add `hit_ids` and
+>    `prompt_embed_b64` to UserPromptSubmit success events, no behavior
+>    change. **Prerequisite — resolve the 10 open questions in §9 of
+>    plan 12, especially OQ-3 (calibration harness design) before
+>    writing code.** Stage 2→3 is gated on the `cmd/calibrate-drift`
+>    harness itself (item 6 below).
 >
-> **Prior merged work (reference only, don't re-litigate):** PRs #25–#29
-> shipped the per-session savings feature
-> (`docs/plans/hooks/10-per-session-savings-report.md`) — Wave A session_id
-> on hook logs, Wave B transcript parser, Wave C hooklog reader+aggregator,
-> Wave D `sessions list` / `sessions report` CLI, Wave E docs. PR #31
-> bumped the first-turn `UserPromptSubmit` budget 250→450ms after
-> `sessions report` surfaced `UserPromptSubmit bytes=0 events=0` on the
-> first prompt of every session (fresh CLI process's first embed against
-> CPU-Ollama reliably exceeded 250ms). Budget stays under the 500ms hard cap.
+> 4. **LLM classifier fallback implementation** per
+>    `docs/plans/hooks/11-llm-classification-fallback.md` (PR #40
+>    design, 768 lines). The prerequisite `ClassUnknown` default
+>    fall-through shipped as PR #45 — the design's integration point is
+>    now unblocked. **Prerequisite — resolve the open questions in §9
+>    of plan 11, especially the model-recommendation bake-off (the
+>    doc lists several candidates but does not pick one).**
 >
-> **Binary state at restart:** `/home/noname/.local/bin/heimdall-mcp` →
-> symlink → `/home/noname/Code/heimdall-mcp/heimdall-mcp`. Rebuild and
-> `heimdall-mcp --version` will report `ff01aef+dirty` until the polish
-> pass is committed — that's expected, not a red flag. Restarting Claude
-> Code launches a fresh MCP server bound to the rebuilt binary.
+> 5. **Shadow-mode guardrail audit.** Wait ≥1 week of real-session
+>    traffic accumulates in `hooks.log`, then run
+>    `heimdall-mcp hooks audit-guardrails --since=168h --format=json`
+>    (PR #44 — 14th hooks subcommand). If the report recommends
+>    `promote_to_warn=true` with zero false-positive candidates,
+>    switch the default `HEIMDALL_GUARDRAILS=shadow` → `warn`.
+>
+> 6. **`cmd/calibrate-drift` harness** — gates Stage 2→3 of the
+>    semantic-drift rollout per plan 12. Design details in the plan's
+>    §Calibration section; OQ-3 in §9 is the main open question.
+>
+> 7. **Cosmetic: cache-hit ratio consolidation.** PR #43 added
+>    top-level `user_prompt_cache_hits` / `user_prompt_cache_total`
+>    to `SessionReport`, but `heimdall_contribution.cache_hits`
+>    already exposed an identical counter. For a future v2, either
+>    consolidate to one field or document the intended semantic split
+>    (per-hook vs whole-session scope). Not urgent — additive fields
+>    don't bump `schema_version: "v1"`.
+>
+> **This session's shipped PRs (all merged, for reference):**
+> - **#39** `feat(sessions): add redundant_heimdall_calls to SessionReport`
+>   (`f205a21`) — Wave F item 3(B) cheap counter, additive JSON field.
+> - **#40** `docs(hooks): design doc for LLM classification fallback`
+>   (`c920625`) — plan 11, flagged ClassUnknown as prerequisite.
+> - **#41** `feat(bench): auto-scope bench-retrieval to CWD's repo`
+>   (`e96fe10`) — `cmd/bench-retrieval` picks up DB via `FindRepoRoot`.
+> - **#42** `feat(install): run skills import as best-effort
+>   post-install step` (`c4a3383`) — `--no-skills-import` flag, mirrors
+>   prewarm contract.
+> - **#43** `feat(sessions): add user-prompt cache-hit counters to
+>   SessionReport` (`8808e99`) — top-level counters.
+> - **#44** `feat(hooks): add audit-guardrails subcommand for PreToolUse
+>   shadow-mode review` (`7af921c`) — 14th hooks subcommand.
+> - **#45** `feat(guardrails): introduce ClassUnknown for default
+>   fall-through` (`1bed701`) — exit 0 in all modes, never blocks.
+> - **#46** `docs(hooks): semantic-drift metric design for missed
+>   tool-call opportunities` (`b039c9c`) — plan 12, 3-stage rollout.
+> - **#47** `feat(hooks): add hooks smoke end-to-end harness for all 6
+>   hooks` (`e5a738d`) — dispatchable substitute for manual restart.
+> - **#48** `fix(hooks): drop redundant event key from Stop/SessionEnd
+>   kv maps` (`18e217f`) — pre-existing bug surfaced by PR #47.
+> - **#49** `fix(hooks): quote-aware parser + lossless producer for
+>   hooks.log values` (`1b9e92e`) — pre-existing bug surfaced by PR
+>   #44; `parseHookLogLine` now round-trips via `strconv.Quote/Unquote`.
+>
+> **Prior merged work (reference only, don't re-litigate):** Wave F
+> (2026-04-17) shipped PRs #33–#37: sessions `--since`, JSON
+> `schema_version`, doctor check #14, skill-body chunking,
+> `sessions report --current`, README audit, `part-*` skill dedup,
+> post-edit actor session attribution. Earlier, PRs #25–#29 shipped
+> the per-session savings feature
+> (`docs/plans/hooks/10-per-session-savings-report.md`) in Waves A–E.
+> PR #31 bumped the first-turn `UserPromptSubmit` budget 250→450ms.
 >
 > **Heimdall installs 6 hooks**: `SessionStart`, `PostToolUse(Edit|Write)`,
 > `UserPromptSubmit`, `Stop`, `SessionEnd`, `PreToolUse(Bash)`. Every
 > retrieval-hook fire carries `session=<uuid>` in `hooks.log` (Wave A).
-> PreToolUse guardrail default is **shadow** — classifier runs, never blocks.
-> Toggle via `HEIMDALL_GUARDRAILS=shadow|warn|block|off`.
+> PreToolUse guardrail default is **shadow** — classifier runs, never
+> blocks. With `ClassUnknown` (PR #45), the default fall-through for
+> commands no rule matches is also allow-equivalent. Toggle the mode
+> via `HEIMDALL_GUARDRAILS=shadow|warn|block|off`.
 >
 > **Measured wins already on the table:**
 > - 62.4% token savings from tiered retrieval at 20% expand rate
 >   (`docs/plans/hooks/09-tiered-retrieval-benchmark.md`, `make bench`).
-> - Per-session savings are now queryable post-hoc: `heimdall-mcp sessions
->   report --session-id=<id>` joins transcript (tokens, tool calls,
->   hook_success bytes) with hooks.log (cache hits, guardrail verdicts,
->   reindex counts). `--format=json` emits `schema_version: "v1"` for
->   scripted consumers.
->
-> **What's next** (pick one, none urgent):
-> 1. **Commit + PR the polish pass.** 10 files changed (see "2026-04-17
->    polish pass" below for the full list and the suggested commit
->    breakdown). Then run `heimdall-mcp skills import` to materialize
->    the newly-chunked `code-improvement-orchestrator` (26 KB) and
->    `deep-code-review` (75 KB) memories. `hooks doctor` row
->    `skills sync` should flip from `5/7 synced` → `7/7 synced` after.
-> 2. Validate the new binary end-to-end on this fresh session — see
->    "First actions on resumption" below.
-> 3. Let guardrails accumulate a week of shadow-mode traffic, then audit
->    `hooks tail --event=pre-tool-use --since=168h` for false `class=block`
->    verdicts. If zero, promote default to `warn`.
-> 4. ~~Three plan-deferred polish items~~ ✅ SHIPPED 2026-04-17:
->    `sessions list --since=<duration>`, doctor check #14
->    (`sessions pipeline`), JSON `schema_version: "v1"`. See
->    `docs/plans/hooks/10-per-session-savings-report.md` §Open decisions.
-> 5. ~~Re-embed the two oversized skills~~ ✅ SHIPPED 2026-04-17:
->    `ChunkSkillBody` + `importSkillChunks` handle it at import time.
+> - Per-session savings are queryable post-hoc via
+>   `heimdall-mcp sessions report --session-id=<id>` — joins
+>   transcript (tokens, tool calls, hook_success bytes) with hooks.log
+>   (cache hits, guardrail verdicts, reindex counts). `--format=json`
+>   emits `schema_version: "v1"`. Session-end JSON includes
+>   `redundant_heimdall_calls` (#39) and top-level
+>   `user_prompt_cache_hits` / `user_prompt_cache_total` (#43).
+> - `heimdall-mcp hooks smoke --fake-ollama` (#47) is the fastest way
+>   to validate the full 6-hook pipeline after a change; expect "PASS"
+>   on all six events.
 >
 > Before any code edit, sanity-check:
 > ```bash
 > cd /home/noname/Code/heimdall-mcp
-> git status && git log --oneline -6
+> git status && git log --oneline -15
 > go build ./... && go vet ./... && go test ./... -race -count=1
 > ```
-> Expect: **uncommitted polish pass** on top of `ff01aef` (10 files
-> modified), or a newer top commit if you've already PR'd. All tests pass.
+> Expect: clean tree on top of `1b9e92e`. All tests pass.
 
 ---
 
@@ -817,22 +816,41 @@ heimdall-mcp hooks tail --event=post-edit --since=5m
 
 ---
 
-## What's next — post Phase 3
+## What's next — post 2026-04-18
 
 All numbered Phase 1/2/3 items and every TODO section follow-up that could
-be shipped without a live Claude Code session are now merged. 10 PRs landed
-today in a parallel push (#14–#23).
+be shipped without a live Claude Code session are merged. 11 PRs landed
+2026-04-18 (#39–#49). Everything remaining requires either design resolution
+(plan 11 §9 / plan 12 §9 open questions) or accumulated real-session
+telemetry.
 
-**Immediate follow-ups (manual, need a live session — NOT dispatchable):**
+**Priority work (in order — see "Opening prompt" for the call-to-action):**
+1. **`bench-retrieval` auto-scope verification** — trivial follow-up to PR #41.
+2. **Smoke-harness re-run** — `heimdall-mcp hooks smoke --fake-ollama` after
+   any future hook change (PR #47).
+3. **Semantic-drift metric implementation** per
+   `docs/plans/hooks/12-semantic-drift-metric.md` (PR #46 design). Prereq:
+   resolve §9 open questions, especially OQ-3 (calibration harness).
+4. **LLM classifier fallback implementation** per
+   `docs/plans/hooks/11-llm-classification-fallback.md` (PR #40 design).
+   Prereq: resolve §9 open questions, especially the model-recommendation
+   bake-off. ClassUnknown unblock shipped in PR #45.
+5. **Shadow-mode guardrail audit** — wait ≥1 week of real traffic, then run
+   `heimdall-mcp hooks audit-guardrails --since=168h --format=json` (PR #44).
+   Flip default `shadow → warn` if report recommends promotion with zero
+   false-positive candidates.
+6. **`cmd/calibrate-drift` harness** — gates Stage 2→3 of semantic-drift
+   rollout per plan 12.
+7. **Cache-hit ratio consolidation** — PR #43 added top-level
+   `user_prompt_cache_hits` alongside the pre-existing
+   `heimdall_contribution.cache_hits`. Either consolidate or document the
+   semantic split in a future v2.
+
+**Manual / dogfood-only (not dispatchable work):**
 - **Dogfood the 6-hook pipeline on reopen.** First-actions block at the top
   of this file has the tail commands and expected output.
-- **Audit PreToolUse shadow-mode verdicts.** After a day or two of real
-  sessions: `hooks tail --event=pre-tool-use --since=24h | grep class=block`
-  — if every block is genuinely a destructive command you'd regret, promote
-  to `HEIMDALL_GUARDRAILS=warn`. If there are false positives, refine the
-  rules in `internal/heimdall/destructive_ops.go`.
-- **T21 with-vs-without comparison.** See next-steps item #17.
-- **Re-embed the two oversized skills** (item #18 above).
+- **UserPromptSubmit cache-hit ratio over sessions.** Surfaced now via
+  `sessions report` top-level counters (PR #43); track the ratio over weeks.
 
 **Closed TODO follow-ups (all merged):**
 - ~~Auto-surface skills in SessionStart/UserPromptSubmit hooks~~ → PR #15
@@ -845,15 +863,18 @@ today in a parallel push (#14–#23).
 - ~~T23 Layer 3 e2e harness~~ → PR #16
 - ~~Ollama pre-warm on install~~ → PR #19
 - ~~Gitignore `.claude/settings.json`~~ → PR #21
-
-**Post-Phase-3 ideas (not on TODO yet, flagged here for consideration):**
-- LLM-based classification fallback for PreToolUse when static rules can't
-  decide. Design doc `08-destructive-op-primitive.md` already reserves this
-  extension point.
-- Auto-scope the bench-retrieval binary to the currently-opened project
-  (currently hard-coded to the heimdall-mcp DB).
-- Chunk-at-import for oversized SKILL.md files — makes the embed model
-  choice irrelevant for skills sync.
+- ~~Chunk-at-import for oversized SKILL.md files~~ → PR #33 (Wave F)
+- ~~Fold `skills import` into `install-hooks`~~ → PR #42
+- ~~Auto-scope `bench-retrieval` to CWD's project~~ → PR #41
+- ~~LLM-based classification fallback design~~ → PR #40 (design only; impl open)
+- ~~Dedup `part-*` skill chunks in hook context~~ → PR #36
+- ~~Post-edit actor session attribution~~ → PR #37
+- ~~Redundant-heimdall-call counter in `SessionReport`~~ → PR #39
+- ~~ClassUnknown default fall-through for guardrails~~ → PR #45
+- ~~`audit-guardrails` subcommand~~ → PR #44
+- ~~Hooks smoke-test harness (`hooks smoke --fake-ollama`)~~ → PR #47
+- ~~Stop/SessionEnd event-key double-stamp bug~~ → PR #48
+- ~~`hooks.log` parser/producer quote-aware round-trip~~ → PR #49
 
 ---
 
@@ -974,62 +995,61 @@ docs/plans/hooks/
 
 ---
 
-## Final git state at session end (2026-04-16 late, post Phase 3)
+## Final git state at session end (2026-04-18 evening)
 
 ```
-$ git log --oneline -14
-65a396b Merge pull request #23 from revprism-dev-bot/feat/hooks-phase3-guardrails
-fc39df0 feat(hooks): Phase 3 destructive-op guardrails (shadow mode by default)
-a642b2b Merge pull request #22 from revprism-dev-bot/bench/tiered-retrieval-token-savings
-d70f702 feat(bench): tiered-retrieval token-savings benchmark
-2db9485 Merge pull request #21 from revprism-dev-bot/chore/gitignore-stale-phase-wording
-4bd81b7 chore: gitignore .claude/+.idea/, fix stale phase-2 wording, extend OQ-5 for guardrails
-f35c566 Merge pull request #20 from revprism-dev-bot/feat/skills-twoway-sync
-a089864 feat(skills): two-way sync between Heimdall memory and ~/.claude/skills/
-aae14e7 Merge pull request #19 from revprism-dev-bot/feat/prewarm-ollama-on-install
-5e6d0c8 feat(install): pre-warm Ollama after install-hooks to remove first-turn cold start
-3e7f165 Merge pull request #18 from revprism-dev-bot/docs/hooks-phase3-destructive-op-design
-770b530 Merge pull request #17 from revprism-dev-bot/feat/cwd-scope-and-memory-path
-dcc2c25 docs(hooks): design for Phase 3 destructive-op judgment primitive
-ab7c629 feat(hooks): CWD scope filter + auto-detect memory path
+$ git log --oneline -12
+1b9e92e fix(hooks): quote-aware parser + lossless producer for hooks.log values (#49)
+18e217f fix(hooks): drop redundant `event` key from Stop/SessionEnd kv maps (#48)
+e5a738d feat(hooks): add `hooks smoke` end-to-end harness for all 6 hooks (#47)
+b039c9c docs(hooks): semantic-drift metric design for missed tool-call opportunities (#46)
+1bed701 feat(guardrails): introduce ClassUnknown for default fall-through (#45)
+7af921c feat(hooks): add audit-guardrails subcommand for PreToolUse shadow-mode review (#44)
+8808e99 feat(sessions): add user-prompt cache-hit counters to SessionReport (#43)
+c4a3383 feat(install): run skills import as best-effort post-install step (#42)
+e96fe10 feat(bench): auto-scope bench-retrieval to CWD's repo (#41)
+c920625 docs(hooks): design doc for LLM classification fallback (#40)
+f205a21 feat(sessions): add redundant_heimdall_calls to SessionReport (#39)
+d231d92 docs(handoff): refresh for Wave F (2026-04-17 late) (#38)
 ```
 
-Main is **in sync with `origin/main`** at `65a396b`. All 10 today's PRs
-merged. Binary at `/home/noname/.local/bin/heimdall-mcp` rebuilt and
-reports `(65a396b)`. Hooks installed at
+Main is **in sync with `origin/main`** at `1b9e92e`. All 11 of 2026-04-18's
+PRs (#39–#49) merged. Binary at `/home/noname/.local/bin/heimdall-mcp`
+rebuilt and reports `(1b9e92e)`. Hooks installed at
 `/home/noname/Code/heimdall-mcp/.claude/settings.json` (6 hooks, template
 envelope `wave2-phase3`).
 
-**Stale worktrees** — the three 2026-04-11 `agent-*` worktrees plus seven
-2026-04-16 `agent-*` worktrees from today's parallel push are all still in
-`git worktree list`. Harmless, excluded from indexing. Prune when you feel
-like it:
+**Stale worktrees** — prior `agent-*` worktrees from earlier parallel
+pushes may still be in `git worktree list`. Harmless, excluded from
+indexing. Prune when you feel like it:
 ```bash
 for d in .claude/worktrees/agent-*; do
   git worktree remove --force "$d"
 done
 ```
-(The seven from today each hold a merged branch with a local lock — may
-need `git worktree remove -f -f` for the locked ones.)
+(Each held a merged branch with a local lock — may need
+`git worktree remove -f -f` for locked ones.)
 
 **Open known-unknowns (ordered by urgency):**
 
 1. ~~SessionStart, PostToolUse, Stop, SessionEnd fire?~~ **✅ verified.**
-2. **PreToolUse shadow-mode telemetry on real sessions.** Phase 3 just
-   shipped. Classifier is new code. Run `hooks tail --event=pre-tool-use`
-   after a day of use and audit verdicts.
-3. **UserPromptSubmit cache-hit ratio over sessions.** Not yet measured.
-   `hooks tail --event=user-prompt --since=24h` should show `stage=cache_hit`
-   vs `stage=ok` counts. Wire a one-liner to compute the ratio.
-4. **T21 with-vs-without comparison.** Still not run — same story.
-5. **Skills auto-import on install-hooks?** Currently `skills import` is a
-   separate CLI command. Could be folded into `install-hooks` as a best-effort
-   step alongside prewarm. Trivial to add if desired.
-6. **Oversized SKILL.md files** (see caveat #8). Not urgent but a real rough
-   edge for heavy skill users.
-10. ~~Should the post-edit actor pre-warm Ollama on install?~~ **✅ done.**
-    `install-hooks` now does a best-effort `EmbedForHook` warm-up
-    (5s timeout, `--no-prewarm` to skip) after a successful install or
-    `--force` re-install. Auto-upgrade SessionStart intentionally skips
-    its own prewarm — the recall step that runs immediately after warms
-    the model anyway, and a redundant call would eat the 2s budget.
+2. **PreToolUse shadow-mode telemetry on real sessions.** Run
+   `heimdall-mcp hooks audit-guardrails --since=168h` (PR #44) after a week
+   of traffic and inspect the report's `promote_to_warn` recommendation.
+3. **UserPromptSubmit cache-hit ratio over sessions.** Surfaced in
+   `sessions report` JSON as top-level `user_prompt_cache_hits` /
+   `user_prompt_cache_total` (PR #43). Track over weeks.
+4. **Semantic-drift metric (plan 12 / PR #46).** Not yet implemented —
+   prerequisite §9 open questions need resolution first.
+5. **LLM classifier fallback (plan 11 / PR #40).** Not yet implemented —
+   ClassUnknown prereq shipped as PR #45; §9 open questions still outstanding.
+6. **Cache-hit ratio consolidation (cosmetic).** See priority-list item 7
+   in the Opening prompt.
+7. ~~Should the post-edit actor pre-warm Ollama on install?~~ **✅ done.**
+   `install-hooks` does a best-effort `EmbedForHook` warm-up (5s timeout,
+   `--no-prewarm` to skip) after a successful install or `--force` re-install.
+   Auto-upgrade SessionStart intentionally skips its own prewarm — the
+   recall step that runs immediately after warms the model anyway, and a
+   redundant call would eat the 2s budget.
+8. ~~Skills auto-import on `install-hooks`?~~ **✅ done** — PR #42. Runs as
+   a best-effort step; `--no-skills-import` to skip.
