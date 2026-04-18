@@ -16,10 +16,17 @@ import (
 //
 // No per-file or per-project caps live here anymore. Back-pressure comes from:
 //   - excludePatterns (.git, node_modules, vendor, .heimdall_db, __pycache__,
-//     .idea, .claude/worktrees by default; user-configurable)
+//     .idea, .claude/worktrees by default; user-configurable via
+//     cfg.ExcludePatterns, CLI --exclude, or the MCP exclude_patterns key)
 //   - isBinaryFile NUL-byte sniff (first 512 bytes)
 //   - the chunker, which slices every file into MaxChunkSize (~1500-char)
 //     pieces — well under nomic-embed-text's 8192-token context window
+//
+// Nested sub-repos (immediate subdirs with their own .git entry) are skipped
+// during the outer walk and recorded in IndexResult.SubRepos so the caller
+// can spawn a separate Indexer per sub-repo via IndexSubRepos. That pass
+// shares the same exclude rules — a sub-repo whose relative path matches a
+// user pattern is skipped at discovery time too.
 //
 // A pathological multi-GB text file will be read whole via os.ReadFile in
 // chunkFile, which is the only remaining memory cliff. If that ever matters

@@ -431,8 +431,59 @@ heimdall-mcp index /path/to/project
   [0:02] 500/500 files 100% (12 chunks) — done      *(output is illustrative)*
   Scanned:  500 files
   Indexed:  1 file       ← only the changed one
-  Skipped:  499 files (unchanged)
+  Skipped:  499 files
+    └─ 499 unchanged (incremental)
 ```
+
+The "Skipped" line breaks down into four categories when any are non-zero:
+`unchanged (incremental)`, `excluded by pattern`, `binary`, and
+`sub-repo directories (indexed separately below)`. Categories with zero
+counts are suppressed.
+
+## Nested Repositories
+
+When the target path contains immediate subdirectories with their own
+`.git/` entry (directory or worktree gitlink), Heimdall indexes each one
+as a **separate project** rooted at the sub-repo. Each sub-repo gets its
+own `.heimdall_db/` inside itself, and is auto-registered in
+`heimdall-mcp projects`.
+
+```
+heimdall-mcp index /abs/outer
+  ...
+  Sub-repos: 3 indexed separately
+    └─ sub-service     [nomic-embed-text]  (12 files, 84 chunks)  → /abs/outer/sub-service/.heimdall_db
+    └─ sub-infra       [bge-m3 — pinned]   ( 7 files, 32 chunks)  → /abs/outer/sub-infra/.heimdall_db
+    └─ tools/generator [nomic-embed-text]  ( 4 files, 18 chunks)  → /abs/outer/tools/generator/.heimdall_db
+  Note: first indexing of sub-repos may take longer; subsequent runs are incremental.
+```
+
+A few notes:
+
+- **Model inheritance.** Sub-repos inherit the outer's embedding model on
+  first index. If a sub-repo already has a store under a different model
+  (e.g. you previously ran `heimdall-mcp index /abs/outer/sub-infra
+  --model bge-m3`), that pin is preserved — the outer's `--model` does
+  NOT overwrite it. Pinned sub-repos are flagged `[<model> — pinned]` in
+  the summary.
+- **Symlinked sub-repos are NOT discovered.** This matches the defaults
+  in `git`, `fd`, and `ripgrep`, and avoids the double-indexing hazard
+  where two outer projects link to the same sub-repo.
+- **Worktrees (`.git` is a file, not a directory) are supported.**
+- **Exclude a sub-repo** by passing `--exclude <dirname>` or by
+  setting `exclude_patterns` in global config:
+  ```
+  heimdall-mcp index /abs/outer --exclude vendor-sub --exclude node_modules
+  heimdall-mcp config set exclude_patterns '["dist","build","third_party"]'
+  ```
+  `--exclude` is repeatable and takes a glob or project-relative path,
+  not an absolute path. The match uses `filepath.Match` (per-component)
+  — `**` is NOT expanded, so prefer bare component names
+  (`--exclude generated`) over globs like `src/**/generated`.
+- **Monorepo first-index expectation.** The first post-upgrade run on a
+  large monorepo will be noticeably slower because every sub-repo now
+  gets an index for the first time. Subsequent runs are incremental per
+  sub-repo.
 
 ## Portable Indexes
 
