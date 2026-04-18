@@ -1,0 +1,5 @@
+{"session_id":"sA","turn_idx":0,"prompt":"pA","injected_hit_ids":["hit1","hit2"],"heimdall_search_queries":["qClose"],"heimdall_tools_used":["heimdall_search"],"v1_flagged":true,"label":"truly_redundant"}
+{"session_id":"sA","turn_idx":1,"prompt":"pB","injected_hit_ids":[],"heimdall_search_queries":[],"heimdall_tools_used":[],"v1_flagged":false,"label":"truly_missed"}
+{"session_id":"sA","turn_idx":2,"prompt":"pC","injected_hit_ids":[],"heimdall_search_queries":[],"heimdall_tools_used":[],"v1_flagged":false,"label":"neither"}
+{"session_id":"sB","turn_idx":0,"prompt":"pD","injected_hit_ids":["hit2"],"heimdall_search_queries":["qUnrelated"],"heimdall_tools_used":["heimdall_search"],"v1_flagged":false,"label":"neither"}
+{"session_id":"sB","turn_idx":1,"prompt":"pE","injected_hit_ids":["hit1","hit2"],"heimdall_search_queries":["qNotClose"],"heimdall_tools_used":["heimdall_search"],"v1_flagged":true,"label":"truly_redundant"}
