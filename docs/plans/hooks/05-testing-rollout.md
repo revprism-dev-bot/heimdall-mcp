@@ -87,6 +87,52 @@ Current harness (`internal/cli/e2e_test.go`, `TestE2E_ClaudeSessionStartHookFire
 
 Caveats: requires `claude` on PATH (skip cleanly otherwise); requires Ollama or a stubbed endpoint; burns real model tokens unless the user has a local setup; gated behind `-tags e2e` AND `HEIMDALL_E2E_CLAUDE=1`, never default CI. On auth/network failures the test treats the run as "environment issue" and `t.Skip`s with the captured output — the harness is explicitly "best effort, not a CI gate." If claude auth flows or flag shapes drift, layer 3 degrades to a manual runbook and layers 1+2 remain the correctness gate — they already cover every assertion from plan 01 §`test-rollout`.
 
+### Smoke harness — dispatchable dogfood substitute
+
+**Status: shipped.** Location: `internal/cli/hooks_smoke.go`, entry point
+`heimdall-mcp hooks smoke [--fake-ollama] [--format=text|json]`. Wrapper
+Makefile target: `make hooks-smoke` (builds the binary, then runs the
+harness with `--fake-ollama`).
+
+Purpose: replace the manual "reopen Claude Code, trigger each hook, eyeball
+hooks.log" ritual with a single command. This is **not** a substitute for
+layers 1-3:
+
+- Layer 1 proves handler logic in isolation.
+- Layer 2 proves the binary's process boundary (flag parsing, stdin
+  buffering, actor fork+setsid).
+- Layer 3 proves the real `claude` CLI drives our hooks end-to-end.
+- **Smoke harness** proves "all six installed hooks still fire cleanly
+  against real CLI deps" — the sanity check a developer runs locally
+  after touching hook code, or that a CI job runs nightly on a
+  head-of-main binary to catch drift without needing a `claude` install.
+
+Scope per fire:
+
+- Synthesized payload per hook matching the Claude Code event schema
+  (`SessionStart`, `UserPromptSubmit`, `PostToolUse(Edit|Write)`,
+  `PreToolUse(Bash)`, `Stop`, `SessionEnd`).
+- Assertions: exit 0 (OQ-5), empty stderr on retrieval hooks, expected
+  `stage=` / `msg=` token present in the per-fire hooks.log slice.
+- Per-run a fresh tempdir-scoped `hooks.log` via `HEIMDALL_HOOK_LOG`; the
+  user's real log file is never touched.
+
+`--fake-ollama` spins an in-process `httptest.Server` (same shape as
+`internal/cli/integration_test.go`'s `fakeOllamaServer`) and seeds a vector
+store so session-start / user-prompt pass `VerifyHookIndex` offline. Without
+the flag, the harness hits whatever `heimdall-mcp config` resolves — useful
+for confirming a real local Ollama setup before shipping.
+
+Output modes:
+
+- `--format=text` (default): per-hook `[PASS] / [FAIL]` lines with the
+  captured log line + reason on failures, plus a final summary (passed /
+  failed / total wall-time).
+- `--format=json`: machine-readable `SmokeReport`; scripts and CI can
+  gate on `failed > 0`.
+
+Exit code: 0 if every step passes, 1 if any fails, 2 on a CLI usage error.
+
 ### Failure-mode coverage
 
 Every tier in plan 04 §1 needs a unit *and* an integration test. Minimum: Ollama unreachable (SessionStart + UserPromptSubmit), index missing (SessionStart), embed timeout > budget (UserPromptSubmit with sleeping fake), concurrent PostToolUse debouncer (unit; 10 events/100 ms → single re-index), DB migration mismatch (SessionStart), model mismatch (plan 04 §3). Cross-reference by plan 04 tier ID.
