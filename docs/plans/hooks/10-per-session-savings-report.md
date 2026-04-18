@@ -2109,6 +2109,7 @@ If Wave C is done in parallel by another agent, wait for both to merge before cl
 | 4 | `sessions list` time window | ✅ SHIPPED | `--since=<duration>` filter implemented; keeps sessions whose `LastSeen` falls inside the window. Session aggregates now track `FirstSeen` / `LastSeen`. |
 | 5 | Auto-detecting "current" session | Not in v1 | `sessions list` lets the user pick; auto-detect needs ambiguity handling (multiple parallel sessions). |
 | 6 | Doctor check #14 | ✅ SHIPPED | Lightweight readability check — reads `hooks.log`, aggregates by session, pass/warn only. Deliberately does not try to render a full report (transcripts may be absent on fresh installs). |
+| 7 | Semantic-drift variant of `redundant_heimdall_calls` | See `docs/plans/hooks/12-semantic-drift-metric.md` | v1 `redundant_heimdall_calls` (PR #39) is a textual counter — it flips on any `heimdall_*` call in a hit-injected turn, without checking whether the hit was relevant to what the model then searched for. Plan 12 designs a cosine-similarity variant (`semantic_redundant_calls` + `missed_call_opportunities`) slotted under `tool_use.semantic_drift`; co-exists with v1 through a 2-stage soak before v1 is dropped (schema_version bump to `"v2"`). Design only — not yet implemented. |
 
 ---
 
