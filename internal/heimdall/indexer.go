@@ -68,11 +68,11 @@ type SkipBreakdown struct {
 
 // IndexResult holds statistics from an indexing run.
 type IndexResult struct {
-	FilesScanned  int
-	FilesIndexed  int
+	FilesScanned int
+	FilesIndexed int
 	// FilesSkipped is the sum of Skip.UserExcluded + Skip.SubRepo + Skip.Binary
 	// + Skip.Unchanged. Retained for backward compat with existing callers.
-	FilesSkipped  int
+	FilesSkipped int
 	// Skip is the per-reason breakdown. New callers should prefer reading this.
 	Skip          SkipBreakdown
 	ChunksCreated int
@@ -80,23 +80,23 @@ type IndexResult struct {
 	// idx.root) that were discovered during the outer walk and skipped by
 	// filepath.SkipDir. These are the sub-repos that the orchestrator (CLI or
 	// MCP runIndex) should index separately as their own projects.
-	SubRepos      []string
-	Duration      time.Duration
-	Errors        []string
+	SubRepos []string
+	Duration time.Duration
+	Errors   []string
 }
 
 // IndexProgress reports progress from an async indexing run.
 type IndexProgress struct {
-	Current      int    // files processed so far
-	Total        int    // total files discovered
-	FilePath     string // current file being indexed
-	ChunksSoFar  int    // total chunks created so far
-	FileChunks   int    // chunks created for this file
-	BytesDone    int64  // bytes processed so far
-	BytesTotal   int64  // total bytes to process
-	Done         bool   // true when indexing is complete
-	Result       *IndexResult // non-nil when Done is true
-	Err          error        // non-nil if indexing failed
+	Current     int          // files processed so far
+	Total       int          // total files discovered
+	FilePath    string       // current file being indexed
+	ChunksSoFar int          // total chunks created so far
+	FileChunks  int          // chunks created for this file
+	BytesDone   int64        // bytes processed so far
+	BytesTotal  int64        // total bytes to process
+	Done        bool         // true when indexing is complete
+	Result      *IndexResult // non-nil when Done is true
+	Err         error        // non-nil if indexing failed
 }
 
 // SubRepoOpts parameterises IndexSubRepos. Currently empty — kept as a
@@ -388,7 +388,7 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 					progress <- IndexProgress{
 						Current: i + 1, Total: len(files), FilePath: relPath,
 						ChunksSoFar: result.ChunksCreated,
-						BytesDone: bytesDone, BytesTotal: totalBytes,
+						BytesDone:   bytesDone, BytesTotal: totalBytes,
 					}
 				}
 				continue
@@ -399,7 +399,7 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 					progress <- IndexProgress{
 						Current: i + 1, Total: len(files), FilePath: relPath,
 						ChunksSoFar: result.ChunksCreated,
-						BytesDone: bytesDone, BytesTotal: totalBytes,
+						BytesDone:   bytesDone, BytesTotal: totalBytes,
 					}
 				}
 				continue
@@ -411,7 +411,7 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 			progress <- IndexProgress{
 				Current: i + 1, Total: len(files), FilePath: relPath,
 				ChunksSoFar: result.ChunksCreated,
-				BytesDone: bytesDone, BytesTotal: totalBytes,
+				BytesDone:   bytesDone, BytesTotal: totalBytes,
 			}
 		}
 
