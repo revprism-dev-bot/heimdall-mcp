@@ -458,21 +458,25 @@ func runDoctorChecks(cfg config.Config, env map[string]string, deps doctorDeps) 
 		}
 	}
 
-	// 13 — PreToolUse guardrail dry-fire (in-process). Classifies a benign
-	// allow-case Bash command (`ls`) via the exact same classifier the
-	// installed hook uses. Confirms the guardrail pipeline is wired without
-	// shelling out (the generic hook dry-fire at check #10 already exec's
-	// every installed entry, but the payload it sends is event-agnostic;
-	// for PreToolUse that means `tool_name` is missing and the handler exits
-	// silently without actually classifying. This check runs the classifier
-	// in-process so we verify the table compiled and the handler wiring is
-	// intact.)
+	// 13 — PreToolUse guardrail dry-fire (in-process). Runs a known-block
+	// command (`rm -rf /`) through the exact same classifier the installed
+	// hook uses; a ClassBlock return proves the rule table compiled and
+	// the handler wiring is intact. (The generic hook dry-fire at check
+	// #10 already exec's every installed entry, but the payload it sends
+	// is event-agnostic — for PreToolUse that means `tool_name` is
+	// missing and the handler exits silently without actually classifying.)
+	//
+	// Note: we used to fire `ls -la` here and expect ClassAllow, but after
+	// the plan 11 §2.1 ClassUnknown split, unrecognized-but-safe commands
+	// now return ClassUnknown (not ClassAllow). Firing a known-block
+	// command is a stronger check anyway — it exercises the regex engine
+	// against real patterns instead of just the default fall-through.
 	{
-		class, _, _ := heimdall.ClassifyBashCommand("ls -la")
-		if class != heimdall.ClassAllow {
+		class, _, ruleID := heimdall.ClassifyBashCommand("rm -rf /")
+		if class != heimdall.ClassBlock || ruleID != "RM_RF_ROOT" {
 			checks = append(checks, doctorCheck{
 				name: "guardrail classifier", status: statusFail,
-				message: fmt.Sprintf("benign `ls -la` classified as %s (expected allow)", class),
+				message: fmt.Sprintf("`rm -rf /` classified as %s (rule=%s); expected block/RM_RF_ROOT", class, ruleID),
 			})
 		} else {
 			checks = append(checks, doctorCheck{

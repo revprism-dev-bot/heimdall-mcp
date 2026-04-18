@@ -1,9 +1,11 @@
 // Package heimdall — destructive_ops.go implements the Phase 3 guardrail
 // classifier primitive. Given a raw Bash command string, it returns one of
-// three classifications (allow / warn / block) plus a stable rule ID and a
-// short human-readable reason.
+// four classifications (allow / warn / block / unknown) plus a stable rule
+// ID and a short human-readable reason.
 //
-// Design reference: docs/plans/hooks/08-destructive-op-primitive.md.
+// Design reference: docs/plans/hooks/08-destructive-op-primitive.md and
+// the ClassUnknown prerequisite in
+// docs/plans/hooks/11-llm-classification-fallback.md §2.1.
 //
 // Contract:
 //   - Deterministic, pure function (no I/O, no RNG).
@@ -11,7 +13,11 @@
 //   - Block precedence: among deny rules, block wins over warn.
 //   - p99 ≤ 1 ms on typical command strings (≤256 bytes). All regex is
 //     compiled at init.
-//   - Default classification when nothing matches is ClassAllow.
+//   - Default classification when NOTHING matches any rule is ClassUnknown
+//     (distinct from ClassAllow, which is reserved for commands that hit
+//     an explicit allow-list rule). Callers that need today's "allow by
+//     default" behavior collapse ClassUnknown to ClassAllow at their own
+//     surface — see the hook handler in internal/cli/hook_pre_tool_use.go.
 //
 // This is a paper-cut protector, NOT a security boundary. A motivated human
 // can trivially bypass any string match (rename binary, pipe through bash -c,
@@ -24,12 +30,14 @@ import (
 	"strings"
 )
 
-// Classification is a tri-state label returned by ClassifyBashCommand.
+// Classification is a four-state label returned by ClassifyBashCommand.
 type Classification int
 
 const (
-	// ClassAllow means the command was not recognized as destructive.
-	// PreToolUse hook should let Claude Code run it without interference.
+	// ClassAllow means the command was explicitly matched by an allowlist
+	// rule (e.g. `git push --force-with-lease`). The PreToolUse hook lets
+	// Claude Code run it without interference, and the match is treated
+	// as authoritative — the LLM fallback (plan 11) never runs on it.
 	ClassAllow Classification = iota
 
 	// ClassWarn means the command is recoverable-destructive (e.g.
@@ -41,6 +49,20 @@ const (
 	// (e.g. `rm -rf /`, force-push to main). In block mode the hook exits
 	// 2 with a one-line stderr reason so Claude Code cancels the tool call.
 	ClassBlock
+
+	// ClassUnknown means no rule matched — neither allowlist nor warn nor
+	// block. This is the default fall-through and is deliberately distinct
+	// from ClassAllow so callers can tell "I recognized this as safe" from
+	// "no rule fired, presumed safe."
+	//
+	// Callers that want today's "allow by default" behavior collapse this
+	// to ClassAllow at their own surface (see the hook handler in
+	// internal/cli/hook_pre_tool_use.go — every mode treats ClassUnknown
+	// identically to ClassAllow for exit-code purposes, and never exits 2
+	// on Unknown regardless of mode). The extension point documented in
+	// docs/plans/hooks/11-llm-classification-fallback.md consults an LLM
+	// fallback if and only if the static classifier returned ClassUnknown.
+	ClassUnknown
 )
 
 // String renders a Classification as the lowercase token used in log lines
@@ -53,6 +75,8 @@ func (c Classification) String() string {
 		return "warn"
 	case ClassBlock:
 		return "block"
+	case ClassUnknown:
+		return "unknown"
 	default:
 		return "unknown"
 	}
@@ -320,7 +344,8 @@ func isEnvAssignment(tok string) bool {
 	return true
 }
 
-// ClassifyBashCommand classifies a proposed Bash command as allow/warn/block.
+// ClassifyBashCommand classifies a proposed Bash command as
+// allow/warn/block/unknown.
 //
 // Precedence:
 //  1. Allow rules win unconditionally (e.g., `git push --force-with-lease`
@@ -329,10 +354,18 @@ func isEnvAssignment(tok string) bool {
 //  3. First match within a class wins (the table is authored so rules do
 //     not overlap ambiguously, but when they do we take the earlier
 //     definition).
-//  4. Default = ClassAllow with empty rule/reason.
+//  4. Default when nothing matched = ClassUnknown with empty rule/reason.
+//     This is deliberately distinct from ClassAllow so callers can tell
+//     "I recognized this as safe" from "no rule fired." Today's
+//     allow-by-default behavior is preserved at the hook-handler surface
+//     (see internal/cli/hook_pre_tool_use.go — ClassUnknown is collapsed
+//     to ClassAllow for exit-code purposes in every mode, including block
+//     mode). The ClassUnknown value is the hook that a future LLM
+//     fallback hangs off of (plan 11 §2).
 //
-// Returns: (class, reason, ruleID). ruleID is the empty string on default
-// allow; reason is the empty string on default allow.
+// Returns: (class, reason, ruleID). ruleID and reason are the empty string
+// on the default unknown fall-through, and also on the empty-command early
+// return.
 //
 // This function is pure and allocation-light: it does a string trim, a
 // single normalization pass, and a fixed-size regex sweep. It never touches
@@ -340,7 +373,11 @@ func isEnvAssignment(tok string) bool {
 func ClassifyBashCommand(cmd string) (Classification, string, string) {
 	norm := normalizeCommand(cmd)
 	if norm == "" {
-		return ClassAllow, "", ""
+		// An empty / whitespace-only command isn't really a command at
+		// all. Report it as Unknown so the default fall-through is a
+		// single well-defined state; the hook handler short-circuits on
+		// an empty `tool_input.command` before reaching us anyway.
+		return ClassUnknown, "", ""
 	}
 
 	// Pass 1: allow rules. Any match short-circuits with ClassAllow.
@@ -373,8 +410,8 @@ func ClassifyBashCommand(cmd string) (Classification, string, string) {
 		}
 	}
 
-	// Nothing matched: not recognized as destructive.
-	return ClassAllow, "", ""
+	// Nothing matched: not recognized — neither safe nor unsafe.
+	return ClassUnknown, "", ""
 }
 
 // DestructiveRuleCount returns the number of rules currently shipped in the

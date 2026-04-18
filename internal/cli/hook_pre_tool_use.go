@@ -190,6 +190,14 @@ func HookPreToolUse(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	})
 
 	// --- act on classification based on mode -------------------------------
+	//
+	// ClassUnknown is treated identically to ClassAllow for exit-code
+	// purposes in EVERY mode (including block). This is the plan 11 §2.1
+	// "no user-visible change in default deployments" contract: the only
+	// hook that may exit 2 is mode=block AND class=ClassBlock (OQ-5 in
+	// docs/plans/hooks/06-decisions.md). Unknown never exits 2, never
+	// writes stdout, never writes stderr — it's logged as `class=unknown`
+	// so the audit tooling can count it separately from real Allow hits.
 
 	switch mode {
 	case guardrailShadow:
@@ -199,7 +207,8 @@ func HookPreToolUse(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	case guardrailWarn:
 		// Warn + block both emit the `## Heimdall guardrail` block on stdout.
 		// Hook still exits 0 — this mode is "preview what block mode would
-		// do" without actually stopping tools.
+		// do" without actually stopping tools. Allow and Unknown fall
+		// through silently.
 		if class == ClassWarnAlias || class == ClassBlockAlias {
 			writeGuardrailBlock(stdout, class, ruleID, reason, cmd)
 		}
@@ -217,6 +226,9 @@ func HookPreToolUse(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 			writeGuardrailBlock(stdout, class, ruleID, reason, cmd)
 			return 0
 		}
+		// ClassAllow + ClassUnknown both fall here — exit 0, silent. OQ-5
+		// compliance: a class=unknown fall-through must NEVER exit 2, even
+		// in block mode.
 		return 0
 	}
 	return 0
@@ -229,12 +241,13 @@ type HookPreToolUseDeps struct {
 }
 
 // Typed aliases — they compile down to the same values as
-// heimdall.ClassAllow/Warn/Block, but keep the handler file from needing
-// a bare reference to every token from the heimdall package.
+// heimdall.ClassAllow/Warn/Block/Unknown, but keep the handler file from
+// needing a bare reference to every token from the heimdall package.
 const (
-	ClassAllowAlias = heimdall.ClassAllow
-	ClassWarnAlias  = heimdall.ClassWarn
-	ClassBlockAlias = heimdall.ClassBlock
+	ClassAllowAlias   = heimdall.ClassAllow
+	ClassWarnAlias    = heimdall.ClassWarn
+	ClassBlockAlias   = heimdall.ClassBlock
+	ClassUnknownAlias = heimdall.ClassUnknown
 )
 
 // writeGuardrailBlock renders the one-line `## Heimdall guardrail` block
