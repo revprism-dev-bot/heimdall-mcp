@@ -397,6 +397,16 @@ enough data to either (a) confirm the rules are tight enough to flip to
    one of the four documented values (catches typos like
    `HEIMDALL_GUARDRAIL=...`).
 
+The audit is automated by `heimdall-mcp hooks audit-guardrails`
+(see `internal/cli/hooks_audit.go`). It reads `hooks.log`, filters to
+`event=pre-tool-use` entries, and emits a structured report with counts
+by class/mode, top offending rules, the full shadow-mode block dataset
+(the false-positive candidate list reviewers must eyeball), and a
+`promote_to_warn` recommendation. The recommendation is `true` iff
+block count in window == 0 OR window covers <24h; otherwise `false`
+with the top offender called out. Run after ≥1 day of real traffic:
+`heimdall-mcp hooks audit-guardrails --since=168h --format=json`.
+
 **Install behavior:** `install-hooks` adds the `PreToolUse` entry by
 default once Phase 3 ships, with the matcher
 `Bash` (no inline filter — we want to see all bash commands so the
