@@ -819,6 +819,9 @@ plus a recommendation the human can ratify or reject.
 1. **Operator committing to ~5 hours of labeling.** The OQ-3 harness
    is ineffective without a hand-labeled sample. Operator time is
    the scarce resource, not code.
+
+   **Status (2026-04-18): RESOLVED — Commit to a 5-hour labeling block ~2026-05-02 (after 2-week Stage 1 soak). Do not ship Stage 3 without labels.**
+
    - *Recommendation:* commit to the labeling at the Stage 2 shipping
      point. If that's a hard no, defer Stage 3 indefinitely — v1 and
      v2 co-exist in perpetuity. Not a correctness problem, just an
@@ -829,6 +832,9 @@ plus a recommendation the human can ratify or reject.
    "~2 MB over 14 days — under cap." The cap is shared with every
    other hook event. If you've got plans for another verbose event
    stream in that cap, this eats room.
+
+   **Status (2026-04-18): RESOLVED — Prophylactic cap bump: 5 MB → 10 MB. Executed as code follow-up F4.**
+
    - *Recommendation:* ship now. Re-litigate if `hooks.log` cap starts
      rotating more than once per 14 days.
 
@@ -837,6 +843,9 @@ plus a recommendation the human can ratify or reject.
    A future migration to `nomic-embed-text-v1.5` or
    `mxbai-embed-large` (both 768+-dim) would invalidate the calibrated
    thresholds — but there's no mechanism to force a re-bake.
+
+   **Status (2026-04-18): RESOLVED — Post-v2 follow-up: record `embedding_model` in the calibration artifact and add a pre-flight warn in `sessions report` when the artifact's model ≠ current store's model.**
+
    - *Recommendation:* add a post-v2 follow-up: an
      `index_version`-style `embedding_model_version` field in
      `store_metadata`, and a pre-flight check in `sessions report`
@@ -848,6 +857,9 @@ plus a recommendation the human can ratify or reject.
    `tool_use.recall_patterns` sub-object.** Argument for `semantic_drift`:
    it's a drift-shaped signal. Argument for splitting: it's
    textually-derived, not semantically-derived.
+
+   **Status (2026-04-18): RESOLVED — Nest inside `tool_use.semantic_drift.companion_counters` sub-map. Executed as code follow-up F5.**
+
    - *Recommendation:* ship it inside `semantic_drift` as a
      `companion_counters` sub-map — keeps the drift block
      self-contained and makes the "we added a companion metric, not
