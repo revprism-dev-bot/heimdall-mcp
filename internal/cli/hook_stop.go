@@ -91,7 +91,6 @@ func HookStop(_ config.Config, stdin io.Reader, stdout, _ io.Writer, env map[str
 	f.Write(line)
 
 	heimdall.LogHookEvent("INFO", "stop", map[string]any{
-		"event":   "stop",
 		"session": payload.SessionID,
 		"msg":     "buffer_appended",
 		"bytes":   len(line),
@@ -150,7 +149,6 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 						result, err := heimdall.IngestSessionSummary(ctx, summary, "", embedder, memStore)
 						if err == nil {
 							heimdall.LogHookEvent("INFO", "session-end", map[string]any{
-								"event":    "session-end",
 								"session":  payload.SessionID,
 								"reason":   payload.Reason,
 								"msg":      "ingest_ok",
@@ -166,7 +164,6 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 	os.Remove(bufferPath)
 
 	heimdall.LogHookEvent("INFO", "session-end", map[string]any{
-		"event":   "session-end",
 		"session": payload.SessionID,
 		"reason":  payload.Reason,
 		"msg":     "session_ended",

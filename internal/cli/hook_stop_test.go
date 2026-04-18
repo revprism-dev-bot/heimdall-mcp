@@ -151,6 +151,92 @@ func TestHookSessionEnd_MalformedJSON(t *testing.T) {
 	}
 }
 
+// TestHookStop_LogsSingleEventStamp is a regression guard: the Stop hook handler
+// must not pass "event" in its kv map to LogHookEvent — the logger already
+// stamps `event=<name>` from its own `event` parameter. Passing it in kv too
+// produced a duplicate token in the log line (e.g. `event=stop ... event=stop`),
+// breaking grep-friendly parsing and making the output look malformed.
+func TestHookStop_LogsSingleEventStamp(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+	t.Setenv("HEIMDALL_HOOKS", "1")
+
+	projectDir := t.TempDir()
+	payload := stopPayload{
+		SessionID:            "single-stamp-session",
+		CWD:                  projectDir,
+		LastAssistantMessage: "msg",
+		StopHookActive:       true,
+	}
+	data, _ := json.Marshal(payload)
+	code := HookStop(config.DefaultConfig(), bytes.NewReader(data), &bytes.Buffer{}, &bytes.Buffer{}, map[string]string{}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+
+	logBytes, err := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if err != nil {
+		t.Fatalf("hook log not written: %v", err)
+	}
+	logStr := string(logBytes)
+	// Find the buffer_appended line — that's the one with the dup before the fix.
+	var target string
+	for _, line := range strings.Split(strings.TrimSpace(logStr), "\n") {
+		if strings.Contains(line, "buffer_appended") {
+			target = line
+			break
+		}
+	}
+	if target == "" {
+		t.Fatalf("no buffer_appended line in hook log:\n%s", logStr)
+	}
+	if n := strings.Count(target, "event=stop"); n != 1 {
+		t.Fatalf("expected exactly 1 `event=stop` token on buffer_appended line, got %d:\n%s", n, target)
+	}
+}
+
+// TestHookSessionEnd_LogsSingleEventStamp is the SessionEnd counterpart to the
+// Stop regression above. Same bug (`"event": "session-end"` in the kv map on
+// top of the logger's own stamp), same fix.
+func TestHookSessionEnd_LogsSingleEventStamp(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+	t.Setenv("HEIMDALL_HOOKS", "1")
+
+	projectDir := t.TempDir()
+	// No buffer file needed; HookSessionEnd will still log session_ended.
+	payload := sessionEndPayload{
+		SessionID:     "single-stamp-session-end",
+		CWD:           projectDir,
+		HookEventName: "SessionEnd",
+		Reason:        "clear",
+	}
+	data, _ := json.Marshal(payload)
+	code := HookSessionEnd(config.DefaultConfig(), bytes.NewReader(data), &bytes.Buffer{}, &bytes.Buffer{}, map[string]string{}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+
+	logBytes, err := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if err != nil {
+		t.Fatalf("hook log not written: %v", err)
+	}
+	logStr := string(logBytes)
+	var target string
+	for _, line := range strings.Split(strings.TrimSpace(logStr), "\n") {
+		if strings.Contains(line, "session_ended") {
+			target = line
+			break
+		}
+	}
+	if target == "" {
+		t.Fatalf("no session_ended line in hook log:\n%s", logStr)
+	}
+	if n := strings.Count(target, "event=session-end"); n != 1 {
+		t.Fatalf("expected exactly 1 `event=session-end` token on session_ended line, got %d:\n%s", n, target)
+	}
+}
+
 func TestExtractTranscriptSummary_Empty(t *testing.T) {
 	got := extractTranscriptSummary(nil)
 	if got != "" {
