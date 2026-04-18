@@ -42,12 +42,38 @@ func NewIndexer(root string, embedder Embedder, store *VectorStore, opts Chunker
 	}
 }
 
+// SkipBreakdown classifies skipped files by reason.
+//
+// UserExcluded counts ONLY user-configured exclusions (cfg.ExcludePatterns
+// + CLI --exclude + MCP exclude_patterns). Default hygiene dirs (.git,
+// node_modules, .heimdall_db, vendor, __pycache__, .idea) are NOT counted —
+// the user cares about what THEY excluded, not about always-on cleanup.
+// See plan §G6 for the contract and §10.3 TestExclude_DefaultHygieneNotCounted
+// for the regression test.
+//
+// Invariant: UserExcluded + SubRepo + Binary + Unchanged == IndexResult.FilesSkipped.
+type SkipBreakdown struct {
+	UserExcluded int `json:"user_excluded"`
+	SubRepo      int `json:"sub_repo"`
+	Binary       int `json:"binary"`
+	Unchanged    int `json:"unchanged"`
+}
+
 // IndexResult holds statistics from an indexing run.
 type IndexResult struct {
 	FilesScanned  int
 	FilesIndexed  int
+	// FilesSkipped is the sum of Skip.UserExcluded + Skip.SubRepo + Skip.Binary
+	// + Skip.Unchanged. Retained for backward compat with existing callers.
 	FilesSkipped  int
+	// Skip is the per-reason breakdown. New callers should prefer reading this.
+	Skip          SkipBreakdown
 	ChunksCreated int
+	// SubRepos is the list of immediate sub-repo directory names (relative to
+	// idx.root) that were discovered during the outer walk and skipped by
+	// filepath.SkipDir. These are the sub-repos that the orchestrator (CLI or
+	// MCP runIndex) should index separately as their own projects.
+	SubRepos      []string
 	Duration      time.Duration
 	Errors        []string
 }

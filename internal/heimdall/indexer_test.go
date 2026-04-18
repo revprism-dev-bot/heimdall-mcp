@@ -385,6 +385,31 @@ func TestDiscoverSubRepoDirs_Empty(t *testing.T) {
 	}
 }
 
+// TestIndexResult_SkipBreakdownSums asserts the invariant that the four
+// SkipBreakdown counters sum to FilesSkipped. This is the contract that lets
+// the CLI render the categorized summary without a discrepancy against the
+// legacy counter.
+func TestIndexResult_SkipBreakdownSums(t *testing.T) {
+	files := map[string]string{"a.go": "package a\n"}
+	root := createTestProject(t, files)
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.Skip.UserExcluded + result.Skip.SubRepo + result.Skip.Binary + result.Skip.Unchanged
+	if got != result.FilesSkipped {
+		t.Errorf("breakdown sum %d != FilesSkipped %d (Skip=%+v)", got, result.FilesSkipped, result.Skip)
+	}
+}
+
 // TestIndexer_NoFileCountCap verifies there is no hard cap on the number of
 // files indexed. Prior to the cap removal, indexing silently truncated at
 // 5000 files, so 5001 is the minimum count that proves the cap is gone.
