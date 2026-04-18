@@ -2104,7 +2104,7 @@ If Wave C is done in parallel by another agent, wait for both to merge before cl
 | # | Decision | Recommendation | Why |
 |---|---|---|---|
 | 1 | Transcript path resolution fallback when `--cwd` is absent | Use `os.Getwd()` | Matches existing hook convention; users are expected to run `sessions report` from the project directory. |
-| 2 | JSON schema stability | ✅ SHIPPED | `schema_version: "v1"` emitted on both `sessions list --format=json` and `sessions report --format=json`. See `SessionsReportSchemaVersion` in `internal/cli/sessions.go`. Bump on breaking change only. |
+| 2 | JSON schema stability | ✅ SHIPPED | `schema_version: "v1"` emitted on both `sessions list --format=json` and `sessions report --format=json`. See `SessionsReportSchemaVersion` in `internal/cli/sessions.go`. Bump on breaking change only. Additive fields (new keys) **do not** require a bump — e.g. `tool_use.redundant_heimdall_calls` was added post-ship in Wave F without a version change. |
 | 3 | Handling rotated `hooks.log.1` | Ignore in v1 | 5 MB cap + rotation means only recent sessions live in the active file. Multi-session history can be a follow-up. |
 | 4 | `sessions list` time window | ✅ SHIPPED | `--since=<duration>` filter implemented; keeps sessions whose `LastSeen` falls inside the window. Session aggregates now track `FirstSeen` / `LastSeen`. |
 | 5 | Auto-detecting "current" session | Not in v1 | `sessions list` lets the user pick; auto-detect needs ambiguity handling (multiple parallel sessions). |
@@ -2142,7 +2142,7 @@ Duration:      1h8m
   output_tokens=9821
 
 ## Tool use
-  total=87 heimdall=14
+  total=87 heimdall=14 redundant_heimdall_calls=6
   - Bash: 32
   - Edit: 11
   - Read: 18
