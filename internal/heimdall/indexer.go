@@ -99,11 +99,30 @@ type IndexProgress struct {
 	Err         error        // non-nil if indexing failed
 }
 
-// SubRepoOpts parameterises IndexSubRepos. Currently empty — kept as a
-// named struct so we can grow the knob surface (e.g. parallelism, explicit
-// model-override) without breaking callers. Exclude patterns are already
-// inherited through the indexer's ChunkerOpts.
-type SubRepoOpts struct{}
+// SubRepoOpts parameterises IndexSubRepos. All fields are optional — a
+// zero-value SubRepoOpts{} preserves the pre-callback behaviour (no
+// panics, same result slice). Exclude patterns are already inherited
+// through the indexer's ChunkerOpts.
+//
+// Callbacks fire synchronously on the goroutine that called IndexSubRepos.
+// Keep them cheap (format a line, update a progress bar); slow callbacks
+// block the indexing pass.
+type SubRepoOpts struct {
+	// OnSubRepoStart fires immediately before each sub-repo is indexed.
+	// name is filepath.Base(subRepoPath). index is 1-based position among
+	// the sub-repos being indexed this run (after user-exclude filtering).
+	// total is the length of that same post-filter slice. Nil to skip.
+	OnSubRepoStart func(name string, index, total int)
+	// OnProgress fires for every IndexProgress event emitted by the
+	// sub-repo's incremental indexing pass (per-file updates). Use it to
+	// drive a progress bar or periodic status line for the sub-repo run.
+	// Nil to skip forwarding — back-compat with the old no-progress path.
+	OnProgress func(p IndexProgress)
+	// OnSubRepoDone fires after each sub-repo's indexing and store close,
+	// with the finalized SubRepoResult (whether successful or failed).
+	// Nil to skip.
+	OnSubRepoDone func(res SubRepoResult)
+}
 
 // SubRepoResult describes one sub-repo's indexing outcome.
 //
@@ -152,24 +171,36 @@ type SubRepoResult struct {
 // (idx.opts.ExcludeGlobs) are filtered out before indexing. Default
 // hygiene excludes do not apply here because DiscoverSubReposAbs never
 // descends into them in the first place.
-func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, _ SubRepoOpts) ([]SubRepoResult, error) {
+func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, opts SubRepoOpts) ([]SubRepoResult, error) {
 	subs, err := DiscoverSubReposAbs(idx.root)
 	if err != nil {
 		return nil, fmt.Errorf("discover sub-repos: %w", err)
 	}
+
+	// Pre-filter user-excluded sub-repos so OnSubRepoStart's index/total
+	// reflect only the sub-repos that will actually be indexed. Relpath
+	// failures are pathological (idx.root is absolute, subAbs built via
+	// filepath.Join) but preserved in the out slice so nothing is silently
+	// dropped.
+	type candidate struct {
+		abs     string
+		relName string
+	}
+	var toIndex []candidate
 	var out []SubRepoResult
 	for _, subAbs := range subs {
 		relName, relErr := filepath.Rel(idx.root, subAbs)
 		if relErr != nil {
-			// Shouldn't happen — idx.root is absolute and subAbs is built
-			// via filepath.Join(root, basename). Fail loudly anyway so a
-			// pathological path does not get silently dropped.
-			out = append(out, SubRepoResult{
+			entry := SubRepoResult{
 				Path:   subAbs,
 				Name:   filepath.Base(subAbs),
 				DBPath: filepath.Join(subAbs, ".heimdall_db"),
 				Err:    fmt.Errorf("relpath %s: %w", subAbs, relErr),
-			})
+			}
+			out = append(out, entry)
+			if opts.OnSubRepoDone != nil {
+				opts.OnSubRepoDone(entry)
+			}
 			continue
 		}
 		if idx.isUserExcluded(relName) {
@@ -179,11 +210,20 @@ func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, _ SubRepoOp
 			// would confuse the summary renderer).
 			continue
 		}
+		toIndex = append(toIndex, candidate{abs: subAbs, relName: relName})
+	}
 
+	total := len(toIndex)
+	for i, c := range toIndex {
+		subAbs := c.abs
 		subRes := SubRepoResult{
 			Path:   subAbs,
 			Name:   filepath.Base(subAbs),
 			DBPath: filepath.Join(subAbs, ".heimdall_db"),
+		}
+
+		if opts.OnSubRepoStart != nil {
+			opts.OnSubRepoStart(subRes.Name, i+1, total)
 		}
 
 		// Resolve model: pinned prior store wins over the caller's request.
@@ -208,6 +248,9 @@ func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, _ SubRepoOp
 			subRes.Model = ""
 			subRes.PinnedModel = false
 			out = append(out, subRes)
+			if opts.OnSubRepoDone != nil {
+				opts.OnSubRepoDone(subRes)
+			}
 			continue
 		}
 
@@ -217,8 +260,31 @@ func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, _ SubRepoOp
 		// responsibility — if the pinned model differs from the embedder's
 		// native model, the caller is expected to rebuild the embedder
 		// before calling IndexSubRepos (see CLI integration in cliIndex).
+		//
+		// Use incremental indexing (not IndexAll) so re-runs skip unchanged
+		// files — the PR #67 regression was re-embedding every file in
+		// every sub-repo on every run. If OnProgress is set, forward
+		// per-file progress events via an intermediate channel drained in
+		// parallel; the consumer only sees the forwarded callback, not the
+		// channel.
 		subIdx := NewIndexer(subAbs, idx.embedder, subStore, idx.opts)
-		r, indexErr := subIdx.IndexAll(ctx)
+		var r *IndexResult
+		var indexErr error
+		if opts.OnProgress != nil {
+			progressCh := make(chan IndexProgress, 64)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for p := range progressCh {
+					opts.OnProgress(p)
+				}
+			}()
+			r, indexErr = subIdx.indexFiles(ctx, true, progressCh)
+			close(progressCh)
+			<-done
+		} else {
+			r, indexErr = subIdx.IndexIncremental(ctx)
+		}
 		subRes.Result = r
 		subRes.Err = indexErr
 		if indexErr == nil {
@@ -238,6 +304,9 @@ func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, _ SubRepoOp
 			subRes.Err = fmt.Errorf("close sub-repo store %s: %w", subDBDir, closeErr)
 		}
 		out = append(out, subRes)
+		if opts.OnSubRepoDone != nil {
+			opts.OnSubRepoDone(subRes)
+		}
 	}
 	return out, nil
 }
