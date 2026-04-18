@@ -1,6 +1,6 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
-.PHONY: build install clean test test-integration test-e2e test-all bench bench-test
+.PHONY: build install clean test test-integration test-e2e test-all bench bench-test hooks-smoke
 
 build:
 	go build -ldflags "-X main.version=$(VERSION)" -o heimdall-mcp ./cmd/heimdall-mcp
@@ -48,3 +48,13 @@ bench:
 # stub embeddings and asserts saving > 0% vs full.
 bench-test:
 	go test -tags=bench -race -count=1 ./cmd/bench-retrieval/
+
+# End-to-end hooks smoke — fires one synthesized Claude Code payload per
+# installed hook, asserts exit codes + hooks.log stages, reports pass/fail.
+# Runs offline against an in-process fake Ollama so it's safe to invoke
+# without a local LLM. Acts as a dispatchable substitute for "reopen Claude
+# Code and eyeball hooks.log" dogfooding. See
+# docs/plans/hooks/05-testing-rollout.md §Smoke harness for the scope
+# boundary vs. layers 1-3.
+hooks-smoke: build
+	./heimdall-mcp hooks smoke --fake-ollama

@@ -25,7 +25,7 @@ type HookHandler func(stdin io.Reader, stdout, stderr io.Writer, env map[string]
 // exit code to surface to the shell. Called by RunCLI via a tiny wrapper.
 func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "Usage: heimdall-mcp hooks <tail|cache-clear|cache-stats|doctor|explain-command|audit-guardrails>")
+		fmt.Fprintln(stderr, "Usage: heimdall-mcp hooks <tail|cache-clear|cache-stats|doctor|explain-command|audit-guardrails|smoke>")
 		return 2
 	}
 	sub := args[0]
@@ -43,6 +43,8 @@ func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer,
 		return HooksExplainCommand(stdin, stdout, stderr, env, rest)
 	case "audit-guardrails":
 		return HooksAuditGuardrails(stdin, stdout, stderr, env, rest)
+	case "smoke":
+		return HooksSmoke(cfg, stdin, stdout, stderr, env, rest)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "heimdall-mcp hooks — operate on the Claude Code hooks subsystem")
 		fmt.Fprintln(stdout)
@@ -53,6 +55,7 @@ func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer,
 		fmt.Fprintln(stdout, "  hooks explain-command \"<cmd>\"          Classify a Bash command (allow/warn/block)")
 		fmt.Fprintln(stdout, "  hooks audit-guardrails [--since=<dur>] [--format text|json]")
 		fmt.Fprintln(stdout, "                                         Audit PreToolUse shadow-mode verdicts")
+		fmt.Fprintln(stdout, "  hooks smoke [--fake-ollama] [--format=text|json]  Fire each hook once, report pass/fail")
 		return 0
 	default:
 		fmt.Fprintf(stderr, "Unknown hooks subcommand: %s\n", sub)
