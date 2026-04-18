@@ -441,6 +441,99 @@ func TestLogHookEvent_NoPanicOnWeirdInputs(t *testing.T) {
 	})
 }
 
+// TestRedactLogString_QuotingProtocol pins the writer-side quoting rules that
+// the reader's strconv.Unquote pairing expects. The contract:
+//
+//  1. Simple values (no whitespace, no quote, no control) round-trip UNCHANGED
+//     — this is load-bearing for every downstream grep-style consumer
+//     (awk, grep, `hooks tail --project=...`).
+//  2. Values containing whitespace → wrapped in double quotes using
+//     strconv.Quote semantics so the reader can use strconv.Unquote for a
+//     lossless round-trip.
+//  3. Values containing a literal " → Go-escaped inside the quoted form.
+//  4. Values containing control chars (tab, newline) → Go-escaped.
+func TestRedactLogString_QuotingProtocol(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain word", "hello", "hello"},
+		{"empty string leaves empty", "", ""},
+		{"number-like token", "12345", "12345"},
+		{"simple with dash and underscore", "rule_id-x", "rule_id-x"},
+		{"space -> quoted", "rm -rf at root", `"rm -rf at root"`},
+		{"embedded quote -> escaped", `she said "hi"`, `"she said \"hi\""`},
+		{"tab -> escaped", "a\tb c", `"a\tb c"`},
+		{"newline -> escaped", "line1\nline2", `"line1\nline2"`},
+		{"backslash with space -> escaped", `a \ b`, `"a \\ b"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactLogString(tc.in)
+			if got != tc.want {
+				t.Errorf("redactLogString(%q) = %q; want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLogHookEvent_SimpleValueUnquoted is the backwards-compat canary —
+// any simple kv must emit as literal `k=v` with no quoting. Existing tools
+// that grep for `project=xyz` or `stage=ok` patterns depend on this.
+func TestLogHookEvent_SimpleValueUnquoted(t *testing.T) {
+	path := setupTmpHookLog(t)
+	LogHookEvent("INFO", "user-prompt", map[string]any{
+		"project": "heimdall",
+		"stage":   "ok",
+		"bytes":   1234,
+	})
+	b, _ := os.ReadFile(path)
+	s := string(b)
+	for _, needle := range []string{"project=heimdall", "stage=ok", "bytes=1234"} {
+		if !strings.Contains(s, needle) {
+			t.Errorf("simple value lost its plain form: need %q in %q", needle, s)
+		}
+	}
+	// Must NOT have wrapped any of these in quotes.
+	for _, forbidden := range []string{`project="heimdall"`, `stage="ok"`, `bytes="1234"`} {
+		if strings.Contains(s, forbidden) {
+			t.Errorf("simple value got spuriously quoted: found %q in %q", forbidden, s)
+		}
+	}
+}
+
+// TestLogHookEvent_ValueWithSpaceQuoted covers the core motivating bug:
+// `reason="rm -rf at root"` must round-trip cleanly for `hooks audit-guardrails`.
+func TestLogHookEvent_ValueWithSpaceQuoted(t *testing.T) {
+	path := setupTmpHookLog(t)
+	LogHookEvent("WARN", "pre-tool-use", map[string]any{
+		"class":   "block",
+		"rule_id": "RM_RF_ROOT",
+		"reason":  "rm -rf at root",
+	})
+	b, _ := os.ReadFile(path)
+	s := string(b)
+	if !strings.Contains(s, `reason="rm -rf at root"`) {
+		t.Errorf("reason with spaces not quoted as expected; got:\n%s", s)
+	}
+}
+
+// TestLogHookEvent_ValueWithEmbeddedQuoteEscaped — values holding a literal
+// double quote must be escaped via strconv.Quote so the reader can unquote
+// them back to the original.
+func TestLogHookEvent_ValueWithEmbeddedQuoteEscaped(t *testing.T) {
+	path := setupTmpHookLog(t)
+	LogHookEvent("INFO", "test", map[string]any{
+		"note": `she said "hi" loudly`,
+	})
+	b, _ := os.ReadFile(path)
+	s := string(b)
+	if !strings.Contains(s, `note="she said \"hi\" loudly"`) {
+		t.Errorf("embedded quote not escaped as expected; got:\n%s", s)
+	}
+}
+
 func TestHookLogPath_EnvOverride(t *testing.T) {
 	p := hookLogPathFromEnv(
 		func(k string) string {

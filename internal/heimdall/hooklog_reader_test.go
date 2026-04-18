@@ -98,6 +98,130 @@ func TestReadHookLog_MissingFileReturnsEmpty(t *testing.T) {
 	}
 }
 
+// TestParseHookLogLine_QuotedValueWithSpaces is the reader-side fix for the
+// motivating bug: a quoted value containing whitespace must deserialize back
+// to the original string.
+func TestParseHookLogLine_QuotedValueWithSpaces(t *testing.T) {
+	line := `2026-04-16T20:56:22Z WARN event=pre-tool-use class=block mode=shadow reason="rm -rf at root" rule_id=RM_RF_ROOT session=S1`
+	entry, ok := parseHookLogLine(line)
+	if !ok {
+		t.Fatalf("parse failed on quoted-value line: %q", line)
+	}
+	if got := entry.Fields["reason"]; got != "rm -rf at root" {
+		t.Errorf("reason: got %q want %q", got, "rm -rf at root")
+	}
+	if got := entry.Fields["rule_id"]; got != "RM_RF_ROOT" {
+		t.Errorf("rule_id: got %q want %q", got, "RM_RF_ROOT")
+	}
+	if got := entry.Session; got != "S1" {
+		t.Errorf("session: got %q want %q", got, "S1")
+	}
+	if got := entry.Fields["class"]; got != "block" {
+		t.Errorf("class: got %q want %q", got, "block")
+	}
+}
+
+// TestParseHookLogLine_EscapedQuoteInsideValue — a quoted value that itself
+// contains an escaped double quote must unescape correctly.
+func TestParseHookLogLine_EscapedQuoteInsideValue(t *testing.T) {
+	line := `2026-04-16T20:56:22Z INFO event=e note="she said \"hi\" loudly" session=S`
+	entry, ok := parseHookLogLine(line)
+	if !ok {
+		t.Fatalf("parse failed")
+	}
+	want := `she said "hi" loudly`
+	if got := entry.Fields["note"]; got != want {
+		t.Errorf("note: got %q want %q", got, want)
+	}
+}
+
+// TestParseHookLogLine_UnterminatedQuoteDegradesCleanly — a malformed line
+// (opening quote without a matching close) must NOT panic and must NOT drop
+// fields parsed before the malformed token. Unterminated value captures the
+// remainder of the line verbatim (sans the opening quote).
+func TestParseHookLogLine_UnterminatedQuoteDegradesCleanly(t *testing.T) {
+	line := `2026-04-16T20:56:22Z INFO event=e good=ok reason="unterminated value without close`
+	entry, ok := parseHookLogLine(line)
+	if !ok {
+		t.Fatalf("parse returned !ok; must degrade gracefully, not drop the whole line")
+	}
+	if entry.Event != "e" {
+		t.Errorf("event lost: got %q", entry.Event)
+	}
+	if entry.Fields["good"] != "ok" {
+		t.Errorf("fields before malformed token lost: got %q", entry.Fields["good"])
+	}
+	// The malformed field should still land in the map with a best-effort
+	// value — what matters is we neither panic nor drop the earlier data.
+	if _, present := entry.Fields["reason"]; !present {
+		t.Errorf("malformed field missing from output entirely; expected best-effort capture")
+	}
+}
+
+// TestParseHookLogLine_SimpleValuesUnchanged — backwards-compat canary for
+// the reader. An all-simple-value line must parse exactly as before.
+func TestParseHookLogLine_SimpleValuesUnchanged(t *testing.T) {
+	line := "2026-04-16T20:56:22Z INFO event=user-prompt bytes=1107 hits=5 model=nomic-embed-text scope= session=abc-xyz skills=3 stage=ok"
+	entry, ok := parseHookLogLine(line)
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	want := map[string]string{
+		"bytes":   "1107",
+		"hits":    "5",
+		"model":   "nomic-embed-text",
+		"scope":   "",
+		"session": "abc-xyz",
+		"skills":  "3",
+		"stage":   "ok",
+	}
+	for k, v := range want {
+		if got := entry.Fields[k]; got != v {
+			t.Errorf("field %q: got %q want %q", k, got, v)
+		}
+	}
+}
+
+// TestHookLogRoundTrip_WriteThenRead — the writer's quoting protocol and the
+// reader's tokenizer must be lossless. For each adversarial input, write it
+// via LogHookEvent, read it back via ReadHookLog, and confirm field equality.
+func TestHookLogRoundTrip_WriteThenRead(t *testing.T) {
+	cases := []struct {
+		name string
+		val  string
+	}{
+		{"plain", "hello"},
+		{"with_spaces", "rm -rf at root"},
+		{"with_embedded_quote", `she said "hi"`},
+		{"with_tab", "a\tb\tc"},
+		{"with_trailing_space", "trailing "},
+		{"with_leading_space", " leading"},
+		{"mixed_quotes_and_spaces", `one "two" three`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := setupTmpHookLog(t)
+			LogHookEvent("INFO", "rt", map[string]any{
+				"payload": tc.val,
+				"session": "SID",
+			})
+			entries, err := ReadHookLog(ReadHookLogOpts{Path: path})
+			if err != nil {
+				t.Fatalf("ReadHookLog: %v", err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("entries: got %d want 1", len(entries))
+			}
+			if got := entries[0].Fields["payload"]; got != tc.val {
+				t.Errorf("round-trip: got %q want %q", got, tc.val)
+			}
+			if entries[0].Session != "SID" {
+				t.Errorf("session round-trip: got %q", entries[0].Session)
+			}
+		})
+	}
+}
+
 func TestAggregateBySession(t *testing.T) {
 	entries := []HookLogEntry{
 		{Event: "session-start", Session: "A", Fields: map[string]string{"stage": "ok", "bullets": "5"}},

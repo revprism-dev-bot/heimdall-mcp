@@ -229,13 +229,38 @@ func redactLogString(s string) string {
 			return "<redacted>"
 		}
 	}
-	if strings.ContainsAny(s, " \t\"\n") {
-		// Quote + escape quotes and newlines.
-		esc := strings.ReplaceAll(s, `"`, `\"`)
-		esc = strings.ReplaceAll(esc, "\n", `\n`)
-		return `"` + esc + `"`
+	// Values that need quoting: whitespace, the quote char itself, any
+	// control char, or a backslash (which must round-trip cleanly).
+	// For simple values we emit the literal bytes — that keeps the grep-
+	// friendly `k=v` pattern stable for every downstream tool (hooks tail,
+	// ad-hoc greps, `awk -F=`).
+	if needsQuoting(s) {
+		// strconv.Quote gives us lossless Go-style escaping (\", \\,
+		// \t, \n, \xNN, \uNNNN). The reader pairs it with strconv.Unquote
+		// for a guaranteed round-trip; see parseHookLogLine.
+		return strconv.Quote(s)
 	}
 	return s
+}
+
+// needsQuoting reports whether a value contains any byte that would be
+// ambiguous in the space-delimited `k=v k=v` log format.
+//
+// Trigger set: whitespace (space/tab/newline/cr), double quote, any
+// control char, or DEL. Bare backslash in an otherwise simple value is
+// intentionally NOT a trigger — `foo\bar` remains literal, matching
+// longstanding producer behavior (backwards-compat with greps and with
+// the Windows-path redaction negative-case tests). Once quoting IS
+// triggered, strconv.Quote handles backslash escaping internally so the
+// round-trip stays lossless.
+func needsQuoting(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == 0x7f || c == ' ' || c == '"' {
+			return true
+		}
+	}
+	return false
 }
 
 // OpenHookLog opens the hook log for streaming reads. The caller MUST close

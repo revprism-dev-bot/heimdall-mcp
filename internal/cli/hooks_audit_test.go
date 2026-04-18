@@ -114,6 +114,13 @@ func TestHooksAudit_BlockInShadowSurfacesFalsePositive(t *testing.T) {
 	if !strings.Contains(out, "block=1") {
 		t.Errorf("expected block=1 in counts; got:\n%s", out)
 	}
+	// Regression: the reader previously truncated quoted multi-word reasons
+	// at the first inner space, so the top-rules and FP sections would show
+	// `sample_reason="rm` instead of `rm -rf at root`. With the quote-aware
+	// tokenizer the full phrase must survive.
+	if !strings.Contains(out, "rm -rf at root") {
+		t.Errorf("multi-word reason lost through the log round-trip; got:\n%s", out)
+	}
 }
 
 func TestHooksAudit_SinceFilter(t *testing.T) {
