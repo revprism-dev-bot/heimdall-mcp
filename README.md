@@ -2,7 +2,7 @@
 
 Local semantic code search + persistent memory for Claude Code, powered by [Ollama](https://ollama.ai) embeddings (nomic-embed-text) and a SQLite vector store.
 
-No cloud APIs. No API keys. Everything runs on your machine.
+**Heimdall itself makes no cloud calls** — indexing, embedding, search, memory, and hooks all run on your machine. Claude Code still sends the conversation (including Heimdall's injected context and MCP tool results) to the Anthropic API, because that's how Claude Code works. The privacy boundary to be aware of is Claude Code's, not Heimdall's. See [Network Interactions](#network-interactions) for a full breakdown.
 
 ## How it works
 
@@ -11,23 +11,28 @@ Heimdall surfaces context automatically on every relevant Claude Code event via 
 ```mermaid
 flowchart LR
     User(["User"])
-    CC["Claude Code session"]
-    subgraph Hooks["Heimdall hooks (6 events)"]
-        SS["SessionStart\ninject recall + skills"]
-        UP["UserPromptSubmit\n(hot path, ~450ms budget)\nsearch + cache"]
-        PTU["PreToolUse\nBash guardrail\n(19-rule classifier)"]
-        PT["PostToolUse\n(Edit|Write)\nqueue reindex"]
-        StopEvt["Stop\nbuffer assistant turn"]
-        SEnd["SessionEnd\ningest summary"]
+    Anthropic(["Anthropic API<br/>(Claude models)"]):::cloud
+    subgraph Machine["Your machine (everything below this line stays local)"]
+        direction LR
+        CC["Claude Code session"]
+        subgraph Hooks["Heimdall hooks (6 events)"]
+            SS["SessionStart\ninject recall + skills"]
+            UP["UserPromptSubmit\n(hot path, ~450ms budget)\nsearch + cache"]
+            PTU["PreToolUse\nBash guardrail\n(19-rule classifier)"]
+            PT["PostToolUse\n(Edit|Write)\nqueue reindex"]
+            StopEvt["Stop\nbuffer assistant turn"]
+            SEnd["SessionEnd\ningest summary"]
+        end
+        subgraph Core["Heimdall core"]
+            MCP["MCP tools\nsearch / expand / ls /\nrecall / remember / skills"]
+            Actor["post-edit actor\nfork+setsid, debounced"]
+            DB[("SQLite\nvector store\n+ hook_cache\n+ memories")]
+        end
+        Ollama["Ollama\nnomic-embed-text"]
     end
-    subgraph Core["Heimdall core"]
-        MCP["MCP tools\nsearch / expand / ls /\nrecall / remember / skills"]
-        Actor["post-edit actor\nfork+setsid, debounced"]
-        DB[("SQLite\nvector store\n+ hook_cache\n+ memories")]
-    end
-    Ollama["Ollama\nnomic-embed-text"]
 
     User -->|prompt| CC
+    CC <==>|prompts + injected context<br/>+ MCP tool results| Anthropic
     CC -->|on open| SS
     CC -->|each prompt| UP
     CC -->|before Bash| PTU
@@ -47,7 +52,11 @@ flowchart LR
     CC -.->|optional MCP calls| MCP
     MCP <--> DB
     DB <--> Ollama
+
+    classDef cloud stroke:#c00,stroke-width:2px,stroke-dasharray: 5 5;
 ```
+
+The thick double arrow between **Claude Code** and the **Anthropic API** is the only path that leaves your machine while a session is running. Everything Heimdall does — the hook injection, the MCP tool execution, the embedding via Ollama, the SQLite reads and writes — runs locally. What crosses the network is whatever Claude Code sends as part of the conversation: your prompts, Heimdall's injected `## Heimdall context` blocks, and any MCP tool results Claude chooses to call.
 
 **Per-turn lifecycle** (from user prompt to Claude's response):
 
@@ -57,6 +66,10 @@ sequenceDiagram
     participant CC as Claude Code
     participant H as Heimdall hook
     participant DB as SQLite + Ollama
+    participant API as Anthropic API
+
+    Note over U,DB: everything below stays on your machine
+    Note over API: the only network hop
 
     U->>CC: prompt
     CC->>H: UserPromptSubmit
@@ -68,7 +81,10 @@ sequenceDiagram
         H->>DB: embed + search + recall skills
         H-->>CC: fresh ## Heimdall context
     end
-    CC->>CC: Claude reasons
+    rect rgba(200, 0, 0, 0.08)
+        CC->>API: prompt + injected context
+        API-->>CC: model response (may request tools)
+    end
     opt Bash tool call
         CC->>H: PreToolUse(Bash)
         H->>H: classify (19 rules)
@@ -80,8 +96,18 @@ sequenceDiagram
         H-->>CC: return immediately
         H->>DB: reindex in background
     end
+    opt MCP tool call (e.g. heimdall_search)
+        CC->>DB: local tool execution
+        DB-->>CC: tool result
+        rect rgba(200, 0, 0, 0.08)
+            CC->>API: tool result embedded in next turn
+            API-->>CC: follow-up response
+        end
+    end
     CC-->>U: response
 ```
+
+The red-tinted bands are the only steps that leave your machine. All Heimdall work (hook execution, embedding, search, tool results) happens locally; Claude Code is what sends the conversation to the Anthropic API.
 
 **Key properties:**
 - **Retrieval hooks always exit 0** — a slow or broken hook never blocks Claude Code.
@@ -99,12 +125,36 @@ The `UserPromptSubmit` hook runs under a 450 ms budget (default), with a design 
 
 ### Network Interactions
 
-Heimdall is local-first. The only steps that touch the internet are one-time setup:
+Heimdall is local-first. There are three distinct boundaries worth keeping straight:
 
-- `go install github.com/caio-silva/heimdall-mcp@latest` — downloads the binary.
-- `ollama pull <model>` — downloads the embedding model into Ollama.
+**Stays on your machine (what Heimdall actually does):**
 
-Everything else — hooks, search, recall, index, remember, guardrails — runs against a local Ollama daemon (default `http://localhost:11434`, configurable via `ollamaEndpoint`). No cloud APIs, no telemetry, no API keys.
+- Embedding generation (Ollama at `http://localhost:11434`, configurable via `ollamaEndpoint`)
+- SQLite vector store + memory store (under `.heimdall_db/` and `~/.config/heimdall-mcp/`)
+- Hook execution (the six `SessionStart`/`UserPromptSubmit`/`PreToolUse`/`PostToolUse`/`Stop`/`SessionEnd` handlers)
+- MCP tool execution (`heimdall_search`, `heimdall_index`, `heimdall_recall`, `heimdall_remember`, etc.)
+- Git commit indexing, content lifecycle pruning, the Bash guardrail classifier
+- The optional LLM classifier fallback (`HEIMDALL_LLM_CLASSIFIER=1`) — runs against your local Ollama, never a cloud model
+
+No telemetry, no API keys, no third-party services. Heimdall has no outbound network code paths other than the Ollama endpoint you configure.
+
+**Leaves your machine via Claude Code (not via Heimdall):**
+
+Claude Code sends the conversation — everything the model needs to respond — to the Anthropic API. Heimdall's outputs become part of that conversation:
+
+- Hook-injected `## Heimdall context` blocks (attached to `SessionStart` and `UserPromptSubmit`)
+- MCP tool results (what `heimdall_search`/`heimdall_recall`/`heimdall_expand`/etc. return)
+- Anything you type
+
+If a snippet, file path, commit message, or memory appears in Claude's reply, it was sent to the Anthropic API on the turn Claude referenced it. That's Claude Code's data boundary, not Heimdall's — Heimdall can't see or influence what Claude Code sends.
+
+**One-time setup (touches the internet once):**
+
+- `go install github.com/caio-silva/heimdall-mcp@latest` — downloads the binary from the Go module proxy
+- `ollama pull <model>` — downloads the embedding model into your local Ollama
+- `git clone` / `git pull` — standard Git operations against your remotes
+
+No cloud APIs from Heimdall, no keys to configure, no telemetry. The only dial-out after setup is whatever Claude Code itself does.
 
 ## Install
 
