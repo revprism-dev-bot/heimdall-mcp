@@ -12,14 +12,19 @@ import (
 	"time"
 )
 
-const (
-	// MaxFileSize is the maximum file size to index (100KB).
-	MaxFileSize = 100 * 1024
-	// MaxFiles is the maximum number of files to index.
-	MaxFiles = 5000
-)
-
 // Indexer scans a project, chunks files, generates embeddings, and stores them.
+//
+// No per-file or per-project caps live here anymore. Back-pressure comes from:
+//   - excludePatterns (.git, node_modules, vendor, .heimdall_db, __pycache__,
+//     .idea, .claude/worktrees by default; user-configurable)
+//   - isBinaryFile NUL-byte sniff (first 512 bytes)
+//   - the chunker, which slices every file into MaxChunkSize (~1500-char)
+//     pieces — well under nomic-embed-text's 8192-token context window
+//
+// A pathological multi-GB text file will be read whole via os.ReadFile in
+// chunkFile, which is the only remaining memory cliff. If that ever matters
+// in practice, exclude the file via excludePatterns or switch chunkFile to
+// a streaming reader (flagged as follow-up when this cap was removed).
 type Indexer struct {
 	embedder Embedder
 	store    *VectorStore
@@ -115,9 +120,6 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 
 	var files []string
 	for _, walkRoot := range walkRoots {
-		if len(files) >= MaxFiles {
-			break
-		}
 		err := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil // skip unreadable
@@ -149,28 +151,15 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 				return nil
 			}
 
-			// Skip files over MaxFileSize
-			info, statErr := d.Info()
-			if statErr != nil {
-				return nil
-			}
-			if info.Size() > MaxFileSize {
-				return nil
-			}
-
 			// Skip binary files
 			if isBinaryFile(path) {
 				return nil
 			}
 
-			if len(files) >= MaxFiles {
-				return filepath.SkipAll
-			}
-
 			files = append(files, path)
 			return nil
 		})
-		if err != nil && err != filepath.SkipAll && ctx.Err() == nil {
+		if err != nil && ctx.Err() == nil {
 			result.Duration = time.Since(start)
 			return result, fmt.Errorf("walking project: %w", err)
 		}

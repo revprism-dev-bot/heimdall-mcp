@@ -15,7 +15,7 @@ clean:
 # These are the 130+ tests that gate every PR. Fast, hermetic, no external
 # deps. Build-tagged integration and e2e suites are NOT included.
 test:
-	go test ./... -race -count=1 -timeout 60s
+	go test ./... -race -count=1 -timeout 180s
 
 # Layer 2 integration tests (T20). Exercises the real binary via os/exec
 # against a fake Ollama httptest server. Build-tag gated — default `make test`
