@@ -3,8 +3,10 @@ package heimdall
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,11 +26,16 @@ type HookLogEntry struct {
 //
 //	<rfc3339> <LEVEL> event=<name> [k=v ...]
 //
-// Returns (_, false) on any parse failure including an empty line or a line
-// missing the `event=` token. The producer (hooklog.go formatHookLogLine)
-// guarantees alphabetically-sorted keys and value sanitization, so a simple
-// space-split on tokens is sufficient — values never contain unescaped
-// whitespace.
+// Values that contain whitespace, double-quotes, backslashes, or control
+// chars are serialized by the producer (hooklog.go redactLogString) as a
+// Go-quoted literal: `k="v with spaces"`, `k="he said \"hi\""`, etc. This
+// parser pairs that with strconv.Unquote so the round-trip is lossless.
+//
+// Returns (_, false) on a hard parse failure — empty line, unparseable
+// timestamp, or a line missing the `event=` token. A MALFORMED value
+// (unterminated quote) degrades gracefully: the parser logs a warning
+// via the stdlib log package and keeps whatever was parsed up to the
+// malformed token, rather than dropping the whole line. Never panics.
 func parseHookLogLine(line string) (HookLogEntry, bool) {
 	line = strings.TrimRight(line, "\r\n")
 	if line == "" {
@@ -47,16 +54,15 @@ func parseHookLogLine(line string) (HookLogEntry, bool) {
 		Level:     parts[1],
 		Fields:    map[string]string{},
 	}
-	for _, tok := range strings.Split(parts[2], " ") {
-		if tok == "" {
-			continue
-		}
-		eq := strings.IndexByte(tok, '=')
+
+	for _, kv := range splitKVTokens(parts[2]) {
+		eq := strings.IndexByte(kv.raw, '=')
 		if eq < 0 {
 			continue
 		}
-		k := tok[:eq]
-		v := tok[eq+1:]
+		k := kv.raw[:eq]
+		rawV := kv.raw[eq+1:]
+		v := unquoteValue(rawV)
 		if k == "event" && entry.Event == "" {
 			entry.Event = v
 			continue
@@ -70,6 +76,110 @@ func parseHookLogLine(line string) (HookLogEntry, bool) {
 		return HookLogEntry{}, false
 	}
 	return entry, true
+}
+
+// kvToken is one whitespace-separated `k=v` chunk from a hooks.log line,
+// with quoted values kept intact so the caller can split on the FIRST `=`
+// rather than every `=` (values can legitimately contain `=`).
+type kvToken struct {
+	raw string
+}
+
+// splitKVTokens splits the tail of a hooks.log line (everything after
+// `<ts> <LEVEL> `) into its kv tokens, respecting strconv.Quote-style
+// quoted values. Rules:
+//   - unquoted run: bytes up to the next space.
+//   - quoted run: `"..."` where inner `\"` and `\\` are escaped. We scan
+//     until the matching unescaped `"` and include both quote bytes in
+//     the returned token so downstream strconv.Unquote has a well-formed
+//     input.
+//   - unterminated quote: capture everything to end-of-string as the
+//     malformed token's value, log a warning, and stop splitting. The
+//     caller keeps fields parsed before the malformed token intact.
+func splitKVTokens(s string) []kvToken {
+	var out []kvToken
+	i := 0
+	n := len(s)
+	for i < n {
+		// Skip any run of spaces between tokens.
+		for i < n && s[i] == ' ' {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		start := i
+		// Walk forward until we either hit the value's opening quote or
+		// end-of-token. A token has the shape `k=...`; we need to scan
+		// the key (up to `=`) without any quote handling.
+		for i < n && s[i] != '=' && s[i] != ' ' {
+			i++
+		}
+		// Missing `=` — emit whatever we have, let parseHookLogLine drop it.
+		if i >= n || s[i] == ' ' {
+			out = append(out, kvToken{raw: s[start:i]})
+			continue
+		}
+		// Found `=`; now scan the value.
+		i++ // past '='
+		if i < n && s[i] == '"' {
+			// Quoted value. Walk until the matching unescaped `"`.
+			vStart := i
+			i++ // past opening quote
+			terminated := false
+			for i < n {
+				if s[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				if s[i] == '"' {
+					i++ // include closing quote
+					terminated = true
+					break
+				}
+				i++
+			}
+			if !terminated {
+				// Malformed: unterminated quote. Best-effort — capture
+				// the rest of the line as this token's value and stop.
+				// We prefix a synthetic closing quote so strconv.Unquote
+				// still accepts the payload; the caller falls back to
+				// the raw inner bytes if unquote fails.
+				log.Printf("hooklog: unterminated quoted value in line fragment %q; degrading", s[start:])
+				out = append(out, kvToken{raw: s[start:vStart] + s[vStart:n]})
+				return out
+			}
+			out = append(out, kvToken{raw: s[start:i]})
+			continue
+		}
+		// Unquoted value — scan to next space.
+		for i < n && s[i] != ' ' {
+			i++
+		}
+		out = append(out, kvToken{raw: s[start:i]})
+	}
+	return out
+}
+
+// unquoteValue decodes a value that may have been emitted by strconv.Quote.
+// Unquoted simple values pass through unchanged. A value starting with `"`
+// is fed to strconv.Unquote; if that fails (malformed input, unterminated
+// quote captured by splitKVTokens) we fall back to stripping the leading
+// quote and returning the raw inner bytes — this preserves the behavior
+// that a malformed line doesn't drop fields.
+func unquoteValue(raw string) string {
+	if len(raw) < 2 || raw[0] != '"' {
+		return raw
+	}
+	if v, err := strconv.Unquote(raw); err == nil {
+		return v
+	}
+	// Degraded path: trim the leading quote and any trailing quote.
+	v := raw[1:]
+	if last := len(v) - 1; last >= 0 && v[last] == '"' {
+		v = v[:last]
+	}
+	return v
 }
 
 // ReadHookLogOpts controls ReadHookLog. Empty fields mean "no filter".
