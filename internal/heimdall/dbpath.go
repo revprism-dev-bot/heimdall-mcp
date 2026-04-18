@@ -124,7 +124,9 @@ func DiscoverSubRepos(root string) map[string]bool {
 			continue
 		}
 		gitDir := filepath.Join(root, entry.Name(), ".git")
-		if info, err := os.Stat(gitDir); err == nil && info.IsDir() {
+		// Accept .git as either a directory (standard repo) OR a regular file
+		// (gitlink used by worktrees). Matches hasRepoMarker in scope.go.
+		if _, err := os.Stat(gitDir); err == nil {
 			result[entry.Name()] = true
 		}
 	}

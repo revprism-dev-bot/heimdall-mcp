@@ -163,10 +163,12 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 				if idx.shouldExclude(relPath) {
 					return filepath.SkipDir
 				}
-				// Skip directories that are their own git repos (sub-repos)
+				// Skip directories that are their own git repos (sub-repos).
+				// Accept .git as either a directory or a regular file (gitlink
+				// for git worktrees) — matches hasRepoMarker in scope.go.
 				if path != walkRoot {
 					gitDir := filepath.Join(path, ".git")
-					if info, err := os.Stat(gitDir); err == nil && info.IsDir() {
+					if _, err := os.Stat(gitDir); err == nil {
 						return filepath.SkipDir
 					}
 				}

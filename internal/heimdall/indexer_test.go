@@ -367,6 +367,26 @@ func TestIndexAll_SubProjectTagging(t *testing.T) {
 	}
 }
 
+// TestDiscoverSubRepos_GitlinkFile covers the git-worktree case where `.git`
+// is a regular file ("gitlink") rather than a directory. The existing walker
+// guarded sub-repo detection with info.IsDir(), which silently ignored
+// worktrees and indexed them into the outer DB.
+func TestDiscoverSubRepos_GitlinkFile(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "wt")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// .git is a FILE (gitlink), not a directory
+	if err := os.WriteFile(filepath.Join(sub, ".git"), []byte("gitdir: /some/worktrees/wt\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got := DiscoverSubRepos(root)
+	if !got["wt"] {
+		t.Errorf("expected wt in subRepoDirs, got %v", got)
+	}
+}
+
 func TestDiscoverSubRepoDirs_Empty(t *testing.T) {
 	root := t.TempDir()
 	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
