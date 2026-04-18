@@ -9,14 +9,83 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
 	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
+
+// llmUnreachableSuppressWindow rate-limits WARN llm.classifier.unreachable
+// events so a down Ollama doesn't spam the hook log on every Bash call.
+// Mirrors plan 04's Tier-B suppressor (see internal/heimdall/suppress.go).
+const llmUnreachableSuppressWindow = 10 * time.Minute
+
+// llmNoModelLogged ensures INFO llm.classifier.no_model_configured is
+// emitted at most once per process (plan 11 §6 F6). Package-level so the
+// singleton survives repeat hook invocations in the same long-running
+// process (e.g. integration tests); hook fires in shell-driven production
+// are one-shot per process, so this is effectively a no-op there.
+var (
+	llmNoModelLogged   bool
+	llmNoModelLoggedMu sync.Mutex
+)
+
+// consumeNoModelLog reports whether this is the first no-model-configured
+// event of the process and marks it as seen. Drop-in replacement for the
+// sync.Once shape that supports reset-in-tests via resetLLMNoModelLogForTest.
+func consumeNoModelLog() bool {
+	llmNoModelLoggedMu.Lock()
+	defer llmNoModelLoggedMu.Unlock()
+	if llmNoModelLogged {
+		return false
+	}
+	llmNoModelLogged = true
+	return true
+}
+
+// resetLLMNoModelLogForTest clears the once-per-process no-model gate so
+// tests can assert independently. Test-only.
+func resetLLMNoModelLogForTest() {
+	llmNoModelLoggedMu.Lock()
+	llmNoModelLogged = false
+	llmNoModelLoggedMu.Unlock()
+}
+
+// llmFirstCallOnce emits a one-shot log annotation on the very first
+// classify call of the process so 11a §6 risk #2 is greppable: a timeout
+// on the first call after idle is expected, not a broken install. Tests
+// reset this via resetLLMFirstCallForTest.
+var (
+	llmFirstCallDone bool
+	llmFirstCallMu   sync.Mutex
+)
+
+func consumeFirstCall() bool {
+	llmFirstCallMu.Lock()
+	defer llmFirstCallMu.Unlock()
+	if llmFirstCallDone {
+		return false
+	}
+	llmFirstCallDone = true
+	return true
+}
+
+// resetLLMFirstCallForTest resets the first-call marker so tests can
+// assert first_call=true behavior deterministically.
+func resetLLMFirstCallForTest() {
+	llmFirstCallMu.Lock()
+	llmFirstCallDone = false
+	llmFirstCallMu.Unlock()
+}
 
 // guardrailMode is the three-state rollout knob driven by HEIMDALL_GUARDRAILS.
 // See design §8 "Rollout plan".
@@ -66,7 +135,11 @@ type preToolUseEvent struct {
 // Exit codes:
 //   - 0 always EXCEPT when mode=block and class=block (then 2).
 func HookPreToolUse(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer, env map[string]string, args []string, deps HookPreToolUseDeps) int {
-	_ = cfg
+	// cfg now carries LLMClassifierModel, consulted downstream when the
+	// env-var opt-in is set and deps.LLM is non-nil. With the env var
+	// unset (the default), cfg is unused and the original static-only
+	// code path is bit-for-bit unchanged — verified by
+	// TestHookPreToolUse_LLM_DefaultOff_ZeroBehaviorChange.
 
 	// Panic guard: design §5 F3 — a regex panic must collapse to allow/exit 0.
 	// Extra defense even though the compiled regexes should never panic.
@@ -176,6 +249,40 @@ func HookPreToolUse(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 
 	class, reason, ruleID := classifier(cmd)
 
+	// --- LLM fallback (plan 11 §2.2 / §6; 11a §5.3) ------------------------
+	//
+	// Opt-in, default off. Consulted ONLY on ClassUnknown — the static rules
+	// always win for Allow/Warn/Block (plan 11 §2.3). The branch is a pure
+	// overlay: it can UPGRADE Unknown → allow/warn/block, but every failure
+	// mode (F1-F7) collapses BACK to Unknown so the non-LLM code path below
+	// is the only exit-code source of truth.
+	if class == ClassUnknownAlias && deps.LLM != nil && env["HEIMDALL_LLM_CLASSIFIER"] == "1" {
+		if cfg.LLMClassifierModel == "" {
+			// F6 — toggle on, config missing. INFO once per process, skip.
+			if consumeNoModelLog() {
+				logHookEventWithSession("INFO", "pre-tool-use", evt.SessionID, map[string]any{
+					"stage": "llm.classifier.no_model_configured",
+				})
+			}
+		} else {
+			llmClass, llmReason, llmRuleID := runLLMFallback(
+				deps.LLM, cfg.LLMClassifierModel, cmd, env, evt,
+			)
+			if llmRuleID != "" {
+				// LLM succeeded — overwrite the verdict. ruleID follows the
+				// `llm:<model>` convention from plan 11 §5.3 so users who
+				// see a stderr block know the verdict came from the
+				// probabilistic layer and can retry with
+				// HEIMDALL_LLM_CLASSIFIER=0 to bypass it.
+				class, reason, ruleID = llmClass, llmReason, llmRuleID
+			}
+			// On failure: class stays ClassUnknown, reason/ruleID stay
+			// empty. The runLLMFallback helper already logged the per-
+			// failure-mode event (F1-F7). The mode switch below handles
+			// Unknown as allow-equivalent in every mode — OQ-5 preserved.
+		}
+	}
+
 	// Always log exactly one structured event per fire (per task spec).
 	logLevel := "INFO"
 	if class == ClassBlockAlias {
@@ -235,9 +342,177 @@ func HookPreToolUse(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 }
 
 // HookPreToolUseDeps lets tests inject a stub classifier. A zero-value deps
-// uses heimdall.ClassifyBashCommand.
+// uses heimdall.ClassifyBashCommand for static classification and leaves
+// the LLM fallback off (LLM==nil → nil-is-off invariant, plan 11 §10.3).
 type HookPreToolUseDeps struct {
+	// Classify is the static classifier. nil → heimdall.ClassifyBashCommand.
 	Classify func(cmd string) (heimdall.Classification, string, string)
+
+	// LLM is the optional LLM fallback consulted when Classify returns
+	// ClassUnknown AND HEIMDALL_LLM_CLASSIFIER=1 AND cfg.LLMClassifierModel
+	// is set. Zero value (nil) means "LLM off" — the static-only code path
+	// is preserved exactly as today. Plan 11 §10.3 / 11a §5.1 item 5.
+	LLM heimdall.LLMClassifier
+}
+
+// runLLMFallback invokes deps.LLM.ClassifyBash with a bounded deadline and
+// emits one of the plan 11 §6 F1-F7 log events on success or failure.
+// Returns (class, reason, ruleID) on success, where ruleID follows the
+// `llm:<model>` convention from plan 11 §5.3. On any failure, returns
+// (ClassUnknown, "", "") so the caller keeps its existing Unknown-
+// handling surface (exit 0 in every mode).
+//
+// The 1500ms default is overridable via HEIMDALL_LLM_CLASSIFIER_TIMEOUT_MS,
+// capped at 2000ms so the env var cannot push above the hook-handler budget
+// (plan 11 §4.3).
+func runLLMFallback(llm heimdall.LLMClassifier, model, cmd string, env map[string]string, evt preToolUseEvent) (heimdall.Classification, string, string) {
+	timeout := llmTimeoutFromEnv(env)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	firstCall := consumeFirstCall()
+
+	// Panic guard — plan 11 §6 F7. Even a defensive panic in the
+	// classifier shouldn't bring down the hook.
+	var (
+		llmClass  heimdall.Classification
+		llmReason string
+		llmErr    error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				llmErr = fmt.Errorf("panic: %v", r)
+				logHookEventWithSession("ERROR", "pre-tool-use", evt.SessionID, map[string]any{
+					"stage":          "llm.classifier.panic",
+					"model":          model,
+					"prompt_version": heimdall.LLMClassifierPromptVersion,
+					"err":            fmt.Sprintf("%v", r),
+				})
+			}
+		}()
+		started := time.Now()
+		llmClass, llmReason, llmErr = llm.ClassifyBash(ctx, cmd)
+		elapsed := time.Since(started)
+
+		if llmErr == nil {
+			// Success — log INFO llm.classifier.classify.
+			reason := llmReason
+			truncated := false
+			if r, didTrunc := heimdall.TruncateReason(reason); didTrunc {
+				reason = r
+				truncated = true
+			}
+			// F4 — reason_truncated WARN (separate event so it's countable).
+			if truncated {
+				logHookEventWithSession("WARN", "pre-tool-use", evt.SessionID, map[string]any{
+					"stage":          "llm.classifier.reason_truncated",
+					"model":          model,
+					"prompt_version": heimdall.LLMClassifierPromptVersion,
+				})
+			}
+			fields := map[string]any{
+				"stage":          "llm.classifier.classify",
+				"elapsed_ms":     int(elapsed / time.Millisecond),
+				"model":          model,
+				"prompt_version": heimdall.LLMClassifierPromptVersion,
+				"class":          llmClass.String(),
+				"reason_len":     len(reason),
+			}
+			if firstCall {
+				fields["first_call"] = true
+			}
+			logHookEventWithSession("INFO", "pre-tool-use", evt.SessionID, fields)
+			// Mutate the returned reason so the caller sees the truncated shape.
+			llmReason = reason
+		}
+	}()
+
+	if llmErr == nil {
+		return llmClass, llmReason, fmt.Sprintf("llm:%s", model)
+	}
+
+	// Failure — bucket into F1 (timeout), F2 (unreachable), F3 (bad
+	// response), or generic. F7 (panic) already logged inside the recover.
+	stage := llmFailureStage(llmErr)
+
+	// F2 unreachable gets rate-limited via plan 04's Tier-B suppressor so
+	// a down Ollama doesn't spam the log on every Bash call. We gate on a
+	// (project_root, "llm-classifier-unreachable") key.
+	if stage == "llm.classifier.unreachable" {
+		projectRoot := evt.CWD
+		if !heimdall.ShouldEmitTierB(projectRoot, "llm-classifier-unreachable", llmUnreachableSuppressWindow) {
+			return heimdall.ClassUnknown, "", ""
+		}
+	}
+
+	fields := map[string]any{
+		"stage":          stage,
+		"model":          model,
+		"prompt_version": heimdall.LLMClassifierPromptVersion,
+		"err":            llmErr.Error(),
+	}
+	if firstCall {
+		fields["first_call"] = true
+	}
+	level := "WARN"
+	if stage == "llm.classifier.panic" {
+		// Already logged inside the recover; don't double-emit.
+		return heimdall.ClassUnknown, "", ""
+	}
+	logHookEventWithSession(level, "pre-tool-use", evt.SessionID, fields)
+
+	return heimdall.ClassUnknown, "", ""
+}
+
+// llmFailureStage buckets an LLM-classifier error into one of the plan 11
+// §6 F1/F2/F3 stage names. F7 (panic) is handled separately via recover.
+func llmFailureStage(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "llm.classifier.timeout"
+	}
+	if errors.Is(err, heimdall.ErrLLMBadResponse) {
+		return "llm.classifier.bad_response"
+	}
+	// Connection-refused, DNS fail, etc. surface as wrapped errors from
+	// OllamaClient.Chat. A substring match is cheaper than unwrapping
+	// net.OpError chains and is stable across Go versions.
+	msg := err.Error()
+	if strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "EOF") {
+		return "llm.classifier.unreachable"
+	}
+	// Non-200 HTTP status falls here too. Log as bad_response; the raw
+	// error carries the status code for ops triage.
+	return "llm.classifier.bad_response"
+}
+
+// llmTimeoutFromEnv resolves HEIMDALL_LLM_CLASSIFIER_TIMEOUT_MS with a
+// default of 1500ms and a 2000ms cap (plan 11 §4.3). Unparseable or
+// negative values fall back to the default.
+func llmTimeoutFromEnv(env map[string]string) time.Duration {
+	const (
+		def = 1500 * time.Millisecond
+		cap = 2000 * time.Millisecond
+	)
+	raw := env["HEIMDALL_LLM_CLASSIFIER_TIMEOUT_MS"]
+	if raw == "" {
+		return def
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return def
+	}
+	d := time.Duration(ms) * time.Millisecond
+	if d > cap {
+		return cap
+	}
+	return d
 }
 
 // Typed aliases — they compile down to the same values as

@@ -601,13 +601,41 @@ func cliProjects() {
 }
 
 func cliConfigure(args []string) {
+	// Plan 11 §5.4 / 11a §5.4 item 7: support
+	//   heimdall-mcp configure --llm-classifier-model=<model>
+	// as a one-shot shortcut. The `config set llm_classifier_model <v>`
+	// surface still works (see setConfigKey) and is the preferred
+	// programmatic entry; this flag exists for copy-paste from the
+	// plan 11 docs and the `hooks doctor` hint.
+	for _, a := range args {
+		const pfx = "--llm-classifier-model="
+		if strings.HasPrefix(a, pfx) {
+			model := strings.TrimPrefix(a, pfx)
+			cfg := config.LoadConfig()
+			cfg.LLMClassifierModel = model
+			if err := config.SaveConfig(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to save config: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("llm_classifier_model = %q (saved)\n", model)
+			if model != "" {
+				fmt.Printf("Hint: ollama pull %s\n", model)
+				fmt.Println("      set HEIMDALL_LLM_CLASSIFIER=1 to enable the fallback")
+			}
+			return
+		}
+	}
+
 	if len(args) == 0 {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  heimdall-mcp config get [key]        Get config (full or specific key)\n")
-		fmt.Fprintf(os.Stderr, "  heimdall-mcp config set <key> <val>  Set a config key\n")
+		fmt.Fprintf(os.Stderr, "  heimdall-mcp config get [key]                   Get config (full or specific key)\n")
+		fmt.Fprintf(os.Stderr, "  heimdall-mcp config set <key> <val>             Set a config key\n")
+		fmt.Fprintf(os.Stderr, "  heimdall-mcp configure --llm-classifier-model=<model>\n")
+		fmt.Fprintf(os.Stderr, "                                                  One-shot setter for the LLM classifier fallback\n")
 		fmt.Fprintf(os.Stderr, "\nKeys: model, git.enabled, git.depth, git.include_diffs, git.branches,\n")
 		fmt.Fprintf(os.Stderr, "      stale_timeout_minutes, lifecycle.active_days,\n")
-		fmt.Fprintf(os.Stderr, "      lifecycle.archive_days, max_chunks_per_project\n")
+		fmt.Fprintf(os.Stderr, "      lifecycle.archive_days, max_chunks_per_project,\n")
+		fmt.Fprintf(os.Stderr, "      llm_classifier_model\n")
 		os.Exit(1)
 	}
 
@@ -692,6 +720,8 @@ func getConfigKey(cfg *config.Config, key string) (any, bool) {
 		return cfg.LifecycleArchiveDays, true
 	case "max_chunks_per_project":
 		return cfg.MaxChunksPerProject, true
+	case "llm_classifier_model":
+		return cfg.LLMClassifierModel, true
 	default:
 		return nil, false
 	}
@@ -741,6 +771,8 @@ func setConfigKey(cfg *config.Config, key, rawVal string) error {
 			return fmt.Errorf("max_chunks_per_project requires an integer: %w", err)
 		}
 		cfg.MaxChunksPerProject = n
+	case "llm_classifier_model":
+		cfg.LLMClassifierModel = rawVal
 	default:
 		return fmt.Errorf("unknown config key: %s", key)
 	}

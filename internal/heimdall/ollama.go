@@ -253,6 +253,88 @@ func (c *OllamaClient) VerifyModel(ctx context.Context, model string) error {
 	return nil
 }
 
+// -----------------------------------------------------------------------
+// /api/chat support — used by the optional LLM classifier fallback
+// (internal/heimdall/llm_classifier.go). Mirrors the embed() plumbing:
+// context-based deadline, HTTP status handling, wrapped errors.
+// -----------------------------------------------------------------------
+
+// ChatMessage is one entry in the /api/chat `messages` array.
+type ChatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// ChatOptions maps to the Ollama /api/chat `options` object. Only the
+// fields we actually set are modeled — leave others nil so the server
+// applies its defaults. Pointer semantics so `omitempty` distinguishes
+// "unset" from "explicit zero value" (seed=0 is valid, as is
+// num_predict=0 meaning "no output").
+type ChatOptions struct {
+	Temperature *float64 `json:"temperature,omitempty"`
+	Seed        *int     `json:"seed,omitempty"`
+	NumPredict  *int     `json:"num_predict,omitempty"`
+}
+
+// ChatRequest is the POST body for /api/chat. Format accepts either the
+// literal string "json" (Ollama's original loose mode) or a raw JSON
+// Schema object (Ollama ≥0.5 structured output). The LLM classifier uses
+// the latter; we expose both shapes via json.RawMessage so callers pass
+// pre-marshalled JSON without us re-validating it here.
+type ChatRequest struct {
+	Model     string          `json:"model"`
+	Messages  []ChatMessage   `json:"messages"`
+	KeepAlive string          `json:"keep_alive,omitempty"`
+	Format    json.RawMessage `json:"format,omitempty"`
+	Options   *ChatOptions    `json:"options,omitempty"`
+	Stream    bool            `json:"stream"`
+}
+
+// ChatResponse is the (non-streaming) response envelope from /api/chat.
+type ChatResponse struct {
+	Model   string      `json:"model"`
+	Message ChatMessage `json:"message"`
+	Done    bool        `json:"done"`
+}
+
+// Chat sends a chat-completion request to /api/chat and returns the full
+// response. Mirrors embed() error handling: wrapped HTTP errors, status
+// checks, decoded body. The caller's ctx governs the deadline — we do
+// NOT apply a default timeout because the LLM classifier path wants an
+// explicit context.WithTimeout set at the hook-handler layer.
+//
+// Safe for concurrent use; the shared http.Client handles connection
+// pooling the same way Embed/EmbedBatch rely on it.
+func (c *OllamaClient) Chat(ctx context.Context, payload ChatRequest) (*ChatResponse, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("ollama chat marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.endpoint+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ollama chat: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ollama chat: status %d: %s", resp.StatusCode, string(b))
+	}
+
+	var result ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("ollama chat decode: %w", err)
+	}
+	return &result, nil
+}
+
 // PullModel pulls a model from the Ollama library. This is a blocking call
 // that waits for the pull to complete.
 func (c *OllamaClient) PullModel(ctx context.Context, model string) error {

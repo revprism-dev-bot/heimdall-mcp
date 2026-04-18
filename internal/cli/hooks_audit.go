@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
@@ -41,17 +42,26 @@ type auditFlags struct {
 // consume. Produced by aggregateAudit from a filtered slice of hooks.log
 // entries. Exported fields only — JSON marshalling needs them.
 type auditSummary struct {
-	SchemaVersion          string               `json:"schema_version"`
-	WindowFrom             string               `json:"window_from,omitempty"`
-	WindowTo               string               `json:"window_to"`
-	TotalEvents            int                  `json:"total_events"`
-	CountsByClass          map[string]int       `json:"counts_by_class"`
-	CountsByMode           map[string]int       `json:"counts_by_mode"`
-	TopRules               []ruleStat           `json:"top_rules_by_block"`
-	FalsePositiveCandidate []fpCandidate        `json:"false_positive_candidates"`
-	PromoteToWarn          bool                 `json:"promote_to_warn"`
-	PromotionReason        string               `json:"promotion_reason"`
-	Notes                  []string             `json:"notes,omitempty"`
+	SchemaVersion          string         `json:"schema_version"`
+	WindowFrom             string         `json:"window_from,omitempty"`
+	WindowTo               string         `json:"window_to"`
+	TotalEvents            int            `json:"total_events"`
+	CountsByClass          map[string]int `json:"counts_by_class"`
+	CountsByMode           map[string]int `json:"counts_by_mode"`
+	TopRules               []ruleStat     `json:"top_rules_by_block"`
+	FalsePositiveCandidate []fpCandidate  `json:"false_positive_candidates"`
+	// LLMVerdicts buckets the class a classify event landed on when it
+	// came from the LLM fallback (rule_id starts with `llm:`). Plan 11a
+	// §5.4 item 9: ops need the allow/warn/block split on LLM-handled
+	// unknowns to evaluate stage-2 promotion criteria (FP rate, §8.2).
+	LLMVerdicts map[string]int `json:"llm_verdicts,omitempty"`
+	// LLMPromptVersions buckets the `prompt_version=N` field emitted on
+	// llm.classifier.classify events. Plan 11a §OQ-5 — lets operators
+	// split telemetry cleanly across prompt edits.
+	LLMPromptVersions map[string]int `json:"llm_prompt_versions,omitempty"`
+	PromoteToWarn     bool           `json:"promote_to_warn"`
+	PromotionReason   string         `json:"promotion_reason"`
+	Notes             []string       `json:"notes,omitempty"`
 }
 
 // ruleStat captures the per-rule aggregate used for the top-offenders
@@ -220,6 +230,21 @@ func aggregateAudit(entries []heimdall.HookLogEntry, windowFrom, windowTo time.T
 		if e.Event != "pre-tool-use" {
 			continue
 		}
+		// Separate LLM-telemetry bucket: `stage=llm.classifier.classify`
+		// carries a `prompt_version` field we surface for audit splits
+		// across prompt edits (plan 11a §OQ-5). These rows do NOT count
+		// toward CountsByClass because the classify-stage row already
+		// logged the final verdict — we'd double-count.
+		stage := e.Fields["stage"]
+		if stage == "llm.classifier.classify" {
+			if pv := e.Fields["prompt_version"]; pv != "" {
+				if s.LLMPromptVersions == nil {
+					s.LLMPromptVersions = map[string]int{}
+				}
+				s.LLMPromptVersions[pv]++
+			}
+			continue
+		}
 		class := e.Fields["class"]
 		mode := e.Fields["mode"]
 		// Skip bookkeeping lines that weren't a classify stage (e.g.
@@ -232,6 +257,16 @@ func aggregateAudit(entries []heimdall.HookLogEntry, windowFrom, windowTo time.T
 		s.CountsByClass[class]++
 		if mode != "" {
 			s.CountsByMode[mode]++
+		}
+
+		// LLM-verdict bucket: the hook handler sets rule_id=llm:<model>
+		// after an LLM upgrade. Count the resulting class here so ops can
+		// evaluate FP rate on LLM-produced blocks / warns.
+		if ruleID := e.Fields["rule_id"]; strings.HasPrefix(ruleID, "llm:") {
+			if s.LLMVerdicts == nil {
+				s.LLMVerdicts = map[string]int{}
+			}
+			s.LLMVerdicts[class]++
 		}
 
 		if class == "block" {
@@ -414,6 +449,34 @@ func renderAuditText(w io.Writer, s auditSummary) {
 				reason = "-"
 			}
 			fmt.Fprintf(w, "  %s  rule=%-28s reason=%s\n", fp.Timestamp, rule, reason)
+		}
+	}
+
+	// LLM-fallback verdict buckets (plan 11a §5.4 item 9). Only rendered
+	// when the log actually contains LLM-upgraded entries so operators
+	// with the fallback off see the same report they got before.
+	if len(s.LLMVerdicts) > 0 || len(s.LLMPromptVersions) > 0 {
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "## LLM fallback (plan 11)")
+		if len(s.LLMVerdicts) > 0 {
+			fmt.Fprintln(w, "verdicts_by_class:")
+			for _, k := range sortedKeysWithDefaults(s.LLMVerdicts, []string{"allow", "warn", "block"}) {
+				if s.LLMVerdicts[k] == 0 {
+					continue
+				}
+				fmt.Fprintf(w, "  %s=%d\n", k, s.LLMVerdicts[k])
+			}
+		}
+		if len(s.LLMPromptVersions) > 0 {
+			fmt.Fprintln(w, "by_prompt_version:")
+			keys := make([]string, 0, len(s.LLMPromptVersions))
+			for k := range s.LLMPromptVersions {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				fmt.Fprintf(w, "  v%s=%d\n", k, s.LLMPromptVersions[k])
+			}
 		}
 	}
 
