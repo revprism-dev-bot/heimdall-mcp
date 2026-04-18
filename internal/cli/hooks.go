@@ -62,7 +62,11 @@ func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer,
 
 // HooksExplainCommand is the `hooks explain-command "<cmd>"` admin entry.
 // Classifies the given Bash command without executing anything and prints
-// a one-line summary `class=<allow|warn|block>  rule=<id>  reason=<text>`.
+// a one-line summary `class=<allow|warn|block|unknown>  rule=<id>
+// reason=<text>`. On ClassUnknown (no rule matched — the default fall-
+// through) a second line explains the state, because `unknown` is a new
+// classification users won't recognize otherwise and the handler's
+// behavior mirrors the LLM-fallback extension point in plan 11.
 //
 // Exit code: 0 unconditionally. This command is purely informational — a
 // shell script wanting to gate on classification should parse the printed
@@ -92,6 +96,15 @@ func HooksExplainCommand(stdin io.Reader, stdout, stderr io.Writer, env map[stri
 		reasonOut = "-"
 	}
 	fmt.Fprintf(stdout, "class=%s  rule=%s  reason=%s\n", class.String(), ruleOut, reasonOut)
+	if class == heimdall.ClassUnknown {
+		// Make the fall-through state legible. Users reading the CLI
+		// output need to understand that Unknown is not Allow — it's the
+		// "no rule fired" default that the plan 11 LLM fallback would
+		// consult if enabled. The hook handler treats this identically
+		// to Allow in every mode; the distinction only matters for audit
+		// tooling and the LLM extension point.
+		fmt.Fprintln(stdout, "note: no rule matched — would fall back to LLM if enabled (see docs/plans/hooks/11-llm-classification-fallback.md).")
+	}
 	return 0
 }
 

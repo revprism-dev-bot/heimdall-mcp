@@ -66,6 +66,14 @@ We are explicitly **not**:
 
 ### 2.1 Introduce `ClassUnknown`
 
+> **Status (2026-04-17):** LANDED in
+> https://github.com/revprism-dev-bot/heimdall-mcp/pull/45. `Classification`
+> is now the four-state `{allow, warn, block, unknown}`,
+> `ClassifyBashCommand` returns `ClassUnknown` on the default fall-through,
+> and the hook handler collapses Unknown to exit 0 in every mode
+> (including block — OQ-5 compliance). The subsections below describe the
+> shape of the change as originally specified.
+
 Today `Classification` in `internal/heimdall/destructive_ops.go` is a closed
 tri-state `{allow, warn, block}`, and the "nothing matched" fall-through
 resolves to `ClassAllow` (lines 376–377). That conflates two different

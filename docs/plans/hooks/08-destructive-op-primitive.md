@@ -48,17 +48,22 @@ We are explicitly **not**:
 ## 2. Classification Levels
 
 We adopt the smallest set that maps cleanly to Claude Code's PreToolUse
-exit-code contract.
+exit-code contract, plus one fall-through sentinel (`unknown`) that the
+plan 11 LLM fallback hangs off of.
 
 | Level | Exit code | stdout | Claude Code behavior | Example |
 |---|---|---|---|---|
-| `allow` | `0` | empty | Tool runs normally. | `ls -la`, `rm tmp/foo`, `git push origin feature` |
+| `allow` | `0` | empty | Tool runs normally. Reserved for commands that hit an explicit allowlist rule (`GIT_PUSH_FORCE_WITH_LEASE`). | `git push --force-with-lease origin main` |
 | `warn` | `0` | one-line `## Heimdall guardrail` block | Tool runs, but Claude sees the warning in context and can decide to abort or rephrase. | `rm -rf node_modules` (recoverable), `git reset --hard HEAD~1` (recoverable on `feature/*`) |
 | `block` | `2` | empty stdout, **stderr** = one-line reason | Claude Code cancels the tool call and surfaces stderr to the model as feedback. The model can then decide whether to retry differently. | `rm -rf /`, `rm -rf $HOME`, `git push --force origin main`, `git reset --hard` on a branch with unpushed commits matching `^main$|^master$|^release/.+` |
+| `unknown` | `0` | empty | Fall-through default: no rule matched (neither allowlist nor warn nor block). The hook handler collapses this to exit 0 identically to `allow` in every mode (including block — OQ-5 restricts exit 2 to `mode=block + class=block` only). Logged as `class=unknown` so audit tooling can distinguish "no rule fired" from "explicit allow". Extension point for the plan 11 LLM fallback. | `ls -la`, `make build`, `cat /etc/hosts` |
 
-Three levels exactly. No `confirm` (Claude Code's PreToolUse contract has
+Four levels exactly. No `confirm` (Claude Code's PreToolUse contract has
 no built-in interactive prompt — it is exit-code or nothing), no
-`allow-but-log-loudly` (degenerate with `warn`).
+`allow-but-log-loudly` (degenerate with `warn`). `unknown` is a sentinel
+for the default fall-through, deliberately split from `allow` so a
+downstream caller (e.g. the plan 11 LLM fallback) can tell "I recognized
+this as safe" from "no rule fired, presumed safe."
 
 **Why stderr on `block`?** Per Claude Code's PreToolUse hook contract
 (observed via existing docs and the hooks ecosystem; *if the contract

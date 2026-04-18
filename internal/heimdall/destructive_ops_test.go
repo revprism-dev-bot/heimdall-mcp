@@ -20,18 +20,23 @@ func TestClassifyBashCommand(t *testing.T) {
 
 	cases := []tc{
 		// -----------------------------------------------------------------
-		// Default allow — nothing recognized.
+		// Default unknown — no rule matched. These used to classify as
+		// ClassAllow under the old tri-state enum; after the ClassUnknown
+		// prerequisite from plan 11 §2.1 landed they return ClassUnknown
+		// instead. The hook handler collapses ClassUnknown to the same
+		// exit-0 "allow to run" surface in every mode, so this change is
+		// user-invisible in the default deployment.
 		// -----------------------------------------------------------------
-		{"empty string", "", ClassAllow, "", ""},
-		{"whitespace only", "   \t  ", ClassAllow, "", ""},
-		{"ls", "ls -la", ClassAllow, "", ""},
-		{"echo", "echo hi", ClassAllow, "", ""},
-		{"git status", "git status", ClassAllow, "", ""},
-		{"go build", "go build ./...", ClassAllow, "", ""},
-		{"cat", "cat /etc/hosts", ClassAllow, "", ""},
-		{"safe rm single file", "rm tmp/foo.txt", ClassAllow, "", ""},
-		{"safe rm with -f only (not recursive)", "rm -f tmp/foo.txt", ClassAllow, "", ""},
-		{"git push feature", "git push origin feature/x", ClassAllow, "", ""},
+		{"empty string", "", ClassUnknown, "", ""},
+		{"whitespace only", "   \t  ", ClassUnknown, "", ""},
+		{"ls", "ls -la", ClassUnknown, "", ""},
+		{"echo", "echo hi", ClassUnknown, "", ""},
+		{"git status", "git status", ClassUnknown, "", ""},
+		{"go build", "go build ./...", ClassUnknown, "", ""},
+		{"cat", "cat /etc/hosts", ClassUnknown, "", ""},
+		{"safe rm single file", "rm tmp/foo.txt", ClassUnknown, "", ""},
+		{"safe rm with -f only (not recursive)", "rm -f tmp/foo.txt", ClassUnknown, "", ""},
+		{"git push feature", "git push origin feature/x", ClassUnknown, "", ""},
 
 		// -----------------------------------------------------------------
 		// ALLOW rule — force-with-lease wins over --force.
@@ -258,20 +263,24 @@ func TestClassifyBashCommand(t *testing.T) {
 
 		// -----------------------------------------------------------------
 		// Known false-positive guards — commands that look scary but aren't.
+		// They hit no rule, so they fall through to ClassUnknown (same
+		// user-visible behavior as the old ClassAllow default because the
+		// hook handler collapses Unknown to Allow at the exit-code surface).
 		// -----------------------------------------------------------------
-		{"rm without -r (single file)", "rm foo.txt", ClassAllow, "", ""},
-		{"rm -f without -r", "rm -f foo.txt", ClassAllow, "", ""},
-		{"git push without force", "git push origin main", ClassAllow, "", ""},
-		{"kubectl get not delete", "kubectl get pods -n prod", ClassAllow, "", ""},
+		{"rm without -r (single file)", "rm foo.txt", ClassUnknown, "", ""},
+		{"rm -f without -r", "rm -f foo.txt", ClassUnknown, "", ""},
+		{"git push without force", "git push origin main", ClassUnknown, "", ""},
+		{"kubectl get not delete", "kubectl get pods -n prod", ClassUnknown, "", ""},
 		// NOTE: `echo 'drop database'` would match DROP_DATABASE by design
 		// (§3.4 matches any wrapper). That false positive is acceptable —
 		// we are paper-cut prevention, not a perfect parser.
 
 		// -----------------------------------------------------------------
 		// bash -c wrappers: classify the OUTER command (bash), not the
-		// quoted inner payload (design §3.5 — deliberate).
+		// quoted inner payload (design §3.5 — deliberate). Outer `bash -c`
+		// doesn't match any rule so it falls through to ClassUnknown.
 		// -----------------------------------------------------------------
-		{"bash -c wrapping rm -rf /", `bash -c "rm -rf /"`, ClassAllow, "", ""},
+		{"bash -c wrapping rm -rf /", `bash -c "rm -rf /"`, ClassUnknown, "", ""},
 	}
 
 	for _, c := range cases {
@@ -287,11 +296,71 @@ func TestClassifyBashCommand(t *testing.T) {
 			if c.wantSub != "" && !strings.Contains(strings.ToLower(gotReason), strings.ToLower(c.wantSub)) {
 				t.Errorf("reason %q does not contain %q", gotReason, c.wantSub)
 			}
-			// Default-allow always yields empty id+reason.
-			if gotClass == ClassAllow && c.wantID == "" && (gotReason != "" || gotID != "") {
-				t.Errorf("default allow must return empty id+reason, got id=%q reason=%q", gotID, gotReason)
+			// The fall-through branches (ClassUnknown — no rule matched) and
+			// the default-allow expectation paths (ClassAllow with no
+			// wantID asserted) both MUST yield empty id+reason.
+			if (gotClass == ClassAllow || gotClass == ClassUnknown) && c.wantID == "" && (gotReason != "" || gotID != "") {
+				t.Errorf("default %s must return empty id+reason, got id=%q reason=%q", gotClass, gotID, gotReason)
 			}
 		})
+	}
+}
+
+// TestClassifyBashCommand_UnknownDefault is the regression guard for the
+// plan 11 §2.1 prerequisite — commands that hit no allowlist, no warn rule,
+// and no block rule MUST return ClassUnknown (never ClassAllow). Allow is
+// reserved for explicit allowlist hits; Unknown is the "no rule matched"
+// sentinel the LLM fallback (plan 11) hangs off of.
+func TestClassifyBashCommand_UnknownDefault(t *testing.T) {
+	// Commands chosen to be clearly outside every rule in the starter set
+	// (no rm -rf, no force push, no DROP DATABASE, no kubectl delete, etc.).
+	unrecognized := []string{
+		"ls -la",
+		"echo hello",
+		"go test ./...",
+		"cat /etc/hosts",
+		"git status",
+		"git push origin feature/x", // no --force
+		"kubectl get pods -n prod",  // get, not delete
+		"rm foo.txt",                // no -r
+		"rm -f foo.txt",             // still no -r
+		"make build",
+		`bash -c "rm -rf /"`, // outer bash, not matched by design (§3.5)
+	}
+	for _, cmd := range unrecognized {
+		t.Run(cmd, func(t *testing.T) {
+			class, reason, id := ClassifyBashCommand(cmd)
+			if class != ClassUnknown {
+				t.Fatalf("ClassifyBashCommand(%q) class = %v (%s), want ClassUnknown",
+					cmd, class, class)
+			}
+			if reason != "" {
+				t.Errorf("ClassifyBashCommand(%q) reason = %q, want empty on Unknown",
+					cmd, reason)
+			}
+			if id != "" {
+				t.Errorf("ClassifyBashCommand(%q) rule id = %q, want empty on Unknown",
+					cmd, id)
+			}
+		})
+	}
+}
+
+// TestClassifyBashCommand_AllowRequiresAllowlistHit is the complementary
+// guard — a ClassAllow return MUST come from an allowlist rule match with a
+// non-empty rule id. No caller should ever see ClassAllow with an empty rule
+// id now that ClassUnknown exists.
+func TestClassifyBashCommand_AllowRequiresAllowlistHit(t *testing.T) {
+	// GIT_PUSH_FORCE_WITH_LEASE is the one allowlist rule in the starter set.
+	class, reason, id := ClassifyBashCommand("git push --force-with-lease origin main")
+	if class != ClassAllow {
+		t.Fatalf("expected ClassAllow for --force-with-lease, got %v", class)
+	}
+	if id != "GIT_PUSH_FORCE_WITH_LEASE" {
+		t.Fatalf("expected GIT_PUSH_FORCE_WITH_LEASE rule id, got %q", id)
+	}
+	if reason == "" {
+		t.Errorf("allowlist hit must carry a reason, got empty")
 	}
 }
 
@@ -304,6 +373,7 @@ func TestClassification_String(t *testing.T) {
 		{ClassAllow, "allow"},
 		{ClassWarn, "warn"},
 		{ClassBlock, "block"},
+		{ClassUnknown, "unknown"},
 		{Classification(99), "unknown"},
 	}
 	for _, c := range cases {

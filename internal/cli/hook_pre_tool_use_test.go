@@ -415,7 +415,13 @@ func TestHookPreToolUse_LogsSessionID(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
 
-	payload := `{"session_id":"sess-abc","tool_name":"Bash","tool_input":{"command":"ls -la"},"cwd":"/tmp"}`
+	// `ls -la` hits no rule in the starter ruleset, so the real classifier
+	// now returns ClassUnknown (plan 11 §2.1). The hook handler still
+	// collapses that to exit 0 in shadow mode; the log records
+	// `class=unknown` so auditors can distinguish "no rule fired" from
+	// "explicit allowlist hit". Use an allowlist-matched command to
+	// confirm class=allow still shows up when it should.
+	payload := `{"session_id":"sess-abc","tool_name":"Bash","tool_input":{"command":"git push --force-with-lease origin main"},"cwd":"/tmp"}`
 	stdin := strings.NewReader(payload)
 	var out, errBuf bytes.Buffer
 
@@ -429,6 +435,105 @@ func TestHookPreToolUse_LogsSessionID(t *testing.T) {
 		t.Fatalf("expected session=sess-abc:\n%s", string(data))
 	}
 	if !strings.Contains(string(data), "class=allow") {
-		t.Fatalf("expected class=allow:\n%s", string(data))
+		t.Fatalf("expected class=allow for allowlist-matched command:\n%s", string(data))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 20 — ClassUnknown handling (plan 11 §2.1 prerequisite).
+// ---------------------------------------------------------------------------
+
+// Shadow mode + Unknown class: exit 0, nothing emitted. The log must record
+// `class=unknown` (not `class=allow`) so audit tooling can tell the two apart.
+func TestHookPreToolUse_ShadowUnknown(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	out, errOut, code := runHookPreToolUse(t, runPTUOpts{
+		stdin:    bashEvent("make build"),
+		env:      map[string]string{"HEIMDALL_GUARDRAILS": "shadow"},
+		classify: stubClassifier(heimdall.ClassUnknown, "", ""),
+	})
+	if code != 0 {
+		t.Errorf("code = %d, want 0 in shadow mode on Unknown", code)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want empty in shadow on Unknown", out)
+	}
+	if errOut != "" {
+		t.Errorf("stderr = %q, want empty in shadow on Unknown", errOut)
+	}
+	data, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	logTxt := string(data)
+	if !strings.Contains(logTxt, "class=unknown") {
+		t.Errorf("expected class=unknown in log, got:\n%s", logTxt)
+	}
+	if strings.Contains(logTxt, "class=allow") {
+		t.Errorf("log must not confuse Unknown with Allow:\n%s", logTxt)
+	}
+	if !strings.Contains(logTxt, "stage=classify") {
+		t.Errorf("expected stage=classify in log:\n%s", logTxt)
+	}
+}
+
+// Warn mode + Unknown class: exit 0, no stdout, no stderr (same surface as
+// Allow — Unknown never surfaces the `## Heimdall guardrail` block).
+func TestHookPreToolUse_WarnModeUnknown(t *testing.T) {
+	out, errOut, code := runHookPreToolUse(t, runPTUOpts{
+		stdin:    bashEvent("make build"),
+		env:      map[string]string{"HEIMDALL_GUARDRAILS": "warn"},
+		classify: stubClassifier(heimdall.ClassUnknown, "", ""),
+	})
+	if code != 0 {
+		t.Errorf("code = %d, want 0 for Unknown in warn mode", code)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want empty on Unknown (no guardrail block)", out)
+	}
+	if errOut != "" {
+		t.Errorf("stderr = %q, want empty on Unknown", errOut)
+	}
+}
+
+// Block mode + Unknown class: CRITICAL — must exit 0, not 2. OQ-5 only
+// permits exit 2 when mode=block AND class=ClassBlock. Plan 11 §2.1
+// explicitly requires Unknown to never block in the default (no-LLM)
+// configuration.
+func TestHookPreToolUse_BlockModeUnknownDoesNotBlock(t *testing.T) {
+	out, errOut, code := runHookPreToolUse(t, runPTUOpts{
+		stdin:    bashEvent("make build"),
+		env:      map[string]string{"HEIMDALL_GUARDRAILS": "block"},
+		classify: stubClassifier(heimdall.ClassUnknown, "", ""),
+	})
+	if code != 0 {
+		t.Errorf("code = %d, want 0 — Unknown MUST NOT exit 2 even in block mode (OQ-5 + plan 11 §2.1)", code)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want empty on Unknown in block mode", out)
+	}
+	if errOut != "" {
+		t.Errorf("stderr = %q, want empty on Unknown in block mode (OQ-5: only block+block writes stderr)", errOut)
+	}
+}
+
+// End-to-end: real classifier + block mode + an unrecognized command
+// (`make build`) → exit 0. Belt-and-suspenders check that the wiring
+// between the real classifier and the hook handler never produces exit 2
+// for a Class=Unknown fall-through.
+func TestHookPreToolUse_EndToEnd_RealClassifier_UnknownDoesNotBlock(t *testing.T) {
+	out, errOut, code := runHookPreToolUse(t, runPTUOpts{
+		stdin: bashEvent("make build"),
+		env:   map[string]string{"HEIMDALL_GUARDRAILS": "block"},
+		// classify: nil — use the real classifier. `make build` hits
+		// nothing in the rule table, so it falls through to ClassUnknown.
+	})
+	if code != 0 {
+		t.Errorf("code = %d, want 0 — real classifier + Unknown + block mode must exit 0", code)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want empty on Unknown", out)
+	}
+	if errOut != "" {
+		t.Errorf("stderr = %q, want empty on Unknown", errOut)
 	}
 }
