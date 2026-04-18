@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -328,13 +329,39 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	}
 	_, _ = io.WriteString(stdout, body)
 
+	// Stage-1 semantic-drift logging (plan 12 §3.2 / §10 Stage 1). Additive
+	// only — no schema_version bump, no behavior change. These two keys
+	// persist the data needed to replay cosine(query, hit) post-hoc in
+	// `sessions report` without re-embedding the prompt at report time.
+	//
+	//   hit_ids           — comma-joined chunk ids of the injected hits. Lets
+	//                        the report-time pass look up per-hit embeddings
+	//                        via VectorByID (to be added in Stage 2).
+	//   prompt_embed_b64  — base64 over EncodeFloat32Vec(queryVec). For a
+	//                        768-dim float32 vector that's 3072 raw bytes →
+	//                        4096 base64 bytes. <1 ms at hook time; §3.3
+	//                        argues for logging over re-embedding.
+	//
+	// Emitted only on `stage=ok` per §4; stage=cache_hit / degraded stages
+	// are intentionally excluded — see §3.5 (cache-hit turns drop from the
+	// semantic-drift denominator in v1).
+	hitIDs := make([]string, 0, len(results))
+	for _, r := range results {
+		if r.Record.ID != "" {
+			hitIDs = append(hitIDs, r.Record.ID)
+		}
+	}
+	promptEmbedB64 := base64.StdEncoding.EncodeToString(heimdall.EncodeFloat32Vec(queryVec))
+
 	logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
-		"stage":  "ok",
-		"hits":   len(results),
-		"skills": len(skillBullets),
-		"bytes":  len(body),
-		"model":  resolvedModel,
-		"scope":  scope,
+		"stage":            "ok",
+		"hits":             len(results),
+		"skills":           len(skillBullets),
+		"bytes":            len(body),
+		"model":            resolvedModel,
+		"scope":            scope,
+		"hit_ids":          strings.Join(hitIDs, ","),
+		"prompt_embed_b64": promptEmbedB64,
 	})
 	return 0
 }
