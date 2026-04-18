@@ -1026,6 +1026,90 @@ func TestIndexer_NoFileCountCap(t *testing.T) {
 	}
 }
 
+// TestIndexAll_SubReposOnlyImmediateChildrenRecorded is the M2 regression:
+// the outer walker previously recorded any dir with a `.git` inside at
+// ARBITRARY depth, but DiscoverSubReposAbs/IndexSubRepos only handle
+// immediate children. The mismatch meant a deeply-nested repo (e.g.
+// outer/services/payments/.git) appeared in result.SubRepos /
+// Skip.SubRepo but was never actually indexed as a separate project.
+//
+// Fix: the walker now records only IMMEDIATE sub-repos of idx.root,
+// matching DiscoverSubReposAbs. Sub-repos deeper than one level are
+// still skipped by filepath.SkipDir (so their files do NOT leak into
+// the outer store) but are not reported in result.SubRepos — the
+// orchestrator never claimed to handle them and the plan's "sub-repo-
+// inside-sub-repo" guarantee only kicks in when each intermediate is
+// itself a sub-repo.
+func TestIndexAll_SubReposOnlyImmediateChildrenRecorded(t *testing.T) {
+	root := t.TempDir()
+
+	// Outer file at root.
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deep sub-repo: outer/services/payments/.git
+	deep := filepath.Join(root, "services", "payments")
+	if err := os.MkdirAll(filepath.Join(deep, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deep, "p.go"), []byte("package p\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Immediate sub-repo: outer/libx/.git
+	shallow := filepath.Join(root, "libx")
+	if err := os.MkdirAll(filepath.Join(shallow, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shallow, "x.go"), []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the IMMEDIATE sub-repo should be recorded. services/payments
+	// (depth 2) must NOT appear — the orchestrator cannot index it
+	// anyway, and surfacing it in the summary would be misleading.
+	if len(result.SubRepos) != 1 {
+		t.Fatalf("SubRepos = %v, want exactly 1 entry (immediate child 'libx'); deeper repos must not be recorded",
+			result.SubRepos)
+	}
+	if result.SubRepos[0] != "libx" {
+		t.Errorf("SubRepos[0] = %q, want 'libx'", result.SubRepos[0])
+	}
+
+	// Skip.SubRepo counter must match len(SubRepos) — invariant that keeps
+	// the CLI summary renderer consistent.
+	if result.Skip.SubRepo != 1 {
+		t.Errorf("Skip.SubRepo = %d, want 1", result.Skip.SubRepo)
+	}
+
+	// Sanity: neither sub-repo's files leaked into the outer store.
+	if outerStore.HasFile("services/payments/p.go") {
+		t.Error("outer store must NOT contain services/payments/p.go (deep sub-repo files)")
+	}
+	if outerStore.HasFile("libx/x.go") {
+		t.Error("outer store must NOT contain libx/x.go (shallow sub-repo files)")
+	}
+
+	// And the outer file IS indexed.
+	if !outerStore.HasFile("main.go") {
+		t.Error("outer store missing main.go")
+	}
+}
+
 // TestIndexSubRepos_StampsEmbeddingDim is the H2 regression test:
 // IndexSubRepos MUST stamp both embedding_model AND embedding_dim on the
 // sub-repo store, matching what the outer indexer (cli.go:352-354 and

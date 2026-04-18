@@ -328,10 +328,20 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 				// for git worktrees) — matches hasRepoMarker in scope.go.
 				// Record the sub-repo's relative path so the orchestrator can
 				// index it as a separate project after the outer walk.
+				//
+				// IMPORTANT (M2 regression): only record IMMEDIATE children of
+				// idx.root. DiscoverSubReposAbs and IndexSubRepos only handle
+				// direct children; recording a deeply-nested sub-repo (e.g.
+				// outer/services/payments/.git) would surface it in
+				// result.SubRepos and Skip.SubRepo even though nothing ever
+				// indexes it. Deeper sub-repos are still SkipDir'd so their
+				// files do not leak into the outer store — they are simply
+				// not reported as "sub-repo candidates".
 				if path != walkRoot {
 					gitDir := filepath.Join(path, ".git")
 					if _, err := os.Stat(gitDir); err == nil {
-						if !subRepoSeen[relPath] {
+						immediate := filepath.Dir(path) == idx.root
+						if immediate && !subRepoSeen[relPath] {
 							subRepoSeen[relPath] = true
 							result.SubRepos = append(result.SubRepos, relPath)
 							result.Skip.SubRepo++
