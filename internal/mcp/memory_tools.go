@@ -176,7 +176,7 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 		Vector:      vec,
 		CreatedAt:   now,
 		UpdatedAt:   now,
-		Source:       heimdall.MemorySourceExplicit,
+		Source:      heimdall.MemorySourceExplicit,
 		ContentHash: hash,
 	}
 	if err := s.MemoryStore.UpsertMemory(m); err != nil {
@@ -334,4 +334,3 @@ func (s *Server) toolIngestSession(args json.RawMessage) MCPToolResult {
 	}, "", "  ")
 	return TextResult(string(out))
 }
-

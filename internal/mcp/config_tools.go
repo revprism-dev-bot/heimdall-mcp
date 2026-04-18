@@ -26,9 +26,9 @@ type managePathsInput struct {
 // --- Config key definitions ---
 
 type configKeyDef struct {
-	Type    string // "bool", "int", "[]string"
-	Get     func(c *config.Config) any
-	Set     func(c *config.Config, v any) error
+	Type string // "bool", "int", "[]string"
+	Get  func(c *config.Config) any
+	Set  func(c *config.Config, v any) error
 }
 
 var configKeys = map[string]configKeyDef{

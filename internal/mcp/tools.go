@@ -389,7 +389,9 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 								log.Printf("git commit indexing for %s: %d commits, %d chunks", sr.Name, gitResult.CommitsIndexed, gitResult.ChunksCreated)
 							}
 						}
-						subStore.Close()
+						if closeErr := subStore.Close(); closeErr != nil {
+							log.Printf("close sub-repo store %s: %v", subDBDir, closeErr)
+						}
 					}
 
 					if err := s.Registry.Save(); err != nil {
@@ -720,4 +722,3 @@ func (s *Server) toolLs(args json.RawMessage) MCPToolResult {
 	out, _ := json.MarshalIndent(entries, "", "  ")
 	return TextResult(string(out))
 }
-
