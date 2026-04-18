@@ -528,8 +528,8 @@ func TestDoctorChecks_GreenWhenAllOK(t *testing.T) {
 	}
 	cfg := config.Config{Model: "bge-m3"}
 	checks := runDoctorChecks(cfg, env, deps)
-	if len(checks) != 14 {
-		t.Fatalf("expected 14 checks, got %d", len(checks))
+	if len(checks) != 15 {
+		t.Fatalf("expected 15 checks, got %d", len(checks))
 	}
 	for _, c := range checks {
 		if c.status == statusFail {
@@ -667,9 +667,10 @@ func TestDoctorChecks_DryFireFailsRed(t *testing.T) {
 		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	checks := runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
-	// check #10 (index 9)
-	if checks[9].status != statusFail {
-		t.Errorf("expected fail on dry-fire failure, got %v: %s", checks[9].status, checks[9].message)
+	// check #11 (index 10) — hook dry-fire; shifted after F5 LLM-classifier
+	// check inserted at index 7.
+	if checks[10].status != statusFail {
+		t.Errorf("expected fail on dry-fire failure, got %v: %s", checks[10].status, checks[10].message)
 	}
 }
 
@@ -729,12 +730,12 @@ func TestDoctorChecks_SessionsPipeline_NoLogWarns(t *testing.T) {
 		memoryDBPath: filepath.Join(home, "memory.db"),
 	}
 	checks := runDoctorChecks(config.Config{Model: "bge-m3"}, env, deps)
-	if len(checks) < 14 {
-		t.Fatalf("expected >=14 checks, got %d", len(checks))
+	if len(checks) < 15 {
+		t.Fatalf("expected >=15 checks, got %d", len(checks))
 	}
-	last := checks[13]
+	last := checks[14]
 	if last.name != "sessions pipeline" {
-		t.Fatalf("expected sessions pipeline check at index 13, got %q", last.name)
+		t.Fatalf("expected sessions pipeline check at index 14, got %q", last.name)
 	}
 	if last.status != statusWarn {
 		t.Errorf("expected warn on missing hooks.log, got %v: %s", last.status, last.message)
@@ -790,6 +791,169 @@ func TestDoctor_HandlerWiring(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "settings.json present") {
 		t.Errorf("expected check table in stdout, got: %s", stdout.String())
+	}
+}
+
+// ----- F5: llm-classifier model_missing check (plan 11 §5.5) -----
+
+// llmDoctorDeps is a tiny helper that returns a baseline doctorDeps with
+// Ollama-up + `bge-m3` present, so each F5 case only has to override the
+// fields it actually tests.
+func llmDoctorDeps(t *testing.T, home string, models []string) doctorDeps {
+	t.Helper()
+	settingsPath := filepath.Join(home, "settings.json")
+	os.WriteFile(settingsPath, []byte("{}"), 0o600)
+	return doctorDeps{
+		settingsPath: settingsPath,
+		lookupPath:   func(name string) (string, error) { return "/fake/" + name, nil },
+		runVersion:   func(bin string) error { return nil },
+		pingOllama:   func(ctx context.Context, ep string) error { return nil },
+		listModels:   func(ctx context.Context, ep string) ([]string, error) { return models, nil },
+		dryFire:      func(cmd string) error { return nil },
+		hookLogPath:  filepath.Join(home, "hooks.log"),
+		skillsDir:    filepath.Join(home, "claude-skills"),
+		memoryDBPath: filepath.Join(home, "memory.db"),
+	}
+}
+
+// TestDoctorChecks_LLMClassifier_DisabledByEnv — default-off box: flag is
+// not set, so the check must not warn. Must stay quiet even when the
+// configured classifier model is unset, because the gate is AND.
+func TestDoctorChecks_LLMClassifier_DisabledByEnv(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home) // no HEIMDALL_LLM_CLASSIFIER set
+	deps := llmDoctorDeps(t, home, []string{"bge-m3"})
+	cfg := config.Config{Model: "bge-m3", LLMClassifierModel: "llama3.2:3b"}
+	checks := runDoctorChecks(cfg, env, deps)
+	// Check #8 (index 7) is the new "llm classifier model" row.
+	row := checks[7]
+	if row.name != "llm classifier model" {
+		t.Fatalf("expected llm-classifier check at index 7, got %q", row.name)
+	}
+	if row.status != statusPass {
+		t.Errorf("expected pass when flag unset, got %v: %s", row.status, row.message)
+	}
+	if !strings.Contains(row.message, "disabled") {
+		t.Errorf("expected 'disabled' in message, got: %s", row.message)
+	}
+}
+
+// TestDoctorChecks_LLMClassifier_EnabledButNoModelConfigured — flag set
+// but cfg.LLMClassifierModel empty → WARN pointing at `configure`.
+// Matches the 11a §5.4 "opt-in at both layers" invariant: env alone is
+// not enough.
+func TestDoctorChecks_LLMClassifier_EnabledButNoModelConfigured(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	env["HEIMDALL_LLM_CLASSIFIER"] = "1"
+	deps := llmDoctorDeps(t, home, []string{"bge-m3"})
+	cfg := config.Config{Model: "bge-m3"} // LLMClassifierModel empty
+	checks := runDoctorChecks(cfg, env, deps)
+	row := checks[7]
+	if row.status != statusWarn {
+		t.Errorf("expected warn with unset model, got %v: %s", row.status, row.message)
+	}
+	if !strings.Contains(row.message, "configure --llm-classifier-model") {
+		t.Errorf("expected configure hint in message, got: %s", row.message)
+	}
+}
+
+// TestDoctorChecks_LLMClassifier_ModelMissing — the F5 path: flag on,
+// model configured, Ollama up, model is NOT in the list. WARN with a
+// copy-pasteable `ollama pull` hint.
+func TestDoctorChecks_LLMClassifier_ModelMissing(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	env["HEIMDALL_LLM_CLASSIFIER"] = "1"
+	// Only embedding model pulled; the classifier model is absent.
+	deps := llmDoctorDeps(t, home, []string{"bge-m3"})
+	cfg := config.Config{Model: "bge-m3", LLMClassifierModel: "llama3.2:3b"}
+	checks := runDoctorChecks(cfg, env, deps)
+	row := checks[7]
+	if row.status != statusWarn {
+		t.Errorf("expected warn on missing classifier model, got %v: %s", row.status, row.message)
+	}
+	if !strings.Contains(row.message, "ollama pull llama3.2:3b") {
+		t.Errorf("expected 'ollama pull <model>' hint, got: %s", row.message)
+	}
+	// Must never be fatal — a missing classifier model is a paper-cut
+	// warning, not a reason to exit 1.
+	for _, c := range checks {
+		if c.status == statusFail && c.name == "llm classifier model" {
+			t.Errorf("F5 must never be fatal; got fail for %q", c.name)
+		}
+	}
+}
+
+// TestDoctorChecks_LLMClassifier_ModelPresent — happy path: flag on,
+// model configured, Ollama up, model IS in the list (with :latest tag
+// variance). Must PASS and echo the model name.
+func TestDoctorChecks_LLMClassifier_ModelPresent(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	env["HEIMDALL_LLM_CLASSIFIER"] = "1"
+	// `:latest` tag roundtrip: modelInList normalizes the implicit tag.
+	deps := llmDoctorDeps(t, home, []string{"bge-m3", "llama3.2:3b"})
+	cfg := config.Config{Model: "bge-m3", LLMClassifierModel: "llama3.2:3b"}
+	checks := runDoctorChecks(cfg, env, deps)
+	row := checks[7]
+	if row.status != statusPass {
+		t.Errorf("expected pass when model pulled, got %v: %s", row.status, row.message)
+	}
+	if !strings.Contains(row.message, "llama3.2:3b") {
+		t.Errorf("expected model name echoed, got: %s", row.message)
+	}
+}
+
+// TestDoctorChecks_LLMClassifier_OllamaDownSkipsQuietly — if Ollama isn't
+// reachable, check #6 already warns. We must not warn a second time on
+// the same root cause; the F5 row reports "ollama down — skipped".
+func TestDoctorChecks_LLMClassifier_OllamaDownSkipsQuietly(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	env["HEIMDALL_LLM_CLASSIFIER"] = "1"
+	deps := llmDoctorDeps(t, home, []string{"llama3.2:3b"})
+	deps.pingOllama = func(ctx context.Context, ep string) error { return errors.New("connection refused") }
+	// listModels should never be called when ping fails; guard via assertion.
+	listCalls := 0
+	deps.listModels = func(ctx context.Context, ep string) ([]string, error) {
+		listCalls++
+		return []string{"llama3.2:3b"}, nil
+	}
+	cfg := config.Config{Model: "bge-m3", LLMClassifierModel: "llama3.2:3b"}
+	checks := runDoctorChecks(cfg, env, deps)
+	row := checks[7]
+	if row.status != statusWarn {
+		t.Errorf("expected warn when ollama down, got %v: %s", row.status, row.message)
+	}
+	if !strings.Contains(row.message, "ollama down") {
+		t.Errorf("expected 'ollama down' marker, got: %s", row.message)
+	}
+	if listCalls != 0 {
+		t.Errorf("listModels must not be called when ping fails; calls=%d", listCalls)
+	}
+}
+
+// TestDoctorChecks_LLMClassifier_ListModelsError — Ollama up but
+// /api/tags fails (e.g. permissions, malformed response). Surface the
+// underlying error as a WARN, not FAIL — the hook itself still works
+// end-to-end because plan 11 §5.5 handles the runtime error.
+func TestDoctorChecks_LLMClassifier_ListModelsError(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	env["HEIMDALL_LLM_CLASSIFIER"] = "1"
+	deps := llmDoctorDeps(t, home, nil)
+	deps.listModels = func(ctx context.Context, ep string) ([]string, error) {
+		return nil, errors.New("unexpected HTTP 500")
+	}
+	cfg := config.Config{Model: "bge-m3", LLMClassifierModel: "llama3.2:3b"}
+	checks := runDoctorChecks(cfg, env, deps)
+	row := checks[7]
+	if row.status != statusWarn {
+		t.Errorf("expected warn on list error, got %v: %s", row.status, row.message)
+	}
+	if !strings.Contains(row.message, "HTTP 500") {
+		t.Errorf("expected underlying error surfaced, got: %s", row.message)
 	}
 }
 

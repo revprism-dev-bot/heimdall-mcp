@@ -212,6 +212,8 @@ End users never invoke these directly — Claude Code runs them via `settings.js
 
 Toggle guardrails with `HEIMDALL_GUARDRAILS=shadow|warn|block|off` (default: `shadow` — logs verdicts, never blocks). `block` also accepts `1`, `on`, `enforce`; `off` also accepts `0` or empty. Disable all hooks with `HEIMDALL_HOOKS=0` or drop a `.heimdall/hooks.disabled` marker in your project.
 
+**LLM classifier fallback (opt-in).** When the static 19-rule classifier returns `ClassUnknown`, an optional second pass can consult a local Ollama instruct model for a sharper verdict. Enable with `HEIMDALL_LLM_CLASSIFIER=1` and point it at a pulled model via `heimdall-mcp configure --llm-classifier-model=<model>` (e.g. `llama3.2:3b`). The fallback is local-only — queries never leave the machine and there is no cloud API. See [`docs/reference/llm-classifier.md`](docs/reference/llm-classifier.md) for latency, failure modes, and the full rollout plan.
+
 **Hook log.** Structured JSON-lines events go to `~/.local/state/heimdall/hooks.log` (honors `$XDG_STATE_HOME`; override the full path with `HEIMDALL_HOOK_LOG`). Logs auto-rotate at 10 MB; the previous log is retained as `hooks.log.1`. Cached hook output is capped at 32 KB per row — larger payloads are refused rather than truncated.
 
 ### Per-session savings

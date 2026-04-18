@@ -336,16 +336,19 @@ func loadPromptVectors(hooksLogPath string) (map[string]map[int][]float32, error
 	return out, nil
 }
 
-// loadHitVectors runs one SELECT per distinct chunk id and builds an
-// id→vector map. Missing ids are silently skipped (F3 per plan 12 §7) —
-// the caller's runDriftForTurn treats a turn with all hit ids missing as
-// skipped to avoid a fabricated negative.
+// loadHitVectors resolves each distinct chunk id to its decoded embedding
+// via store.VectorByID. Missing ids are silently skipped (F3 per plan 12
+// §7) — the caller's runDriftForTurn treats a turn with all hit ids
+// missing as skipped to avoid a fabricated negative. Uses the shared
+// heimdall.VectorStore helper (added in PR #58) so the harness and the
+// in-process drift compute path go through the same query + decode
+// primitive, keeping output byte-identical to the pre-helper raw-SQL
+// version.
 func loadHitVectors(store *heimdall.VectorStore, ids []string) map[string][]float32 {
 	out := map[string][]float32{}
 	if store == nil {
 		return out
 	}
-	db := store.DB()
 	for _, id := range ids {
 		if id == "" {
 			continue
@@ -353,11 +356,10 @@ func loadHitVectors(store *heimdall.VectorStore, ids []string) map[string][]floa
 		if _, seen := out[id]; seen {
 			continue
 		}
-		var blob []byte
-		if err := db.QueryRow(`SELECT vector FROM entries WHERE id = ?`, id).Scan(&blob); err != nil {
+		vec, err := store.VectorByID(id)
+		if err != nil {
 			continue
 		}
-		vec := heimdall.DecodeFloat32Vec(blob)
 		if len(vec) == 0 {
 			continue
 		}
