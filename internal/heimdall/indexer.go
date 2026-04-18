@@ -145,6 +145,10 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 	}
 
 	var files []string
+	// subRepoSeen dedupes entries in result.SubRepos. The walker only visits
+	// each directory once but using a set makes the post-pass loop cheap to
+	// reason about and future-proofs against nested walks.
+	subRepoSeen := make(map[string]bool)
 	for _, walkRoot := range walkRoots {
 		err := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -160,27 +164,45 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 			}
 
 			if d.IsDir() {
-				if idx.shouldExclude(relPath) {
+				// User-configured excludes are counted and skipped.
+				if idx.isUserExcluded(relPath) {
+					result.Skip.UserExcluded++
+					return filepath.SkipDir
+				}
+				// Default hygiene is silent (not counted — H1 resolution).
+				if idx.isDefaultExcluded(relPath) {
 					return filepath.SkipDir
 				}
 				// Skip directories that are their own git repos (sub-repos).
 				// Accept .git as either a directory or a regular file (gitlink
 				// for git worktrees) — matches hasRepoMarker in scope.go.
+				// Record the sub-repo's relative path so the orchestrator can
+				// index it as a separate project after the outer walk.
 				if path != walkRoot {
 					gitDir := filepath.Join(path, ".git")
 					if _, err := os.Stat(gitDir); err == nil {
+						if !subRepoSeen[relPath] {
+							subRepoSeen[relPath] = true
+							result.SubRepos = append(result.SubRepos, relPath)
+							result.Skip.SubRepo++
+						}
 						return filepath.SkipDir
 					}
 				}
 				return nil
 			}
 
-			if idx.shouldExclude(relPath) {
+			if idx.isUserExcluded(relPath) {
+				result.Skip.UserExcluded++
+				return nil
+			}
+			if idx.isDefaultExcluded(relPath) {
 				return nil
 			}
 
 			// Skip binary files
 			if isBinaryFile(path) {
+				result.Skip.Binary++
 				return nil
 			}
 
@@ -232,7 +254,7 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 				continue
 			}
 			if idx.isUpToDate(relPath, info.ModTime(), path) {
-				result.FilesSkipped++
+				result.Skip.Unchanged++
 				if progress != nil {
 					progress <- IndexProgress{
 						Current: i + 1, Total: len(files), FilePath: relPath,
@@ -344,6 +366,11 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 		result.Errors = append(result.Errors, fmt.Sprintf("store save: %v", saveErr))
 	}
 
+	// Keep the legacy FilesSkipped counter consistent with the breakdown
+	// so both old and new readers observe the same totals. Invariant in
+	// SkipBreakdown godoc.
+	result.FilesSkipped = result.Skip.UserExcluded + result.Skip.SubRepo + result.Skip.Binary + result.Skip.Unchanged
+
 	result.Duration = time.Since(start)
 	return result, nil
 }
@@ -417,20 +444,48 @@ func (idx *Indexer) chunkFile(path, relPath string) ([]Chunk, error) {
 	return chunks, nil
 }
 
-// shouldExclude checks if a relative path matches any exclude pattern.
-func (idx *Indexer) shouldExclude(relPath string) bool {
-	// Always exclude common directories
-	defaultExcludes := []string{".git", "node_modules", ".heimdall_db", "vendor", "__pycache__", ".idea"}
-	allExcludes := append(defaultExcludes, idx.opts.ExcludeGlobs...)
+// defaultExcludes names directories that are always skipped for hygiene.
+// Hits against this list are NOT counted in Skip.UserExcluded — see
+// SkipBreakdown doc and plan §G6 (H1 resolution).
+var defaultExcludes = []string{".git", "node_modules", ".heimdall_db", "vendor", "__pycache__", ".idea"}
 
-	parts := strings.Split(filepath.ToSlash(relPath), "/")
-	for _, pattern := range allExcludes {
+// isDefaultExcluded reports whether relPath matches one of the always-on
+// hygiene patterns. Does NOT consult user config. Hits here are silent —
+// the user did not opt into them and should not see them in summary counts.
+func (idx *Indexer) isDefaultExcluded(relPath string) bool {
+	return matchesAnyPattern(relPath, defaultExcludes)
+}
+
+// isUserExcluded reports whether relPath matches a user-configured pattern
+// from ChunkerOpts.ExcludeGlobs (sourced from cfg.ExcludePatterns + CLI
+// --exclude + MCP exclude_patterns). Hits bump Skip.UserExcluded.
+func (idx *Indexer) isUserExcluded(relPath string) bool {
+	return matchesAnyPattern(relPath, idx.opts.ExcludeGlobs)
+}
+
+// shouldExclude is the union of default and user excludes. Retained for the
+// remaining callers (e.g. legacy tests / sub-repo orchestration helpers) so
+// behaviour is identical when a counter update is not required.
+func (idx *Indexer) shouldExclude(relPath string) bool {
+	return idx.isDefaultExcluded(relPath) || idx.isUserExcluded(relPath)
+}
+
+// matchesAnyPattern tests relPath against each pattern, matching both each
+// path component and the full slash-joined relative path — same semantics as
+// the previous shouldExclude body.
+func matchesAnyPattern(relPath string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	slashed := filepath.ToSlash(relPath)
+	parts := strings.Split(slashed, "/")
+	for _, pattern := range patterns {
 		for _, part := range parts {
 			if matched, _ := filepath.Match(pattern, part); matched {
 				return true
 			}
 		}
-		if matched, _ := filepath.Match(pattern, filepath.ToSlash(relPath)); matched {
+		if matched, _ := filepath.Match(pattern, slashed); matched {
 			return true
 		}
 	}

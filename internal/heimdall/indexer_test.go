@@ -249,7 +249,15 @@ func TestIndexAll_DoesNotSkip(t *testing.T) {
 	}
 }
 
-func TestIndexAll_SkipsSubRepoDirectories(t *testing.T) {
+// TestIndexAll_SubRepoFilesNotInOuterStore verifies that immediate sub-repos
+// (directories containing a .git entry) are NOT merged into the outer store.
+// Previously named TestIndexAll_SkipsSubRepoDirectories — renamed because
+// the plan now indexes sub-repos as separate projects (see IndexSubRepos).
+// The outer-store contract is unchanged: outer files land here, sub-repo
+// files do not. Also asserts Skip.SubRepo counts discovered sub-repo
+// directories (2) and that default-hygiene (.git inside each sub-repo) does
+// NOT leak into UserExcluded.
+func TestIndexAll_SubRepoFilesNotInOuterStore(t *testing.T) {
 	// Create a parent project with a sub-repo (directory containing .git/)
 	root := t.TempDir()
 
@@ -311,6 +319,18 @@ func TestIndexAll_SkipsSubRepoDirectories(t *testing.T) {
 	if !store.HasFile("pkg/lib.go") {
 		t.Error("regular subdir file pkg/lib.go should be indexed")
 	}
+
+	// NEW: sub-repo discovery is surfaced on the result.
+	if result.Skip.SubRepo != 2 {
+		t.Errorf("Skip.SubRepo = %d, want 2 (sub-service, sub-infra)", result.Skip.SubRepo)
+	}
+	if len(result.SubRepos) != 2 {
+		t.Errorf("SubRepos = %v, want 2 entries", result.SubRepos)
+	}
+	// INVARIANT: default-excluded hygiene dirs DO NOT bump UserExcluded.
+	if result.Skip.UserExcluded != 0 {
+		t.Errorf("Skip.UserExcluded = %d, want 0 (no user patterns configured)", result.Skip.UserExcluded)
+	}
 }
 
 func TestIndexAll_SubProjectTagging(t *testing.T) {
@@ -364,6 +384,155 @@ func TestIndexAll_SubProjectTagging(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("subProjectForFile(%q) = %q, want %q", tt.relPath, got, tt.want)
 		}
+	}
+}
+
+// TestIndexResult_SkipBinaryCounted asserts the walker bumps Skip.Binary
+// when the NUL-byte sniff trips, not the generic FilesSkipped counter alone.
+func TestIndexResult_SkipBinaryCounted(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "bin.dat"), []byte{0x00, 0x01, 0x02, 0x03}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "ok.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Skip.Binary != 1 {
+		t.Errorf("Skip.Binary = %d, want 1 (result=%+v)", result.Skip.Binary, result)
+	}
+	if result.FilesIndexed != 1 {
+		t.Errorf("FilesIndexed = %d, want 1 (only ok.go)", result.FilesIndexed)
+	}
+}
+
+// TestIndexResult_SkipUnchangedCounted asserts the incremental path bumps
+// Skip.Unchanged (not just FilesSkipped) so the summary can label it.
+func TestIndexResult_SkipUnchangedCounted(t *testing.T) {
+	files := map[string]string{
+		"a.go": "package main\nfunc a() {}",
+		"b.go": "package main\nfunc b() {}",
+	}
+	root := createTestProject(t, files)
+	store, err := OpenStore(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+	if _, err := idx.IndexAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := idx.IndexIncremental(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Skip.Unchanged != 2 {
+		t.Errorf("Skip.Unchanged = %d, want 2", result.Skip.Unchanged)
+	}
+	if result.Skip.UserExcluded != 0 || result.Skip.SubRepo != 0 || result.Skip.Binary != 0 {
+		t.Errorf("other counters should be 0, got %+v", result.Skip)
+	}
+}
+
+// TestIndexResult_UserExcludedCountsOnlyUserPatterns is the H1 regression —
+// only user-configured patterns bump Skip.UserExcluded; default hygiene
+// (.git, node_modules) stays silent.
+func TestIndexResult_UserExcludedCountsOnlyUserPatterns(t *testing.T) {
+	root := t.TempDir()
+	// User pattern: "generated" — files under generated/ should be counted.
+	if err := os.MkdirAll(filepath.Join(root, "generated"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "generated", "x.go"), []byte("package g\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Default-excluded: node_modules — must NOT bump the counter.
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "node_modules", "y.go"), []byte("package y\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Regular file.
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{
+		MaxChunkSize: 1500,
+		ExcludeGlobs: []string{"generated"},
+	})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Skip.UserExcluded != 1 {
+		t.Errorf("Skip.UserExcluded = %d, want 1 (only 'generated' dir)", result.Skip.UserExcluded)
+	}
+	if result.FilesIndexed != 1 {
+		t.Errorf("FilesIndexed = %d, want 1 (just a.go)", result.FilesIndexed)
+	}
+}
+
+// TestExclude_DefaultHygieneNotCounted is the H1 regression test: a fixture
+// containing only default-excluded dirs + one regular file must produce
+// FilesSkipped == 0 (matches TestIndexAll_DoesNotSkip semantics).
+func TestExclude_DefaultHygieneNotCounted(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "config"), []byte("[core]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "node_modules", "a.js"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+	result, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Skip.UserExcluded != 0 {
+		t.Errorf("Skip.UserExcluded = %d, want 0 (only default hygiene)", result.Skip.UserExcluded)
+	}
+	if result.Skip.SubRepo != 0 {
+		t.Errorf("Skip.SubRepo = %d, want 0 (.git is default-exclude, not sub-repo)", result.Skip.SubRepo)
+	}
+	if result.FilesSkipped != 0 {
+		t.Errorf("FilesSkipped = %d, want 0 (default hygiene is silent)", result.FilesSkipped)
+	}
+	if result.FilesIndexed != 1 {
+		t.Errorf("FilesIndexed = %d, want 1 (just a.go)", result.FilesIndexed)
 	}
 }
 
