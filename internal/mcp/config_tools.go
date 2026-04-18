@@ -143,6 +143,23 @@ var configKeys = map[string]configKeyDef{
 			return nil
 		},
 	},
+	"exclude_patterns": {
+		Type: "[]string",
+		Get:  func(c *config.Config) any { return c.ExcludePatterns },
+		Set: func(c *config.Config, v any) error {
+			s, err := toStringSlice(v)
+			if err != nil {
+				return fmt.Errorf("expected []string for exclude_patterns: %w", err)
+			}
+			// Reject absolute paths at the MCP boundary, same as the CLI
+			// `--exclude` surface (plan §6 M6 resolution).
+			if err := config.ValidateExcludePatterns(s); err != nil {
+				return err
+			}
+			c.ExcludePatterns = s
+			return nil
+		},
+	},
 }
 
 // --- Tool handlers ---

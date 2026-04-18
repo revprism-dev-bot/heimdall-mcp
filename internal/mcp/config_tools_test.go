@@ -158,6 +158,57 @@ func TestToolConfigure_SetKey_StringSlice(t *testing.T) {
 	}
 }
 
+// TestConfigureSetExcludePatterns_MCP is the G5/M6 MCP-side regression: the
+// heimdall_configure tool accepts an exclude_patterns array and persists it.
+func TestConfigureSetExcludePatterns_MCP(t *testing.T) {
+	s := testServerWithConfig(t)
+	args, _ := json.Marshal(map[string]any{
+		"action": "set",
+		"key":    "exclude_patterns",
+		"value":  []string{"dist", "build", "generated"},
+	})
+	result := s.toolConfigure(args)
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content[0].Text)
+	}
+	if len(s.Cfg.ExcludePatterns) != 3 {
+		t.Errorf("expected 3 patterns, got %d (%v)", len(s.Cfg.ExcludePatterns), s.Cfg.ExcludePatterns)
+	}
+	// Round-trip from disk — the set path must persist.
+	loaded := config.LoadConfig()
+	if len(loaded.ExcludePatterns) != 3 {
+		t.Errorf("persisted config mismatch: %v", loaded.ExcludePatterns)
+	}
+}
+
+// TestExclude_AbsolutePathRejectedByMCP is the M6 regression for the MCP
+// surface: absolute paths are rejected, nothing is persisted.
+func TestExclude_AbsolutePathRejectedByMCP(t *testing.T) {
+	s := testServerWithConfig(t)
+	originalPatterns := append([]string{}, s.Cfg.ExcludePatterns...)
+	args, _ := json.Marshal(map[string]any{
+		"action": "set",
+		"key":    "exclude_patterns",
+		"value":  []string{"ok", "/etc/foo"},
+	})
+	result := s.toolConfigure(args)
+	if !result.IsError {
+		t.Fatal("expected IsError for absolute path")
+	}
+	if !strings.Contains(result.Content[0].Text, "absolute") {
+		t.Errorf("error text must mention 'absolute', got: %s", result.Content[0].Text)
+	}
+	// In-memory config must NOT have been mutated on validation failure.
+	if len(s.Cfg.ExcludePatterns) != len(originalPatterns) {
+		t.Errorf("config mutated on failure: %v", s.Cfg.ExcludePatterns)
+	}
+	for i, v := range originalPatterns {
+		if s.Cfg.ExcludePatterns[i] != v {
+			t.Errorf("config[%d] = %q, want %q (unchanged)", i, s.Cfg.ExcludePatterns[i], v)
+		}
+	}
+}
+
 func TestToolConfigure_SetKey_TypeMismatch(t *testing.T) {
 	s := testServerWithConfig(t)
 
