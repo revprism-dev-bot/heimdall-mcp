@@ -2,8 +2,10 @@ package heimdall
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -380,5 +382,79 @@ func TestDiscoverSubRepoDirs_Empty(t *testing.T) {
 	subRepoDirs := DiscoverSubRepos(root)
 	if len(subRepoDirs) != 0 {
 		t.Errorf("expected empty subRepoDirs, got %v", subRepoDirs)
+	}
+}
+
+// TestIndexer_NoFileCountCap verifies there is no hard cap on the number of
+// files indexed. Prior to the cap removal, indexing silently truncated at
+// 5000 files, so 5001 is the minimum count that proves the cap is gone.
+// Skipped in -short mode because full-pipeline indexing of 5001 files
+// (stub embedder + real SQLite store) takes tens of seconds.
+func TestIndexer_NoFileCountCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow: exercises full pipeline with 5001 files")
+	}
+	const n = 5001
+	files := make(map[string]string, n)
+	for i := 0; i < n; i++ {
+		files[filepath.Join("pkg", fmt.Sprintf("f%04d.go", i))] = "package main\n"
+	}
+	root := createTestProject(t, files)
+
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	indexer := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+
+	result, err := indexer.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FilesScanned != n {
+		t.Errorf("FilesScanned = %d, want %d (no file-count cap expected)", result.FilesScanned, n)
+	}
+	if result.FilesIndexed != n {
+		t.Errorf("FilesIndexed = %d, want %d", result.FilesIndexed, n)
+	}
+}
+
+// TestIndexer_NoFileSizeCap verifies that files larger than the former
+// 100 KB cap are indexed end-to-end. The chunker handles the split.
+func TestIndexer_NoFileSizeCap(t *testing.T) {
+	// 200 KB of printable text — above the prior 100 KB cap, below binary
+	// sniff triggers. One chunk per MaxChunkSize slice.
+	const size = 200 * 1024
+	body := strings.Repeat("package main\nfunc f() {}\n", size/24+1)[:size]
+	files := map[string]string{"big.go": body}
+	root := createTestProject(t, files)
+
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	indexer := NewIndexer(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500})
+
+	result, err := indexer.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FilesScanned != 1 {
+		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
+	}
+	if result.FilesIndexed != 1 {
+		t.Errorf("FilesIndexed = %d, want 1 (200 KB file should be indexed)", result.FilesIndexed)
+	}
+	// 200 KB ÷ 1500-char chunks = ~137 chunks minimum.
+	if result.ChunksCreated < 100 {
+		t.Errorf("ChunksCreated = %d, want >=100 for a 200 KB file at 1500-char chunks", result.ChunksCreated)
 	}
 }
