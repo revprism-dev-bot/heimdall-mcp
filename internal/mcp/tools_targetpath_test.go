@@ -161,40 +161,268 @@ func TestToolStatus_DoesNotUseContaminatedIndexPath(t *testing.T) {
 	}
 }
 
-// TestToolIndexText_WritesToTargetNotCWD — Planner 3 critical finding.
-// toolIndexText must route its baseDir through s.resolveDBDir(project),
-// not os.Getwd(). If project is registered, content lands in the
-// registered DB path.
+// TestToolIndexText_WritesToTargetNotCWD — behavioral test (per PR #73
+// tests-reviewer finding): the original test exercised resolveDBDir in
+// isolation and never invoked toolIndexText. A future refactor that
+// inlined resolveDBDir elsewhere would pass that test while regressing
+// the invariant. This replacement drives toolIndexText through a fake
+// Ollama server and asserts the indexed content lands inside the
+// registered project's DB — NOT cwd.
 func TestToolIndexText_WritesToTargetNotCWD(t *testing.T) {
-	// Skip if the fake-Ollama integration harness isn't easily available
-	// in this package. Instead assert the wiring at a smaller level: with
-	// no project registered, resolveDBDir returns cwd-based path; with
-	// a project registered for input.Project, resolveDBDir returns the
-	// registered path. Exercise resolveDBDir directly in the code path
-	// that toolIndexText uses.
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+
+	// Register a project at its own tempdir. Use the canonical DBPath
+	// shape (<projectRoot>/.heimdall_db) so the resolver returns it
+	// verbatim for input.Project.
+	projectRoot := t.TempDir()
+	baseDir := filepath.Join(projectRoot, ".heimdall_db")
+	srv.Registry.Register("remoteproj", projectRoot, baseDir)
+
+	// Chdir away so os.Getwd is NOT projectRoot. A regression that
+	// routed through cwd instead of the registered path would write
+	// .heimdall_db under elsewhere.
+	elsewhere := t.TempDir()
+	t.Chdir(elsewhere)
+
+	body, _ := json.Marshal(indexTextInput{
+		Content: "indexed content for targeting test",
+		Source:  "unit-test",
+		Project: "remoteproj",
+		Type:    "note",
+	})
+	res := srv.toolIndexText(body)
+	if res.IsError {
+		t.Fatalf("toolIndexText returned error: %s", resultText(res))
+	}
+
+	// Assert the model-specific dir under the REGISTERED baseDir was
+	// created (toolIndexText writes through heimdall.OpenStore →
+	// ModelDBDir(baseDir, model)).
+	registeredModelDir := heimdall.ModelDBDir(baseDir, model)
+	if _, err := os.Stat(filepath.Join(registeredModelDir, "vectors.db")); err != nil {
+		t.Errorf("vectors.db missing under registered project %q: %v", registeredModelDir, err)
+	}
+
+	// Assert cwd was NOT polluted. The regression signature is a
+	// .heimdall_db dir appearing beneath the unrelated cwd.
+	if _, err := os.Stat(filepath.Join(elsewhere, ".heimdall_db")); err == nil {
+		t.Errorf("toolIndexText wrote .heimdall_db into cwd %q — target-path invariant regressed", elsewhere)
+	}
+}
+
+// TestToolStatus_DoesNotSubstringMatchRegistry — PR #73 review HIGH
+// finding. toolStatus previously routed through resolveDBDir, which
+// uses Registry.Find, which does case-insensitive substring matching.
+// Asking for path=/srv/auth when a project named `auth` is registered
+// at `/srv/auth-service` would return the wrong project's stats.
+//
+// The fix: when input.Path is an absolute filesystem directory, short
+// circuit to <path>/.heimdall_db (matching the resolveRunIndexBaseDir
+// exact-match contract). Only fall through to resolveDBDir when the
+// input looks like a project name, not a path.
+func TestToolStatus_DoesNotSubstringMatchRegistry(t *testing.T) {
+	s := helperServer(t)
+
+	// Register a project whose name coincidentally is a substring of
+	// the absolute path we will ask about. Registry.Find does
+	// case-insensitive substring matching on name, so a naive lookup
+	// of path=/srv/auth-service would return this project when the
+	// requested path is the unrelated `/srv/auth`.
+	//
+	// We simulate the inverse: register project `auth` at `realProject`,
+	// then ask status for a DIFFERENT absolute path `requestedPath`
+	// whose basename happens to contain "auth". toolStatus must return
+	// stats for requestedPath's own store, not the registered project's.
+	realProject := t.TempDir()
+	realBase := filepath.Join(realProject, ".heimdall_db")
+	realModelDir := heimdall.ModelDBDir(realBase, s.Cfg.Model)
+	realStore, err := heimdall.OpenStore(realModelDir)
+	if err != nil {
+		t.Fatalf("open real store: %v", err)
+	}
+	if err := realStore.Upsert([]heimdall.VectorRecord{{
+		ID: "real:1", FilePath: "r.go", Content: "real", Embedding: []float32{1, 0, 0, 0}, ModTime: 100,
+	}}); err != nil {
+		realStore.Close()
+		t.Fatalf("upsert real: %v", err)
+	}
+	realStore.Close()
+	s.Registry.Register("auth", realProject, realBase)
+
+	// Build a separate, unrelated absolute directory whose path contains
+	// the substring "auth" (mimicking `/srv/auth-v2` when `auth` is
+	// registered at `/srv/auth-service`). Its own DB has TWO entries so
+	// we can distinguish it from the registered project's store.
+	requestedRoot := filepath.Join(t.TempDir(), "auth-v2-experimental")
+	if err := os.MkdirAll(requestedRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	requestedBase := filepath.Join(requestedRoot, ".heimdall_db")
+	requestedModelDir := heimdall.ModelDBDir(requestedBase, s.Cfg.Model)
+	requestedStore, err := heimdall.OpenStore(requestedModelDir)
+	if err != nil {
+		t.Fatalf("open requested store: %v", err)
+	}
+	if err := requestedStore.Upsert([]heimdall.VectorRecord{
+		{ID: "req:1", FilePath: "a.go", Content: "x", Embedding: []float32{1, 0, 0, 0}, ModTime: 200},
+		{ID: "req:2", FilePath: "b.go", Content: "y", Embedding: []float32{0, 1, 0, 0}, ModTime: 200},
+	}); err != nil {
+		requestedStore.Close()
+		t.Fatalf("upsert requested: %v", err)
+	}
+	requestedStore.Close()
+
+	// Chdir somewhere else so cwd-fallback would miss both.
+	t.Chdir(t.TempDir())
+
+	args, _ := json.Marshal(statusInput{Path: requestedRoot})
+	res := s.toolStatus(args)
+	if res.IsError {
+		t.Fatalf("toolStatus error: %s", resultText(res))
+	}
+	body := resultText(res)
+	// The status body must point at requestedBase (the abs-path short
+	// circuit), not at realBase (the substring match result).
+	if !strings.Contains(body, requestedBase) {
+		t.Errorf("expected dbPath %q in status body:\n%s", requestedBase, body)
+	}
+	if strings.Contains(body, realBase) && !strings.Contains(body, requestedBase) {
+		t.Errorf("status body resolved to wrong registered project:\n%s", body)
+	}
+	// indexedFiles should reflect requestedRoot's store (2 entries → 2
+	// files), NOT the registered project's (1 entry → 1 file).
+	if !strings.Contains(body, `"indexedFiles": 2`) {
+		t.Errorf("expected indexedFiles=2 (requestedRoot's store), got:\n%s", body)
+	}
+}
+
+// TestToolStatus_AbsolutePathShortCircuits — when input.Path is an
+// absolute path to an existing directory, toolStatus must return
+// <path>/.heimdall_db WITHOUT consulting Registry.Find. Covers the
+// registry-bypass guarantee.
+func TestToolStatus_AbsolutePathShortCircuits(t *testing.T) {
 	s := helperServer(t)
 
 	projectRoot := t.TempDir()
 	baseDir := filepath.Join(projectRoot, ".heimdall_db")
-	s.Registry.Register("remoteproj", projectRoot, baseDir)
+	modelDir := heimdall.ModelDBDir(baseDir, s.Cfg.Model)
+	store, err := heimdall.OpenStore(modelDir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := store.Upsert([]heimdall.VectorRecord{{
+		ID: "seed:1", FilePath: "s.go", Content: "x", Embedding: []float32{1, 0, 0, 0}, ModTime: 100,
+	}}); err != nil {
+		store.Close()
+		t.Fatalf("upsert: %v", err)
+	}
+	store.Close()
 
-	// Chdir away so os.Getwd is NOT projectRoot.
+	// NOT registered. cwd elsewhere.
+	t.Chdir(t.TempDir())
+
+	args, _ := json.Marshal(statusInput{Path: projectRoot})
+	res := s.toolStatus(args)
+	if res.IsError {
+		t.Fatalf("toolStatus error: %s", resultText(res))
+	}
+	body := resultText(res)
+	if !strings.Contains(body, baseDir) {
+		t.Errorf("expected abs-path short circuit to dbPath=%q; body:\n%s", baseDir, body)
+	}
+	if !strings.Contains(body, `"indexedFiles": 1`) {
+		t.Errorf("expected indexedFiles=1 (unregistered abs-path short circuit); body:\n%s", body)
+	}
+}
+
+// TestToolStatus_UnregisteredAbsPath_ShortCircuits — covers PR #73
+// tests-reviewer finding #8: unregistered absolute paths previously
+// silently fell through to `<cwd>/.heimdall_db`, producing misleading
+// status. With the fix, an unregistered absolute path that points at
+// an existing directory resolves to that path's own `.heimdall_db`
+// (even if the DB doesn't yet exist — the status call simply reports
+// an empty index at the correct location).
+func TestToolStatus_UnregisteredAbsPath_ShortCircuits(t *testing.T) {
+	s := helperServer(t)
+
+	// Absolute path exists but has no .heimdall_db yet. cwd elsewhere.
+	unregistered := t.TempDir()
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+
+	args, _ := json.Marshal(statusInput{Path: unregistered})
+	res := s.toolStatus(args)
+	if res.IsError {
+		t.Fatalf("toolStatus error: %s", resultText(res))
+	}
+	body := resultText(res)
+
+	wantDBPath := filepath.Join(unregistered, ".heimdall_db")
+	if !strings.Contains(body, wantDBPath) {
+		t.Errorf("expected dbPath=%q (short-circuit from abs path), got:\n%s", wantDBPath, body)
+	}
+	// Must NOT have routed to cwd-based fallback.
+	cwdDBPath := filepath.Join(cwd, ".heimdall_db")
+	if strings.Contains(body, cwdDBPath) {
+		t.Errorf("status routed to cwd %q instead of short-circuiting to requested path %q:\n%s", cwdDBPath, unregistered, body)
+	}
+}
+
+// TestBaseDir_CLIAndMCPAgree_ForSameTarget — plan v2 invariant I9 (§8
+// merge gate, D-08). The cross-layer contract: indexing the same target
+// project through CLI (cli.go:378) and MCP (tools.go:runIndex) must
+// produce the SAME baseDir. Both paths must anchor at
+// `<target>/.heimdall_db`, not at their respective cwds.
+//
+// We drive the MCP layer directly (runIndex), and compute the CLI path
+// via the same heimdall.ModelDBDir call the CLI uses. Assert equality.
+func TestBaseDir_CLIAndMCPAgree_ForSameTarget(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	target := filepath.Join(base, "target-project")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "main.go"),
+		[]byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// CLI and MCP must both resolve baseDir from the target path, not
+	// from their current working directory.
 	elsewhere := t.TempDir()
 	t.Chdir(elsewhere)
 
-	// resolveDBDir with the project name must return the registered baseDir.
-	got := s.resolveDBDir("remoteproj")
-	if got != baseDir {
-		t.Fatalf("resolveDBDir(\"remoteproj\") = %q, want %q", got, baseDir)
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	runIndexSync(t, srv, target)
+
+	// MCP's resolved baseDir — read from the registry after runIndex.
+	p := srv.Registry.Find("target-project")
+	if p == nil {
+		t.Fatalf("registry has no 'target-project' entry after runIndex")
 	}
-	// With empty project, the fallback goes through FindByCWD which
-	// should NOT match elsewhere. Result should be <elsewhere>/.heimdall_db.
-	gotEmpty := s.resolveDBDir("")
-	if gotEmpty == baseDir {
-		t.Errorf("resolveDBDir(\"\") returned registered baseDir %q; should have fallen back to cwd", baseDir)
+	mcpBaseDir := p.DBPath
+
+	// What the CLI would compute for the same target: the CLI path also
+	// uses <target>/.heimdall_db (cli.go:indexCmd → filepath.Join(target, ".heimdall_db")).
+	cliBaseDir := filepath.Join(target, ".heimdall_db")
+
+	if mcpBaseDir != cliBaseDir {
+		t.Fatalf("MCP baseDir %q != CLI baseDir %q — cross-layer invariant I9 violated", mcpBaseDir, cliBaseDir)
 	}
-	if !strings.HasPrefix(gotEmpty, elsewhere) {
-		t.Errorf("resolveDBDir(\"\") = %q, want prefix %q", gotEmpty, elsewhere)
+
+	// Tighten further: both layers must resolve ModelDBDir to the same
+	// model-specific path. Any divergence between the MCP and CLI
+	// convention would slip past the basic equality check.
+	mcpModelDir := heimdall.ModelDBDir(mcpBaseDir, model)
+	cliModelDir := heimdall.ModelDBDir(cliBaseDir, model)
+	if mcpModelDir != cliModelDir {
+		t.Errorf("MCP modelDir %q != CLI modelDir %q", mcpModelDir, cliModelDir)
 	}
 }
 

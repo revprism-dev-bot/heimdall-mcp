@@ -574,12 +574,51 @@ func (s *Server) resolveRunIndexBaseDir(absPath string) string {
 	return s.resolveDBDir("")
 }
 
+// resolveStatusBaseDir returns the baseDir for heimdall_status. It
+// mirrors the resolveRunIndexBaseDir exact-match contract for absolute
+// paths, fixing PR #73 review HIGH finding: status previously routed
+// through resolveDBDir, which uses Registry.Find with case-insensitive
+// substring name matching. That meant `heimdall_status path=/srv/auth`
+// could silently return stats for a registered project `auth-service`.
+//
+// Resolution order:
+//  1. If input is an absolute directory that exists on disk, return an
+//     exact-path registry match OR <input>/.heimdall_db. Substring /
+//     name fuzzy matching is bypassed entirely.
+//  2. If input is a non-empty string that is NOT an absolute path,
+//     treat it as a project name and route through resolveDBDir
+//     (registry name/path exact match → substring match → cwd
+//     fallback — the existing behavior for name-style input is
+//     preserved).
+//  3. If input is empty, fall back to resolveDBDir("") — the cwd
+//     chain (FindByCWD → <cwd>/.heimdall_db).
+func (s *Server) resolveStatusBaseDir(input string) string {
+	if input == "" {
+		return s.resolveDBDir("")
+	}
+	if filepath.IsAbs(input) {
+		for _, p := range s.Registry.All() {
+			if p.Path == input {
+				return p.DBPath
+			}
+		}
+		return filepath.Join(input, ".heimdall_db")
+	}
+	// Name-style input — delegate to the shared resolver. A purely
+	// name-based substring match is intentional here (users call
+	// `heimdall_status project=my-proj` expecting a loose lookup).
+	return s.resolveDBDir(input)
+}
+
 // toolStatus serves heimdall_status. In PR1 it gained an optional `path`
-// input parameter. Resolution routes through s.resolveDBDir(path)
-// (registry-first, cwd-last) — see server.go:resolveDBDir. Does NOT use
-// s.Index.Path as fallback because autoIndexOnSearch writes the server's
-// cwd into it on unindexed searches (tools.go:464), contaminating the
-// signal. Reviewer A L-1 required this explicit separation.
+// input parameter. Resolution routes through s.resolveStatusBaseDir,
+// which mirrors the resolveRunIndexBaseDir exact-match contract for
+// absolute paths — so `heimdall_status path=/srv/auth` cannot be
+// misrouted to an unrelated registered project named `auth-service` via
+// Registry.Find's substring matching (PR #73 review HIGH finding). Does
+// NOT use s.Index.Path as fallback because autoIndexOnSearch writes the
+// server's cwd into it on unindexed searches (tools.go:464),
+// contaminating the signal.
 func (s *Server) toolStatus(args json.RawMessage) MCPToolResult {
 	var input statusInput
 	if len(args) > 0 {
@@ -615,7 +654,7 @@ func (s *Server) toolStatus(args json.RawMessage) MCPToolResult {
 		}
 	}
 
-	baseDir := s.resolveDBDir(input.Path)
+	baseDir := s.resolveStatusBaseDir(input.Path)
 	status["dbPath"] = baseDir
 
 	// Show all available model DBs for this project
