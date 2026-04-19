@@ -1,0 +1,73 @@
+name: CHANGELOG check
+
+# Require that any PR touching internal/ or cmd/ code also updates
+# CHANGELOG.md. Prevents the bitrot pattern flagged in v2 plan R-v2-7:
+# PR1 seeds the file, later PRs forget to append, and the CHANGELOG
+# silently diverges from reality.
+#
+# Mechanics:
+#   - Trigger on pull_request into main.
+#   - Diff the PR head vs the base ref.
+#   - If the diff touches Go code under internal/ or cmd/ but does
+#     NOT touch CHANGELOG.md, fail with a clear message.
+#
+# Opt-out escape valve: label the PR `skip-changelog` for docs-only,
+# refactor-only, or pure-test PRs where a CHANGELOG entry would add
+# noise. This matches the industry-standard "annotate to skip" idiom.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  check:
+    name: Require CHANGELOG.md entry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip for label
+        if: contains(github.event.pull_request.labels.*.name, 'skip-changelog')
+        run: echo "skip-changelog label present; skipping check"
+
+      - name: Check out PR with full history
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-changelog') }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine base ref
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-changelog') }}
+        id: base
+        run: |
+          echo "sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify CHANGELOG.md changed when code changed
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-changelog') }}
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only "$BASE_SHA"...HEAD)
+          echo "Changed files:"
+          echo "$changed"
+
+          code_changed=0
+          if echo "$changed" | grep -Eq '^(internal/|cmd/).*\.go$'; then
+            code_changed=1
+          fi
+
+          changelog_changed=0
+          if echo "$changed" | grep -Eq '^CHANGELOG\.md$'; then
+            changelog_changed=1
+          fi
+
+          if [ "$code_changed" -eq 1 ] && [ "$changelog_changed" -eq 0 ]; then
+            echo ""
+            echo "::error file=CHANGELOG.md::PR touches internal/ or cmd/ code but does not update CHANGELOG.md."
+            echo ""
+            echo "Fix: add an entry under [Unreleased] describing the user-visible change."
+            echo "If the change is genuinely invisible to users (pure refactor, test-only, docs-only),"
+            echo "add the 'skip-changelog' label to this PR."
+            exit 1
+          fi
+          echo "CHANGELOG check passed."
