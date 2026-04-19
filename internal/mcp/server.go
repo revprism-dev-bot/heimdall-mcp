@@ -30,6 +30,19 @@ func TextResult(text string) MCPToolResult {
 	return MCPToolResult{Content: []MCPContent{{Type: "text", Text: text}}}
 }
 
+// newOllamaClient constructs an OllamaClient honoring the Server's Config.
+// Centralizes `EmbedMaxConcurrent` / `EmbedTimeoutMs` / `EmbedMaxRetries`
+// wiring so every MCP tool inherits the same bursty-safe defaults. See
+// heimdall.NewOllamaClientFromConfig for semantics.
+func (s *Server) newOllamaClient() *heimdall.OllamaClient {
+	return heimdall.NewOllamaClientFromConfig(
+		s.Cfg.OllamaEndpoint,
+		s.Cfg.EmbedMaxConcurrent,
+		s.Cfg.EmbedTimeoutMs,
+		s.Cfg.EmbedMaxRetries,
+	)
+}
+
 // ErrResult creates an error text result.
 func ErrResult(msg string) MCPToolResult {
 	return MCPToolResult{Content: []MCPContent{{Type: "text", Text: msg}}, IsError: true}
@@ -107,7 +120,7 @@ Do not wait to be asked — use these tools as your primary way to understand an
 	// Check Ollama health and include status in the response so Claude
 	// knows immediately if there's a setup problem — before any tool fails.
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := s.newOllamaClient()
 	ollamaStatus := "ok"
 	if err := client.Ping(ctx); err != nil {
 		ollamaStatus = "not_reachable"
@@ -612,7 +625,7 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 	}
 
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := s.newOllamaClient()
 	if err := client.Ping(ctx); err != nil {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
@@ -837,7 +850,7 @@ func (s *Server) resolveModelDBDirForRead(project string) string {
 // project base dir and Ollama client.
 func (s *Server) resolveAnyModelDB(project string) (string, string) {
 	base := s.resolveDBDir(project)
-	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := s.newOllamaClient()
 	return heimdall.ResolveUsableModelDB(context.Background(), client, base, s.Cfg.Model)
 }
 
@@ -906,7 +919,7 @@ func (s *Server) toolExplain(args json.RawMessage) MCPToolResult {
 	}
 
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := s.newOllamaClient()
 	if err := client.Ping(ctx); err != nil {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}

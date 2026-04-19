@@ -206,6 +206,69 @@ func TestSaveConfig_CreatesDir(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------
+// Embed concurrency / timeout / retry env-var override tests
+// (PR5: closes handoff Problem #5 — parallel Ollama bursts deadline-exceed)
+// -----------------------------------------------------------------------
+
+func TestLoadConfig_EmbedEnvOverrides_Apply(t *testing.T) {
+	// Use a tmpdir XDG so LoadConfig's default path returns something
+	// predictable; we don't actually need an existing config file for
+	// the env-var path.
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("HEIMDALL_MCP_CONFIG", "")
+	t.Setenv("HEIMDALL_EMBED_MAX_CONCURRENT", "5")
+	t.Setenv("HEIMDALL_EMBED_TIMEOUT_MS", "7500")
+	t.Setenv("HEIMDALL_EMBED_MAX_RETRIES", "3")
+
+	cfg := LoadConfig()
+
+	if cfg.EmbedMaxConcurrent != 5 {
+		t.Errorf("EmbedMaxConcurrent = %d, want 5", cfg.EmbedMaxConcurrent)
+	}
+	if cfg.EmbedTimeoutMs != 7500 {
+		t.Errorf("EmbedTimeoutMs = %d, want 7500", cfg.EmbedTimeoutMs)
+	}
+	if cfg.EmbedMaxRetries != 3 {
+		t.Errorf("EmbedMaxRetries = %d, want 3", cfg.EmbedMaxRetries)
+	}
+}
+
+func TestLoadConfig_EmbedEnvOverrides_MalformedIgnored(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("HEIMDALL_MCP_CONFIG", "")
+	t.Setenv("HEIMDALL_EMBED_MAX_CONCURRENT", "not-a-number")
+	t.Setenv("HEIMDALL_EMBED_TIMEOUT_MS", "")
+	t.Setenv("HEIMDALL_EMBED_MAX_RETRIES", "-1")
+
+	cfg := LoadConfig()
+
+	// Malformed values should NOT update the zero default.
+	if cfg.EmbedMaxConcurrent != 0 {
+		t.Errorf("EmbedMaxConcurrent = %d, want 0 (malformed env must be ignored)", cfg.EmbedMaxConcurrent)
+	}
+	// Negative retries rejected — stays 0.
+	if cfg.EmbedMaxRetries != 0 {
+		t.Errorf("EmbedMaxRetries = %d, want 0 (negative env rejected)", cfg.EmbedMaxRetries)
+	}
+}
+
+func TestLoadConfig_EmbedEnvOverrides_ZeroMeansUnbounded(t *testing.T) {
+	// Explicit 0 for HEIMDALL_EMBED_MAX_CONCURRENT means "unbounded"
+	// downstream. The Config layer just passes it through.
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("HEIMDALL_MCP_CONFIG", "")
+	t.Setenv("HEIMDALL_EMBED_MAX_CONCURRENT", "0")
+
+	cfg := LoadConfig()
+	if cfg.EmbedMaxConcurrent != 0 {
+		t.Errorf("EmbedMaxConcurrent = %d, want 0 (explicit zero)", cfg.EmbedMaxConcurrent)
+	}
+}
+
 func TestSaveConfig_NoExistingFile(t *testing.T) {
 	// When there's no existing config file and no HEIMDALL_MCP_CONFIG env,
 	// SaveConfig should create one in the default location.

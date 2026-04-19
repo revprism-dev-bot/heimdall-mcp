@@ -4,28 +4,214 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 )
 
+// DefaultEmbedMaxConcurrent caps concurrent /api/embed requests issued by a
+// single OllamaClient. Two was picked empirically — burst parallelism of 4+
+// against a single-GPU Ollama instance was observed to deadline-exceed during
+// indexing (see docs/handoffs/2026-04-19-legacy-db-paths-and-filters.md
+// Problem #5). Raise via NewOllamaClientWithLimit / NewOllamaClientWithOptions
+// or config `embedMaxConcurrent`.
+const DefaultEmbedMaxConcurrent = 2
+
+// DefaultEmbedTimeout is the per-request deadline applied when the caller's
+// context carries no deadline. Matches the historical inline default.
+const DefaultEmbedTimeout = 30 * time.Second
+
+// DefaultEmbedMaxRetries is the number of retries applied to an embed call
+// when the failure is `context.DeadlineExceeded` against the PER-REQUEST
+// deadline (not the caller's ctx). Set to 0 to disable retries.
+const DefaultEmbedMaxRetries = 2
+
+// defaultEmbedRetryBackoff is the sequence of sleeps between retries.
+// Callers can override via OllamaOptions.RetryBackoff. If the configured
+// MaxRetries exceeds len(backoff), the last entry is reused for the
+// remaining attempts.
+var defaultEmbedRetryBackoff = []time.Duration{
+	250 * time.Millisecond,
+	500 * time.Millisecond,
+}
+
+// OllamaOptions groups the tunables for constructing an OllamaClient.
+// Zero values mean "use the package default".
+type OllamaOptions struct {
+	// MaxConcurrent bounds in-flight /api/embed requests. 0 = unbounded
+	// (caller manages concurrency upstream). Negative coerces to
+	// DefaultEmbedMaxConcurrent with a one-line warn log.
+	MaxConcurrent int
+	// EmbedTimeout is applied to embed requests whose caller ctx has no
+	// deadline. 0 → DefaultEmbedTimeout.
+	EmbedTimeout time.Duration
+	// MaxRetries controls retries on PER-REQUEST context.DeadlineExceeded
+	// (only). The caller's own ctx cancellation is NEVER retried. Default
+	// DefaultEmbedMaxRetries.
+	MaxRetries int
+	// RetryBackoff is consumed in order. If shorter than MaxRetries the
+	// last entry is repeated. nil → defaultEmbedRetryBackoff.
+	RetryBackoff []time.Duration
+}
+
 // OllamaClient talks to the Ollama REST API.
+//
+// Concurrency: EmbedForHook / Embed / EmbedBatch share a counting
+// semaphore (cap = MaxConcurrent) so burst parallelism from the indexer
+// does not deadline-exceed a single-GPU Ollama instance. The semaphore
+// acquire respects the caller's context. Chat/Ping/ListModels/PullModel
+// are NOT gated — they carry their own distinct deadlines and are not
+// the hot bursty path.
 type OllamaClient struct {
 	endpoint   string
 	httpClient *http.Client
+	// sem is a counting semaphore: send struct{}{} to acquire, receive
+	// to release. A nil sem means "unbounded" (MaxConcurrent == 0).
+	sem          chan struct{}
+	embedTimeout time.Duration
+	maxRetries   int
+	retryBackoff []time.Duration
 }
 
 // NewOllamaClient creates a client for the given endpoint (e.g. "http://localhost:11434").
 // The shared http.Client has no hard timeout — per-call deadlines are expected
 // to come from the caller's context, which lets batch embeds use a longer
 // deadline than single-text embeds while still sharing one connection pool.
+//
+// This constructor preserves backward compatibility: callers get the safe
+// concurrency default (DefaultEmbedMaxConcurrent). Use
+// NewOllamaClientWithLimit or NewOllamaClientWithOptions to override.
 func NewOllamaClient(endpoint string) *OllamaClient {
-	return &OllamaClient{
-		endpoint:   endpoint,
-		httpClient: &http.Client{},
+	return NewOllamaClientWithLimit(endpoint, DefaultEmbedMaxConcurrent)
+}
+
+// NewOllamaClientWithLimit constructs an OllamaClient with an explicit
+// concurrency cap. `maxConcurrent == 0` disables the semaphore (unbounded);
+// a negative value coerces to DefaultEmbedMaxConcurrent with a WARN log
+// (constructor signature cannot return an error without breaking every
+// existing caller).
+func NewOllamaClientWithLimit(endpoint string, maxConcurrent int) *OllamaClient {
+	return NewOllamaClientWithOptions(endpoint, OllamaOptions{MaxConcurrent: maxConcurrent})
+}
+
+// NewOllamaClientFromConfig is a convenience constructor that maps the
+// `EmbedMaxConcurrent` / `EmbedTimeoutMs` / `EmbedMaxRetries` fields from
+// the top-level Config (see internal/config) onto OllamaOptions. Zero
+// values fall through to package defaults — callers do not need to know
+// the defaults. Kept in the heimdall package so the heimdall ↔ config
+// cycle stays one-way.
+func NewOllamaClientFromConfig(endpoint string, maxConcurrent, timeoutMs, maxRetries int) *OllamaClient {
+	opts := OllamaOptions{
+		MaxConcurrent: maxConcurrent, // 0 → unbounded (explicit opt-out),
+		MaxRetries:    DefaultEmbedMaxRetries,
 	}
+	// Zero in the config means "unset → default". Only non-zero overrides.
+	if maxConcurrent == 0 {
+		opts.MaxConcurrent = DefaultEmbedMaxConcurrent
+	}
+	if timeoutMs > 0 {
+		opts.EmbedTimeout = time.Duration(timeoutMs) * time.Millisecond
+	}
+	if maxRetries > 0 {
+		opts.MaxRetries = maxRetries
+	}
+	// Allow explicit "0 retries" only via negative sentinel — zero from
+	// JSON defaults is ambiguous. Callers who want zero retries set the
+	// config field explicitly to -1 (treated as 0 after clamping below).
+	if maxRetries < 0 {
+		opts.MaxRetries = 0
+	}
+	return NewOllamaClientWithOptions(endpoint, opts)
+}
+
+// NewOllamaClientWithOptions is the full-fidelity constructor. Options fields
+// left at the zero value fall back to package defaults.
+func NewOllamaClientWithOptions(endpoint string, opts OllamaOptions) *OllamaClient {
+	maxConcurrent := opts.MaxConcurrent
+	if maxConcurrent < 0 {
+		log.Printf("heimdall: NewOllamaClientWithOptions: invalid MaxConcurrent=%d; coercing to default %d", maxConcurrent, DefaultEmbedMaxConcurrent)
+		maxConcurrent = DefaultEmbedMaxConcurrent
+	}
+
+	timeout := opts.EmbedTimeout
+	if timeout <= 0 {
+		timeout = DefaultEmbedTimeout
+	}
+
+	retries := opts.MaxRetries
+	if retries < 0 {
+		retries = 0
+	}
+
+	backoff := opts.RetryBackoff
+	if len(backoff) == 0 {
+		backoff = defaultEmbedRetryBackoff
+	}
+
+	var sem chan struct{}
+	if maxConcurrent > 0 {
+		sem = make(chan struct{}, maxConcurrent)
+	}
+
+	return &OllamaClient{
+		endpoint:     endpoint,
+		httpClient:   &http.Client{},
+		sem:          sem,
+		embedTimeout: timeout,
+		maxRetries:   retries,
+		retryBackoff: backoff,
+	}
+}
+
+// acquireEmbedSlot blocks until the semaphore admits this call, or ctx is
+// cancelled. Returns a release func (always non-nil; safe to call when
+// acquire returned an error — it's a no-op in that case).
+func (c *OllamaClient) acquireEmbedSlot(ctx context.Context) (release func(), err error) {
+	if c.sem == nil {
+		return func() {}, nil
+	}
+	select {
+	case c.sem <- struct{}{}:
+		return func() { <-c.sem }, nil
+	case <-ctx.Done():
+		return func() {}, ctx.Err()
+	}
+}
+
+// backoffFor returns the sleep duration to apply AFTER attempt `attemptIdx`
+// (0-indexed). When the configured backoff slice is shorter than needed the
+// last entry is reused for remaining retries.
+func (c *OllamaClient) backoffFor(attemptIdx int) time.Duration {
+	if len(c.retryBackoff) == 0 {
+		return 0
+	}
+	if attemptIdx >= len(c.retryBackoff) {
+		return c.retryBackoff[len(c.retryBackoff)-1]
+	}
+	return c.retryBackoff[attemptIdx]
+}
+
+// isPerRequestDeadlineExceeded returns true when `err` is
+// context.DeadlineExceeded from our PER-REQUEST timeout. The caller's ctx is
+// passed separately so we can distinguish "caller cancelled us" (do not
+// retry) from "our internal timeout fired" (retry is safe).
+func isPerRequestDeadlineExceeded(err error, callerCtx context.Context) bool {
+	if err == nil {
+		return false
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// If the caller's context has been cancelled or timed out, attribute
+	// the deadline to them — do NOT retry.
+	if callerCtx.Err() != nil {
+		return false
+	}
+	return true
 }
 
 // EmbedBatchSize is the maximum number of texts to send in a single batch
@@ -78,17 +264,69 @@ func (c *OllamaClient) EmbedForHook(ctx context.Context, model, text string) ([]
 
 // embed is the shared HTTP plumbing. Kept private so Embed and EmbedForHook
 // are the only public shapes and their intent is obvious at each call site.
+//
+// Concurrency + retry contract:
+//   - Acquires a semaphore slot (respects caller ctx).
+//   - Each attempt gets its own context.WithTimeout(callerCtx, embedTimeout)
+//     UNLESS the caller already set a deadline — then we honor theirs.
+//   - On per-request context.DeadlineExceeded, retries up to maxRetries
+//     times with configurable backoff. Caller ctx cancellation is NEVER
+//     retried (the caller has told us to stop).
+//   - Non-timeout errors (HTTP 4xx/5xx, decode errors, transport errors
+//     other than deadline-exceeded) are returned immediately.
 func (c *OllamaClient) embed(ctx context.Context, payload EmbedRequest) ([]float32, error) {
-	// Apply a default per-call deadline if the caller hasn't already set one,
-	// matching the historical 30s cap on the shared http.Client.
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+	release, err := c.acquireEmbedSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	body, _ := json.Marshal(payload)
+
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		// Honor caller cancellation between attempts.
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
+		}
+
+		vec, err := c.doEmbedOnce(ctx, body)
+		if err == nil {
+			return vec, nil
+		}
+		lastErr = err
+		if !isPerRequestDeadlineExceeded(err, ctx) {
+			return nil, err
+		}
+		if attempt == c.maxRetries {
+			break
+		}
+		// Sleep, but don't exceed caller ctx.
+		sleep := c.backoffFor(attempt)
+		if sleep > 0 {
+			select {
+			case <-time.After(sleep):
+			case <-ctx.Done():
+				return nil, lastErr
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+// doEmbedOnce executes a single /api/embed round-trip. Applies the default
+// per-request deadline when the caller ctx has none. Returns the first
+// embedding vector or an error wrapping the HTTP / decode failure.
+func (c *OllamaClient) doEmbedOnce(ctx context.Context, body []byte) ([]float32, error) {
+	reqCtx, cancel := c.perRequestCtx(ctx)
+	if cancel != nil {
 		defer cancel()
 	}
 
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", c.endpoint+"/api/embed", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(reqCtx, "POST", c.endpoint+"/api/embed", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +334,12 @@ func (c *OllamaClient) embed(ctx context.Context, payload EmbedRequest) ([]float
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// Preserve errors.Is(err, context.DeadlineExceeded) — the retry
+		// gate relies on it. http.Client already wraps with url.Error
+		// whose Unwrap chain exposes the ctx error.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("ollama embed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -115,9 +359,57 @@ func (c *OllamaClient) embed(ctx context.Context, payload EmbedRequest) ([]float
 	return result.Embeddings[0], nil
 }
 
+// applyBatchDeadline mirrors perRequestCtx but with a caller-supplied budget
+// (the batch-scaled timeout). Returns a nil cancel when no new context is
+// needed (caller-deadline shorter, or budget non-positive).
+func (c *OllamaClient) applyBatchDeadline(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if budget <= 0 {
+		return ctx, nil
+	}
+	callerDeadline, hasCallerDeadline := ctx.Deadline()
+	if hasCallerDeadline {
+		if time.Until(callerDeadline) < budget {
+			return ctx, nil
+		}
+	}
+	return context.WithTimeout(ctx, budget)
+}
+
+// perRequestCtx returns a child context with a per-request deadline bounded
+// by min(caller_deadline, c.embedTimeout). This is the knob the retry loop
+// relies on: per-request context.DeadlineExceeded must fire BEFORE the
+// caller's deadline so we can distinguish "our budget blew" (retry) from
+// "caller cancelled us" (abort).
+//
+// If neither caller deadline nor c.embedTimeout apply, returns ctx as-is.
+// Always returns a non-nil cancel func (defensive — callers `defer cancel`
+// unconditionally) unless ctx is passed through unchanged.
+func (c *OllamaClient) perRequestCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	// If embedTimeout is zero/negative, fall back to caller ctx unchanged.
+	if c.embedTimeout <= 0 {
+		return ctx, nil
+	}
+	callerDeadline, hasCallerDeadline := ctx.Deadline()
+	budget := c.embedTimeout
+	if hasCallerDeadline {
+		remaining := time.Until(callerDeadline)
+		if remaining < budget {
+			// Caller has less headroom — honor theirs directly (no new
+			// child needed; the caller ctx already fires in time).
+			return ctx, nil
+		}
+	}
+	return context.WithTimeout(ctx, budget)
+}
+
 // EmbedBatch generates embeddings for multiple texts in one API call.
 // Rejects batches larger than EmbedBatchSize so that callers cannot bypass
 // the split path and force Ollama to load an unbounded request into memory.
+//
+// Concurrency: shares the same semaphore as Embed / EmbedForHook so a mix
+// of single and batch callers cannot collectively exceed MaxConcurrent.
+// Retries follow the same rules as embed() — per-request DeadlineExceeded
+// only, never on caller ctx cancel.
 func (c *OllamaClient) EmbedBatch(ctx context.Context, model string, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
@@ -125,7 +417,8 @@ func (c *OllamaClient) EmbedBatch(ctx context.Context, model string, texts []str
 	if len(texts) > EmbedBatchSize {
 		return nil, fmt.Errorf("ollama embed batch: size %d exceeds max %d", len(texts), EmbedBatchSize)
 	}
-	// Single text: reuse the single-embed path for simplicity.
+	// Single text: reuse the single-embed path for simplicity. The
+	// semaphore acquire inside Embed handles concurrency bounding.
 	if len(texts) == 1 {
 		vec, err := c.Embed(ctx, model, texts[0])
 		if err != nil {
@@ -134,14 +427,59 @@ func (c *OllamaClient) EmbedBatch(ctx context.Context, model string, texts []str
 		return [][]float32{vec}, nil
 	}
 
+	release, err := c.acquireEmbedSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	body, _ := json.Marshal(EmbedBatchRequest{Model: model, Input: texts})
 
 	// Scale the deadline with batch size so larger batches get proportionally
-	// more time, while still reusing the shared http.Client (and its keep-alive
-	// connection pool) rather than allocating a new one per call.
-	batchTimeout := 30*time.Second + time.Duration(len(texts))*2*time.Second
-	reqCtx, cancel := context.WithTimeout(ctx, batchTimeout)
-	defer cancel()
+	// more time. Baseline is the configured per-request timeout (no longer
+	// a hardcoded 30s — honors OllamaOptions.EmbedTimeout).
+	batchTimeout := c.embedTimeout + time.Duration(len(texts))*2*time.Second
+
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
+		}
+		vecs, err := c.doEmbedBatchOnce(ctx, body, batchTimeout, len(texts))
+		if err == nil {
+			return vecs, nil
+		}
+		lastErr = err
+		if !isPerRequestDeadlineExceeded(err, ctx) {
+			return nil, err
+		}
+		if attempt == c.maxRetries {
+			break
+		}
+		sleep := c.backoffFor(attempt)
+		if sleep > 0 {
+			select {
+			case <-time.After(sleep):
+			case <-ctx.Done():
+				return nil, lastErr
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+// doEmbedBatchOnce executes a single batch /api/embed round-trip. Applies
+// a batch-scaled per-request deadline bounded by min(caller_deadline,
+// batchTimeout) so the retry loop can distinguish our timeout from the
+// caller's cancellation.
+func (c *OllamaClient) doEmbedBatchOnce(ctx context.Context, body []byte, batchTimeout time.Duration, wantCount int) ([][]float32, error) {
+	reqCtx, cancel := c.applyBatchDeadline(ctx, batchTimeout)
+	if cancel != nil {
+		defer cancel()
+	}
 
 	req, err := http.NewRequestWithContext(reqCtx, "POST", c.endpoint+"/api/embed", bytes.NewReader(body))
 	if err != nil {
@@ -151,6 +489,9 @@ func (c *OllamaClient) EmbedBatch(ctx context.Context, model string, texts []str
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("ollama embed batch: %w", err)
 	}
 	defer resp.Body.Close()
@@ -164,8 +505,8 @@ func (c *OllamaClient) EmbedBatch(ctx context.Context, model string, texts []str
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("ollama embed batch decode: %w", err)
 	}
-	if len(result.Embeddings) != len(texts) {
-		return nil, fmt.Errorf("ollama embed batch: expected %d embeddings, got %d", len(texts), len(result.Embeddings))
+	if len(result.Embeddings) != wantCount {
+		return nil, fmt.Errorf("ollama embed batch: expected %d embeddings, got %d", wantCount, len(result.Embeddings))
 	}
 	return result.Embeddings, nil
 }

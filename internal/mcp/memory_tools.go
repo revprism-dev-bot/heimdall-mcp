@@ -115,7 +115,7 @@ func (s *Server) toolRemember(args json.RawMessage) MCPToolResult {
 
 	// Embed the content
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := s.newOllamaClient()
 	if err := client.Ping(ctx); err != nil {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
@@ -269,7 +269,7 @@ func (s *Server) toolRecall(args json.RawMessage) MCPToolResult {
 	}
 
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := s.newOllamaClient()
 	if err := client.Ping(ctx); err != nil {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
@@ -310,7 +310,7 @@ func (s *Server) toolIngestSession(args json.RawMessage) MCPToolResult {
 	}
 
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := s.newOllamaClient()
 	if err := client.Ping(ctx); err != nil {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}

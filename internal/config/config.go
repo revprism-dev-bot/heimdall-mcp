@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 // Config holds the Heimdall MCP server configuration.
@@ -34,6 +35,21 @@ type Config struct {
 	// docs/plans/hooks/11a-design-decisions.md §5.4. Recommended value:
 	// "llama3.2:3b" (primary) with "qwen2.5-coder:3b" as fallback.
 	LLMClassifierModel string `json:"llmClassifierModel,omitempty"`
+	// EmbedMaxConcurrent caps in-flight Ollama /api/embed requests per
+	// OllamaClient. 0 means "use package default"
+	// (heimdall.DefaultEmbedMaxConcurrent). Env override:
+	// HEIMDALL_EMBED_MAX_CONCURRENT. Closes handoff Problem #5.
+	EmbedMaxConcurrent int `json:"embedMaxConcurrent,omitempty"`
+	// EmbedTimeoutMs is the per-request deadline (milliseconds) applied
+	// to Ollama /api/embed when the caller ctx has none. 0 means "use
+	// package default" (30 s). Env override: HEIMDALL_EMBED_TIMEOUT_MS.
+	EmbedTimeoutMs int `json:"embedTimeoutMs,omitempty"`
+	// EmbedMaxRetries is the number of retries applied to embed calls
+	// whose per-request deadline is exceeded. Caller ctx cancellation
+	// is NEVER retried. 0 disables retries. Negative = coerce to 0.
+	// Default (sentinel -1 means "unset → package default" = 2 retries).
+	// Env override: HEIMDALL_EMBED_MAX_RETRIES.
+	EmbedMaxRetries int `json:"embedMaxRetries,omitempty"`
 }
 
 // DefaultConfig returns sensible defaults.
@@ -63,11 +79,15 @@ func LoadConfig() Config {
 	cfg := DefaultConfig()
 	path := resolveConfigPath()
 	if path == "" {
+		// No config file — env overrides still apply so operators can
+		// tune Ollama concurrency without writing a config first.
+		applyEmbedEnvOverrides(&cfg)
 		return cfg
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
+		applyEmbedEnvOverrides(&cfg)
 		return cfg
 	}
 
@@ -112,7 +132,47 @@ func LoadConfig() Config {
 		cfg.EmbedBatchSize = defaults.EmbedBatchSize
 	}
 
+	// Env-var escape valves for Ollama concurrency / timeout / retry.
+	// These override JSON config on purpose — operators occasionally
+	// need to tune these on a single machine without editing config.
+	applyEmbedEnvOverrides(&cfg)
+
 	return cfg
+}
+
+// applyEmbedEnvOverrides reads the HEIMDALL_EMBED_* env vars and overrides
+// the relevant Config fields. Malformed values are logged and ignored so a
+// bad env var never crashes the server.
+func applyEmbedEnvOverrides(cfg *Config) {
+	if v := os.Getenv("HEIMDALL_EMBED_MAX_CONCURRENT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.EmbedMaxConcurrent = n
+		} else {
+			log.Printf("heimdall: ignoring malformed HEIMDALL_EMBED_MAX_CONCURRENT=%q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("HEIMDALL_EMBED_TIMEOUT_MS"); v != "" {
+		n, err := strconv.Atoi(v)
+		switch {
+		case err != nil:
+			log.Printf("heimdall: ignoring malformed HEIMDALL_EMBED_TIMEOUT_MS=%q: %v", v, err)
+		case n < 0:
+			log.Printf("heimdall: ignoring negative HEIMDALL_EMBED_TIMEOUT_MS=%q", v)
+		default:
+			cfg.EmbedTimeoutMs = n
+		}
+	}
+	if v := os.Getenv("HEIMDALL_EMBED_MAX_RETRIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		switch {
+		case err != nil:
+			log.Printf("heimdall: ignoring malformed HEIMDALL_EMBED_MAX_RETRIES=%q: %v", v, err)
+		case n < 0:
+			log.Printf("heimdall: ignoring negative HEIMDALL_EMBED_MAX_RETRIES=%q", v)
+		default:
+			cfg.EmbedMaxRetries = n
+		}
+	}
 }
 
 // SaveConfig writes the config to the resolved config path, creating the directory if needed.

@@ -364,6 +364,9 @@ Create `~/.config/heimdall-mcp/config.json` or use `heimdall_configure` / `heimd
   "lifecycleArchiveDays": 90,
   "maxChunksPerProject": 10000,
   "embedBatchSize": 32,
+  "embedMaxConcurrent": 2,
+  "embedTimeoutMs": 30000,
+  "embedMaxRetries": 2,
   "indexedPaths": []
 }
 ```
@@ -388,6 +391,9 @@ Config precedence:
 | `lifecycle.archive_days` | int | `90` | Days before content is pruned |
 | `max_chunks_per_project` | int | `10000` | Hard cap on chunks per project DB |
 | `embed_batch_size` | int | `32` | Maximum texts per embed API call to Ollama |
+| `embed_max_concurrent` | int | `2` | Max in-flight Ollama `/api/embed` requests per client. `0` = unbounded. Env: `HEIMDALL_EMBED_MAX_CONCURRENT` |
+| `embed_timeout_ms` | int | `30000` | Per-request embed deadline (ms) when caller ctx has none. Env: `HEIMDALL_EMBED_TIMEOUT_MS` |
+| `embed_max_retries` | int | `2` | Retries on per-request `context deadline exceeded`. Caller-ctx cancels are NOT retried. Env: `HEIMDALL_EMBED_MAX_RETRIES` |
 
 ## Embedding Models
 

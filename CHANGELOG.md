@@ -34,6 +34,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
   data when both dirs are populated (log-and-leave). Set
   `HEIMDALL_DISABLE_LEGACY_MIGRATION=1` to opt out of the rename while
   keeping the mixed-state reader active.
+- **Ollama: bounded parallelism on embed bursts** (closes handoff Problem #5).
+  Burst parallel embed calls from the indexer against a single-GPU Ollama
+  instance were deadline-exceeding (`context deadline exceeded`). The
+  `OllamaClient` now bounds concurrent `/api/embed` requests with a counting
+  semaphore (default cap = 2) shared across `Embed`, `EmbedForHook`, and
+  `EmbedBatch`. Per-request deadlines that fire (vs. caller-ctx cancellation)
+  are retried with configurable backoff (default 2 retries, 250 ms + 500 ms).
 
 ### Added
 
@@ -50,6 +57,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
 - **Added `dbPath` to `heimdall_status` output.**
   The resolved baseDir is now echoed so callers can confirm which store
   the MCP is reading without re-running resolution elsewhere.
+- `heimdall.NewOllamaClientWithLimit(endpoint, maxConcurrent int)` — additive
+  constructor. The original `NewOllamaClient(endpoint)` remains and now
+  applies `DefaultEmbedMaxConcurrent = 2` transparently for backward
+  compatibility.
+- `heimdall.NewOllamaClientWithOptions(endpoint, OllamaOptions)` — full
+  tunables: `MaxConcurrent`, `EmbedTimeout`, `MaxRetries`, `RetryBackoff`.
+- `heimdall.NewOllamaClientFromConfig(endpoint, maxConcurrent, timeoutMs, maxRetries int)`
+  — convenience wiring for `Config.EmbedMaxConcurrent` /
+  `Config.EmbedTimeoutMs` / `Config.EmbedMaxRetries`.
+- New config keys:
+  - `embedMaxConcurrent` (int, default 2; `0` = unbounded)
+  - `embedTimeoutMs` (int, default 30000)
+  - `embedMaxRetries` (int, default 2)
+- New env-var overrides:
+  - `HEIMDALL_EMBED_MAX_CONCURRENT`
+  - `HEIMDALL_EMBED_TIMEOUT_MS`
+  - `HEIMDALL_EMBED_MAX_RETRIES`
+
+### Changed
+
+- All MCP tools now construct the Ollama client through the central
+  `Server.newOllamaClient()` helper so config-driven concurrency / timeout
+  / retry tunables take effect globally.
+- Per-request embed deadline is now `min(caller_deadline, embedTimeout)`.
+  This caps runaway single embed calls that previously inherited huge
+  caller deadlines (e.g. the 24h ctx used by the indexer).
+
+### Notes
+
+- Retries are scoped strictly to `context.DeadlineExceeded` from our
+  per-request timeout. Caller-ctx cancellation and non-timeout errors
+  (HTTP 4xx/5xx, decode failures) are NOT retried.
+- `MaxConcurrent = 0` is an explicit opt-out for callers that manage
+  concurrency upstream. Negative values coerce to the default with a
+  one-line WARN log.
 
 ### Tests
 
