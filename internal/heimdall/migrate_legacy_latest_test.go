@@ -172,22 +172,68 @@ func TestMigrateLegacyLatestDir_Idempotent(t *testing.T) {
 
 // TestMigrateLegacyLatestDir_DisabledByEnvVar — HEIMDALL_DISABLE_LEGACY_MIGRATION=1
 // short-circuits the rename. Legacy dir remains in place.
+//
+// Also exercises common alternative truthy forms (`true`, `TRUE`, `yes`,
+// `on`, whitespace-padded `" 1 "`) to guard against the brittle literal
+// comparison that previously only accepted the string "1". strconv.ParseBool
+// accepts `1/t/T/TRUE/true/True/0/f/F/FALSE/false/False`; `yes`/`on` are
+// common operator reflexes and are normalized to true before ParseBool.
 func TestMigrateLegacyLatestDir_DisabledByEnvVar(t *testing.T) {
-	baseDir := t.TempDir()
-	const model = "nomic-embed-text"
-	legacy := seedLegacyDir(t, baseDir, model, 100)
-
-	t.Setenv("HEIMDALL_DISABLE_LEGACY_MIGRATION", "1")
-
-	migrated, err := MigrateLegacyLatestDir(baseDir, model)
-	if err != nil {
-		t.Fatalf("err: %v", err)
+	cases := []struct {
+		name string
+		env  string
+	}{
+		{"literal-1", "1"},
+		{"lowercase-true", "true"},
+		{"uppercase-TRUE", "TRUE"},
+		{"mixedcase-True", "True"},
+		{"whitespace-padded-1", " 1 "},
+		{"yes", "yes"},
+		{"on", "on"},
 	}
-	if migrated {
-		t.Errorf("migrated=true while env var opts out; want false")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			baseDir := t.TempDir()
+			const model = "nomic-embed-text"
+			legacy := seedLegacyDir(t, baseDir, model, 100)
+
+			t.Setenv("HEIMDALL_DISABLE_LEGACY_MIGRATION", tc.env)
+
+			migrated, err := MigrateLegacyLatestDir(baseDir, model)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			if migrated {
+				t.Errorf("migrated=true while env var %q opts out; want false", tc.env)
+			}
+			if _, err := os.Stat(legacy); err != nil {
+				t.Errorf("legacy dir must remain when migration is disabled: %v", err)
+			}
+		})
 	}
-	if _, err := os.Stat(legacy); err != nil {
-		t.Errorf("legacy dir must remain when migration is disabled: %v", err)
+}
+
+// TestMigrateLegacyLatestDir_EnvVarUnrecognizedValueDoesNotOptOut — values
+// that are not recognized truthy forms must NOT opt out (fail-safe: default
+// behaviour is to migrate).
+func TestMigrateLegacyLatestDir_EnvVarUnrecognizedValueDoesNotOptOut(t *testing.T) {
+	cases := []string{"0", "false", "no", "off", "", "bogus"}
+	for _, v := range cases {
+		t.Run("value="+v, func(t *testing.T) {
+			baseDir := t.TempDir()
+			const model = "nomic-embed-text"
+			seedLegacyDir(t, baseDir, model, 100)
+
+			t.Setenv("HEIMDALL_DISABLE_LEGACY_MIGRATION", v)
+
+			migrated, err := MigrateLegacyLatestDir(baseDir, model)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			if !migrated {
+				t.Errorf("migrated=false for non-truthy env %q; expected migration to proceed", v)
+			}
+		})
 	}
 }
 
@@ -381,5 +427,93 @@ func TestMigrateDisabled_WritesStillGoToCanonical(t *testing.T) {
 	_, _ = MigrateLegacyLatestDir(baseDir, model)
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("disabled-env fast-path took %v, want <2s", elapsed)
+	}
+}
+
+// TestMigrateLegacyLatestDir_StaleLockRecovered — a lock file that predates
+// the stale-lock threshold must be removed and migration must proceed.
+// This covers the Ctrl-C / SIGKILL / os.Exit lock-leak scenario from the
+// concurrency review: defers do not run on os.Exit, so an old lock file
+// remains on disk. Without stale-lock recovery, every subsequent run
+// silently returns (false, nil) and the user is permanently stuck.
+func TestMigrateLegacyLatestDir_StaleLockRecovered(t *testing.T) {
+	baseDir := t.TempDir()
+	const model = "nomic-embed-text"
+	seedLegacyDir(t, baseDir, model, 100)
+
+	// Create a stale lock file, touched to appear older than the stale
+	// threshold.
+	sanitized := sanitizeModelDirName(NormalizeModelName(model))
+	lockPath := filepath.Join(baseDir, ".heimdall-legacy-migrate-"+sanitized+".lock")
+	if err := os.WriteFile(lockPath, nil, 0600); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	// Set mtime well into the past (2 hours ago — older than the
+	// default 10-minute stale threshold).
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(lockPath, past, past); err != nil {
+		t.Fatalf("chtimes lock: %v", err)
+	}
+
+	migrated, err := MigrateLegacyLatestDir(baseDir, model)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !migrated {
+		t.Fatalf("stale lock was not recovered — migration silently skipped (migrated=false)")
+	}
+
+	// Legacy must be gone; canonical must hold the row.
+	legacyPath := filepath.Join(baseDir, sanitized+"_latest")
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Errorf("legacy should be gone after stale-lock recovery: err=%v", err)
+	}
+	canonical := filepath.Join(baseDir, sanitized)
+	if n := countRowsAt(filepath.Join(canonical, "vectors.db")); n != 1 {
+		t.Errorf("canonical row count = %d, want 1", n)
+	}
+
+	// The lock file itself must be cleaned up after a successful run.
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Errorf("lock file should have been cleaned up: stat err=%v", err)
+	}
+}
+
+// TestMigrateLegacyLatestDir_FreshLockDefersToActiveProcess — a lock file
+// that is NEWER than the stale threshold represents a currently-running
+// migration. Migration must no-op to avoid double-rename. We also expect
+// the lock file itself to be preserved (the other process still owns it).
+func TestMigrateLegacyLatestDir_FreshLockDefersToActiveProcess(t *testing.T) {
+	baseDir := t.TempDir()
+	const model = "nomic-embed-text"
+	seedLegacyDir(t, baseDir, model, 100)
+
+	sanitized := sanitizeModelDirName(NormalizeModelName(model))
+	lockPath := filepath.Join(baseDir, ".heimdall-legacy-migrate-"+sanitized+".lock")
+	if err := os.WriteFile(lockPath, nil, 0600); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	// Fresh mtime — simulates an active concurrent process.
+	now := time.Now()
+	if err := os.Chtimes(lockPath, now, now); err != nil {
+		t.Fatalf("chtimes lock: %v", err)
+	}
+
+	migrated, err := MigrateLegacyLatestDir(baseDir, model)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if migrated {
+		t.Errorf("fresh lock should defer; migrated=true indicates we stomped an active process")
+	}
+
+	// Legacy still present (we deferred).
+	legacyPath := filepath.Join(baseDir, sanitized+"_latest")
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Errorf("legacy must remain when we defer to an active process: %v", err)
+	}
+	// Lock file preserved (the other process owns it).
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Errorf("fresh lock must be preserved, not stomped: %v", err)
 	}
 }

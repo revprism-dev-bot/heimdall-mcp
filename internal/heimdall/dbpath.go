@@ -100,13 +100,19 @@ func pickLegacyOverCanonical(legacyDir, canonicalDir string) bool {
 // value. Returns (0, false) if the DB can't be opened or queried (e.g.
 // missing file, corrupt, or table absent). A fresh store with no rows
 // returns (0, true).
+//
+// DSN matches the writer side (`store.go:OpenStore`): `_journal_mode=WAL`
+// + `_busy_timeout=5000`. DO NOT add `immutable=1` — per SQLite docs,
+// immutable=1 instructs the driver that the file will not change and
+// allows it to bypass the WAL, which would return a stale snapshot when
+// a concurrent writer has un-checkpointed rows in the WAL. The reader
+// acquires a shared lock on the WAL; writer contention is handled by
+// SQLite's own busy-timeout.
 func maxModTimeFromDB(dbPath string) (int64, bool) {
 	if _, err := os.Stat(dbPath); err != nil {
 		return 0, false
 	}
-	// immutable=1 + mode=ro ensures we don't create/modify the file and
-	// avoids lock contention with an open writer in another process.
-	db, err := sql.Open("sqlite", dbPath+"?mode=ro&immutable=1")
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return 0, false
 	}

@@ -247,3 +247,43 @@ type stubModelLister struct{ models []ModelInfo }
 func (s stubModelLister) ListModels(_ context.Context) ([]ModelInfo, error) {
 	return s.models, nil
 }
+
+// TestMaxModTimeFromDB_ReadsWALWrites — concurrency review CRITICAL finding.
+// When a writer has un-checkpointed rows in the WAL, maxModTimeFromDB must
+// still see them. Previously the function opened with `?mode=ro&immutable=1`,
+// which tells SQLite to bypass the WAL and read the main DB file directly
+// — under a live writer, this returns a stale snapshot.
+//
+// Scenario: open a store, upsert a row with mod_time=42, DO NOT close (WAL
+// frames remain uncheckpointed). Call maxModTimeFromDB from a separate
+// connection. With immutable=1 this returned 0/false (or a stale value);
+// with the fix (plain WAL reader) it returns (42, true).
+func TestMaxModTimeFromDB_ReadsWALWrites(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// Hold the writer open for the whole test so any WAL pages remain
+	// uncheckpointed on disk.
+	t.Cleanup(func() { _ = store.Close() })
+
+	const want int64 = 42
+	if err := store.Upsert([]VectorRecord{{
+		ID:        "wal:seed",
+		FilePath:  "seed.go",
+		Content:   "seed",
+		Embedding: []float32{1, 0, 0, 0},
+		ModTime:   want,
+	}}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	got, ok := maxModTimeFromDB(filepath.Join(dir, "vectors.db"))
+	if !ok {
+		t.Fatalf("maxModTimeFromDB not ok — open with immutable=1 can bypass the WAL")
+	}
+	if got != want {
+		t.Fatalf("maxModTimeFromDB = %d, want %d (reader did not see un-checkpointed WAL write)", got, want)
+	}
+}

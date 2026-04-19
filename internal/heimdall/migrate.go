@@ -5,15 +5,59 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // DisableLegacyMigrationEnv is the environment variable callers can set to
-// "1" to opt out of the `<model>_latest/` → `<model>/` rename performed by
-// MigrateLegacyLatestDir. Everything else in the read path still works —
-// ModelDBDir's mixed-state reader picks the populated dir — but no data is
-// moved on disk. Useful when a user wants to audit the mixed state
-// manually (e.g. `heimdall-mcp cleanup-legacy-latest`, follow-up New-OQ-3).
+// a truthy value to opt out of the `<model>_latest/` → `<model>/` rename
+// performed by MigrateLegacyLatestDir. Everything else in the read path
+// still works — ModelDBDir's mixed-state reader picks the populated dir —
+// but no data is moved on disk. Useful when a user wants to audit the
+// mixed state manually (e.g. `heimdall-mcp cleanup-legacy-latest`,
+// follow-up New-OQ-3).
+//
+// Accepted truthy values are any strconv.ParseBool-recognized form
+// (`1`, `t`, `true`, `TRUE`, etc.) plus the common operator reflexes
+// `yes` and `on`, case-insensitive. Whitespace is trimmed. Any other
+// value is treated as "not set" and migration proceeds normally — this
+// fail-safe default ensures a misconfigured env var never silently
+// masks a legitimate migration need.
 const DisableLegacyMigrationEnv = "HEIMDALL_DISABLE_LEGACY_MIGRATION"
+
+// staleLockThreshold is the age beyond which a lock file is assumed to
+// be orphaned by a prior crashed process (Ctrl-C / SIGKILL / os.Exit
+// paths that skip defers). Deliberately generous: a healthy migration
+// typically takes seconds, so 10 minutes is >10x the 99th-percentile
+// hot-path runtime. Stale-lock recovery logs both the detection and the
+// cleanup so operators can audit.
+const staleLockThreshold = 10 * time.Minute
+
+// envDisablesLegacyMigration reports whether the opt-out env var is set
+// to any recognized truthy value. Uses strconv.ParseBool semantics plus
+// `yes`/`on` normalization, with whitespace tolerance. Any unrecognized
+// value (including the empty string, `0`, `false`, `no`, `off`, or any
+// bogus value) returns false → migration proceeds. This avoids the
+// brittle `os.Getenv(...) == "1"` pattern flagged by PR #73 review.
+func envDisablesLegacyMigration() bool {
+	raw := strings.TrimSpace(os.Getenv(DisableLegacyMigrationEnv))
+	if raw == "" {
+		return false
+	}
+	// Normalize common reflexes that strconv.ParseBool rejects.
+	switch strings.ToLower(raw) {
+	case "yes", "on":
+		return true
+	case "no", "off":
+		return false
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false
+	}
+	return v
+}
 
 // MigrateDBDir renames .viking_db/ to .heimdall_db/ if the old dir exists
 // and the new one does not. Uses a lock file to prevent TOCTOU races when
@@ -152,7 +196,7 @@ func MigrateToModelDir(baseDir, model string) {
 // This function only renames. It never deletes data. If any invariant
 // fails mid-way, we log and return false without touching the filesystem.
 func MigrateLegacyLatestDir(baseDir, model string) (bool, error) {
-	if os.Getenv(DisableLegacyMigrationEnv) == "1" {
+	if envDisablesLegacyMigration() {
 		return false, nil
 	}
 	sanitized := sanitizeModelDirName(NormalizeModelName(model))
@@ -182,21 +226,31 @@ func MigrateLegacyLatestDir(baseDir, model string) (bool, error) {
 	}
 
 	// Acquire an exclusive lock file keyed by model so two writer entry
-	// points can't race to rename the same dir. Short-circuit if another
-	// process already holds it — they'll finish the migration, and our
-	// second-attempt post-lock check will observe legacy-gone.
+	// points can't race to rename the same dir.
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return false, err
 	}
 	lockPath := filepath.Join(baseDir, ".heimdall-legacy-migrate-"+sanitized+".lock")
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+
+	lock, err := acquireMigrationLock(lockPath)
 	if err != nil {
-		// Contention: another process is migrating; treat as no-op for
-		// the caller (the other side is responsible).
+		// Contention with a healthy peer; treat as no-op for the caller.
 		return false, nil
 	}
-	defer os.Remove(lockPath)
-	defer lock.Close()
+
+	// Explicit single-defer with logged errors. LIFO defers would ALSO
+	// produce the correct close-then-remove order, but relying on that is
+	// fragile (a later maintainer reordering the statements would break
+	// Windows cleanup). Logging surfaces cleanup failures instead of
+	// silently leaking the lock file into a permanent future no-op.
+	defer func() {
+		if err := lock.Close(); err != nil {
+			log.Printf("heimdall: lock.Close %s: %v", lockPath, err)
+		}
+		if err := os.Remove(lockPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("heimdall: os.Remove(%s): %v — manual cleanup may be required if it persists", lockPath, err)
+		}
+	}()
 
 	// Re-check legacy exists and canonical doesn't, after acquiring the
 	// lock. Another migration may have completed while we waited.
@@ -228,6 +282,59 @@ func MigrateLegacyLatestDir(baseDir, model string) (bool, error) {
 	}
 	log.Printf("heimdall: migrated legacy model dir %s → %s", legacy, canonical)
 	return true, nil
+}
+
+// acquireMigrationLock attempts O_EXCL creation of lockPath. On EEXIST it
+// stat-s the existing lock file; if the file is older than
+// staleLockThreshold, it logs a WARN, removes it, and retries once.
+// Returns the opened *os.File on success or the underlying error if
+// contention remains (typical case: a peer is legitimately running).
+//
+// Rationale: Go's `defer` does NOT run on os.Exit / SIGKILL, so any
+// crash between lock acquisition and the deferred cleanup leaves the
+// lock file permanently on disk. Without this recovery, a user who
+// Ctrl-C's a long-running reindex on Mac ends up silently stuck on the
+// pre-migration legacy path forever (every subsequent run sees EEXIST
+// and returns false, nil). See PR #73 concurrency review CRITICAL
+// finding #1.
+func acquireMigrationLock(lockPath string) (*os.File, error) {
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err == nil {
+		return lock, nil
+	}
+	if !os.IsExist(err) {
+		// Any error other than "already exists" is a real failure
+		// (permission denied, etc.) — surface it.
+		return nil, err
+	}
+
+	// EEXIST — inspect the age of the existing lock.
+	info, statErr := os.Stat(lockPath)
+	if statErr != nil {
+		// The lock file disappeared between OpenFile and Stat — treat as
+		// "not ours to claim this pass" and let the caller no-op. A
+		// subsequent invocation will get a clean OpenFile.
+		return nil, err
+	}
+	age := time.Since(info.ModTime())
+	if age < staleLockThreshold {
+		// A healthy peer is working; defer.
+		return nil, err
+	}
+
+	log.Printf("heimdall: stale legacy-migration lock at %s (age=%s > %s); removing and retrying — likely from a prior SIGKILL/Ctrl-C crash", lockPath, age.Round(time.Second), staleLockThreshold)
+	if rmErr := os.Remove(lockPath); rmErr != nil && !os.IsNotExist(rmErr) {
+		log.Printf("heimdall: could not remove stale lock %s: %v (giving up this pass)", lockPath, rmErr)
+		return nil, err
+	}
+	// Single retry. If we lose a genuine race here (another process
+	// raced us to recover the stale lock), the second EEXIST is reported
+	// as contention — safe.
+	lock, retryErr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if retryErr != nil {
+		return nil, retryErr
+	}
+	return lock, nil
 }
 
 // readEmbeddingModel opens a vectors.db read-only and reads the embedding_model
