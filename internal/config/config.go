@@ -94,7 +94,7 @@ type Config struct {
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		OllamaEndpoint:       "http://localhost:11434",
+		OllamaEndpoint:       "http://127.0.0.1:11434",
 		Model:                "nomic-embed-text",
 		ContextDepth:         1,
 		MaxContextTokens:     4096,

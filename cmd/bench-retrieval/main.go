@@ -493,7 +493,7 @@ func main() {
 		topK        = flag.Int("top-k", 10, "results per search")
 		expandRate  = flag.Float64("expand-rate", 0.2, "fraction of results the caller would expand")
 		format      = flag.String("format", "text", "text|json")
-		ollamaHost  = flag.String("ollama", "http://localhost:11434", "Ollama endpoint")
+		ollamaHost  = flag.String("ollama", "http://127.0.0.1:11434", "Ollama endpoint")
 		modelFlag   = flag.String("model", "nomic-embed-text", "embedding model name")
 	)
 	flag.Parse()

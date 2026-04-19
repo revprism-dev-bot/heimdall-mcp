@@ -8,6 +8,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
 
 ## [Unreleased]
 
+### Changed
+
+- **Default `ollamaEndpoint` is now `http://127.0.0.1:11434`** (was `http://localhost:11434`).
+  On macOS and some Linux configurations, `localhost` resolves to `::1` (IPv6)
+  while Ollama's `ollama serve` binds IPv4 `127.0.0.1` only, producing spurious
+  "Ollama not reachable" errors when the daemon is actually running. Using the
+  literal IPv4 address removes that resolution surprise. Users with a custom
+  `ollamaEndpoint` in `config.json` or `HEIMDALL_OLLAMA_ENDPOINT` are unaffected.
+
 ### Upgrade notes
 
 - **`embed_max_concurrent: 0` now means UNBOUNDED** (previously silently
