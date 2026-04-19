@@ -1099,6 +1099,554 @@ docs/plans/claude-heimdall-self-use/."
 
 ---
 
+## Task 6 (P0.5 Unit F+G): MCP tool-call logging + UserPromptSubmit auto-inject logging + log-rotation bump
+
+**Goal:** Close the observability gap for Claude's direct heimdall usage. Today `hooks.log` records hook firings but not which MCP tools Claude called, and UserPromptSubmit logs that it fired but not *what* it injected. After this task, every heimdall tool call and every auto-inject fires one structured log line — enough for `hooks tail -e user-prompt -e mcp.tool_call` to show whether Claude actually engaged.
+
+**Files:**
+- Modify: `internal/mcp/server.go` — wrap the `handleToolsCall` dispatch with logging.
+- Modify: `internal/cli/hook_user_prompt.go` — extend the existing "injected" log line with content hash, byte count, and top-hit file names.
+- Modify: `internal/heimdall/hooklog.go` — bump `maxLogSize` from 10 MB to 20 MB. Update the comment that mentions the "10 MB" figure.
+- Test: `internal/mcp/server_test.go` — add `TestHandleToolsCall_LogsEveryInvocation`.
+- Test: `internal/cli/hook_user_prompt_test.go` — extend existing happy-path test to assert `auto_inject_bytes` and `auto_inject_hash` keys are present.
+
+### Step 6.1: Write failing tests
+
+In `internal/mcp/server_test.go`:
+
+```go
+func TestHandleToolsCall_LogsEveryInvocation(t *testing.T) {
+	// Capture log lines via a temporary HEIMDALL_HOOK_LOG path.
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	// Build a minimal server that can handle heimdall_status (doesn't require
+	// a live index). We just need the dispatcher to run.
+	s := newTestServer(t) // reuse existing helper if present; otherwise inline
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"heimdall_status","arguments":{}}`),
+	}
+	_ = s.handleToolsCall(req)
+
+	body, err := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if err != nil {
+		t.Fatalf("hooks.log not written: %v", err)
+	}
+	s2 := string(body)
+	if !strings.Contains(s2, "event=mcp.tool_call") {
+		t.Errorf("expected event=mcp.tool_call in log; got %s", s2)
+	}
+	if !strings.Contains(s2, `tool=heimdall_status`) {
+		t.Errorf("expected tool=heimdall_status in log; got %s", s2)
+	}
+	if !strings.Contains(s2, "duration_ms=") {
+		t.Errorf("expected duration_ms field in log; got %s", s2)
+	}
+}
+```
+
+If `newTestServer(t)` doesn't exist, inline the minimal setup: `s := &Server{Cfg: config.DefaultConfig()}`. It's fine if `toolStatus` returns an error result for lack of index — the dispatcher still fires the log line.
+
+In `internal/cli/hook_user_prompt_test.go`, add or extend the existing happy-path test so it asserts on the new fields. At minimum, add:
+
+```go
+func TestHookUserPrompt_LogsAutoInjectFields(t *testing.T) {
+	// Set up an indexed project + fire the hook with a prompt that produces
+	// at least one hit. Capture hooks.log. Assert:
+	//   - auto_inject_bytes=<n> present and > 0
+	//   - auto_inject_hash=<12-char hex> present
+	//   - top_hit_files=[…] present when hits > 0
+	// (Use existing test-fixture patterns from TestHookUserPrompt_Happy if present.)
+}
+```
+
+Follow whatever fixture pattern the file already uses for happy-path tests (look for the existing test that verifies the injected context line).
+
+### Step 6.2: Run tests → fail
+
+Run: `go test ./internal/mcp/ -run TestHandleToolsCall_LogsEveryInvocation -v` → FAIL.
+Run: `go test ./internal/cli/ -run TestHookUserPrompt_LogsAutoInjectFields -v` → FAIL.
+
+### Step 6.3: Instrument `handleToolsCall`
+
+In `internal/mcp/server.go`, modify `handleToolsCall` to log every tool invocation with timing, input size, and error flag. Replace the switch-and-return pattern with a small wrapper:
+
+```go
+func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
+	var params struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return &JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error:   &RPCError{Code: -32602, Message: "invalid params: " + err.Error()},
+		}
+	}
+
+	start := time.Now()
+	var result MCPToolResult
+	switch params.Name {
+	case "heimdall_search":
+		result = s.toolSearch(params.Arguments)
+	// … (existing cases unchanged) …
+	default:
+		heimdall.LogHookEvent("WARN", "mcp.tool_call", map[string]any{
+			"tool":  params.Name,
+			"err":   "unknown_tool",
+		})
+		return &JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error:   &RPCError{Code: -32602, Message: "unknown tool: " + params.Name},
+		}
+	}
+
+	// Structured log for every successful dispatch. Field choices:
+	//   tool        — which MCP tool ran
+	//   duration_ms — wall-clock time of the handler
+	//   input_bytes — size of the arguments JSON
+	//   is_error    — whether result.IsError is true
+	//   result_size — approximate byte size of the rendered result
+	heimdall.LogHookEvent("INFO", "mcp.tool_call", map[string]any{
+		"tool":        params.Name,
+		"duration_ms": time.Since(start).Milliseconds(),
+		"input_bytes": len(params.Arguments),
+		"is_error":    result.IsError,
+		"result_size": resultSize(result),
+	})
+
+	return &JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+}
+
+// resultSize returns the approximate total byte count of text content blocks
+// in an MCPToolResult. Used for observability, not correctness.
+func resultSize(r MCPToolResult) int {
+	n := 0
+	for _, c := range r.Content {
+		n += len(c.Text)
+	}
+	return n
+}
+```
+
+Preserve every existing switch-case tool name unchanged; only wrap the dispatch with `start := time.Now()` + the trailing log line + add the unknown-tool log.
+
+### Step 6.4: Extend UserPromptSubmit logging
+
+In `internal/cli/hook_user_prompt.go`, find the existing "injected" log-event line (the one at the end of a successful run, around line 356 based on the current grep). Replace the fields map with one that includes:
+
+```go
+import "crypto/sha256"
+import "encoding/hex"
+
+// …
+
+hash := sha256.Sum256(injectedBytes)
+topHitFiles := extractTopHitFiles(hits, 3) // first 3 distinct file paths from the hit list
+
+logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
+	"stage":              "injected", // existing key; keep
+	"hits":               len(hits),    // existing key
+	// … existing keys … //
+	"auto_inject_bytes":  len(injectedBytes),
+	"auto_inject_hash":   hex.EncodeToString(hash[:6]), // 12-hex-char prefix
+	"top_hit_files":      topHitFiles,
+})
+```
+
+Where `injectedBytes` is the final content string served to Claude. If the hook currently builds that string in a variable named differently, adapt — the intent is to hash exactly what gets injected. Add a small helper `extractTopHitFiles(hits []someHit, n int) []string` if the shape of `hits` in that file doesn't already expose file paths.
+
+Do not change any existing fields in the log line — only add the three new ones.
+
+### Step 6.5: Bump log rotation
+
+In `internal/heimdall/hooklog.go`, find the `maxLogSize` constant (currently 10 MB). Change to 20 MB:
+
+```go
+// maxLogSize caps the hooks.log file. When a write would cross this size,
+// the current file is rotated (renamed to .1) and a fresh file started.
+// 20 MB comfortably fits a week of verbose single-user logs including
+// per-MCP-tool-call entries; bump if usage pattern changes.
+const maxLogSize = 20 * 1024 * 1024
+```
+
+Update the comment above the constant (and any in-file reference to "10 MB") to reflect 20 MB. Do not change rotation logic.
+
+### Step 6.6: Run tests → pass
+
+Run: `go test ./internal/mcp/ -run TestHandleToolsCall -v` → PASS.
+Run: `go test ./internal/cli/ -run TestHookUserPrompt_LogsAutoInjectFields -v` → PASS.
+Run: `go test ./... -count=1` → no regressions.
+
+### Step 6.7: Commit
+
+```bash
+git add internal/mcp/server.go internal/mcp/server_test.go internal/cli/hook_user_prompt.go internal/cli/hook_user_prompt_test.go internal/heimdall/hooklog.go
+git commit -m "feat(observability): log every MCP tool call + UserPromptSubmit inject content
+
+Every handleToolsCall dispatch now emits a structured hooks.log line
+with tool name, duration_ms, input_bytes, is_error, result_size — so
+hooks tail -e mcp.tool_call answers 'did Claude actually call
+heimdall_*?' Also extends UserPromptSubmit's 'injected' log line with
+auto_inject_bytes, auto_inject_hash (12-char sha256 prefix), and
+top_hit_files, so the injected context can be correlated with Claude's
+subsequent tool use or non-use. Bumps hooks.log rotation 10MB→20MB to
+accommodate the new verbosity. Addresses P0.5-a observability gap."
+```
+
+---
+
+## Task 7 (P0.5 Unit H+I): missed-call analyzer + analyze-session CLI
+
+**Goal:** Detect and report cases where Claude *should* have called a heimdall tool but didn't. Uses the trigger→action pairs from the rewritten MCP instruction block as a rule registry. Integrates into SessionEnd (extends `last-session-review.json` with a `misses` field) so the next-session nag can name specific rule violations, not just raw candidate counts. Also exposes an ad-hoc CLI (`heimdall-mcp hooks analyze-session`) for poking at historical transcripts.
+
+**Files:**
+- Create: `internal/cli/missed_calls.go` — rule registry + analyzer.
+- Create: `internal/cli/missed_calls_test.go` — fixture-based tests.
+- Create: `internal/cli/testdata/transcript_missed_read.jsonl` — big Read without heimdall_search.
+- Create: `internal/cli/testdata/transcript_missed_correction.jsonl` — correction without heimdall_remember.
+- Create: `internal/cli/testdata/transcript_all_compliant.jsonl` — trigger → matching tool call.
+- Modify: `internal/cli/hook_stop.go` — call the analyzer in `HookSessionEnd`, feed results into `writeLastSessionReview`.
+- Modify: `internal/cli/hook.go` — extend `lastSessionReview` type + `renderLastSessionReview` to surface misses.
+- Modify: `internal/cli/hooks.go` (or wherever the admin-hooks dispatcher lives) — add `analyze-session` subcommand.
+- Test: `internal/cli/hook_stop_test.go` — add `TestHookSessionEnd_RecordsMissesInReview`.
+- Test: `internal/cli/hook_test.go` — add `TestRenderLastSessionReview_SurfacesMisses`.
+
+### Step 7.1: Define the rule registry and analyzer
+
+Create `internal/cli/missed_calls.go`:
+
+```go
+package cli
+
+import (
+	"bytes"
+	"encoding/json"
+	"regexp"
+	"strings"
+)
+
+// MissedCall is one detected rule violation: a trigger fired in the
+// transcript but the expected heimdall tool call did not happen within
+// the rule's allowed window.
+type MissedCall struct {
+	Rule           string // "read_large_file" | "user_correction" | "external_content" | "task_start_recall"
+	ExpectedTool   string // heimdall_search / heimdall_remember / heimdall_index_text / heimdall_recall
+	TriggerExcerpt string // ≤ 200 chars describing what triggered the rule
+	TurnIndex      int    // zero-based index in the transcript
+}
+
+// AnalysisResult summarizes one transcript's compliance with the
+// trigger→action rules. `Triggers` is the total number of rule firings;
+// `Followed` is how many had the expected tool call within window.
+// Misses = Triggers - Followed. The per-rule Misses list carries detail
+// for display in the last-session-review block.
+type AnalysisResult struct {
+	Triggers int
+	Followed int
+	Misses   []MissedCall
+}
+
+// AnalyzeTranscript runs all four rules over a raw JSONL transcript and
+// returns the AnalysisResult. Transcript shape: one JSON object per line;
+// each object has "role" and "content" (either a string or a list of
+// content blocks). Tool calls appear as content blocks of type "tool_use"
+// with a "name" field; tool results as blocks of type "tool_result".
+func AnalyzeTranscript(data []byte) AnalysisResult {
+	msgs := parseTranscriptMessages(data) // shared helper, see below
+	var out AnalysisResult
+	for _, r := range rules {
+		triggers, followed, misses := r.evaluate(msgs)
+		out.Triggers += triggers
+		out.Followed += followed
+		out.Misses = append(out.Misses, misses...)
+	}
+	return out
+}
+
+// rule is an internal representation of one trigger→action pair. Each rule
+// decides for itself what counts as a trigger and which tool name satisfies
+// it within which window.
+type rule struct {
+	name         string
+	expectedTool string
+	evaluate     func([]parsedMsg) (triggers, followed int, misses []MissedCall)
+}
+
+// parsedMsg is the common representation used across the four rule
+// evaluators. Content is already flattened to text for marker scanning;
+// ContentBlocks is retained for tool_use / tool_result inspection.
+type parsedMsg struct {
+	Role          string
+	Content       string
+	ContentBlocks []map[string]any
+	Index         int
+}
+
+// Rule set. Four rules mirroring the trigger→action pairs in the MCP
+// instruction block. Kept in one place so the instruction block and the
+// analyzer stay in sync — if you add a pair to the block, add a rule here.
+var rules = []rule{
+	{
+		name:         "read_large_file",
+		expectedTool: "heimdall_search",
+		evaluate: func(msgs []parsedMsg) (int, int, []MissedCall) {
+			return evaluateReadLargeFile(msgs)
+		},
+	},
+	{
+		name:         "user_correction",
+		expectedTool: "heimdall_remember",
+		evaluate: func(msgs []parsedMsg) (int, int, []MissedCall) {
+			return evaluateUserCorrection(msgs)
+		},
+	},
+	{
+		name:         "external_content",
+		expectedTool: "heimdall_index_text",
+		evaluate: func(msgs []parsedMsg) (int, int, []MissedCall) {
+			return evaluateExternalContent(msgs)
+		},
+	},
+	{
+		name:         "task_start_recall",
+		expectedTool: "heimdall_recall",
+		evaluate: func(msgs []parsedMsg) (int, int, []MissedCall) {
+			return evaluateTaskStartRecall(msgs)
+		},
+	},
+}
+
+// evaluateReadLargeFile: a Read tool_result with > 200 newlines triggers
+// the rule. The expected call is heimdall_search within the same assistant
+// turn OR the immediately preceding assistant turn.
+func evaluateReadLargeFile(msgs []parsedMsg) (int, int, []MissedCall) {
+	// … implementation walks tool_result blocks, counts newlines in the
+	// "content" field (or "text" subfield if it's a block array), then
+	// scans ±1 assistant turn for a tool_use block with name=="heimdall_search".
+}
+
+// evaluateUserCorrection: a user message matching the correction regex
+// from hook_stop.go (or a duplicate of it — see note below) triggers the
+// rule. Expected: heimdall_remember in the next assistant turn.
+func evaluateUserCorrection(msgs []parsedMsg) (int, int, []MissedCall) {
+	// … implementation reuses the correction regex. Do not import from
+	// hook_stop.go; duplicate the regex literal here and add a comment
+	// pointing to the source of truth (the trigger pair in the MCP
+	// instruction block).
+}
+
+// evaluateExternalContent: a tool_result from WebFetch OR from an MCP tool
+// outside the heimdall_* namespace, with > 500 chars content, triggers the
+// rule. Expected: heimdall_index_text in the next assistant turn.
+func evaluateExternalContent(msgs []parsedMsg) (int, int, []MissedCall) {
+	// …
+}
+
+// evaluateTaskStartRecall: the FIRST user message whose content matches
+// the "past decisions / plans / architecture" regex triggers the rule.
+// Expected: heimdall_recall in the first 3 assistant turns.
+func evaluateTaskStartRecall(msgs []parsedMsg) (int, int, []MissedCall) {
+	// …
+}
+
+// regex for the task-start recall trigger — keep wording aligned with the
+// MCP instruction bullet: "task that references past decisions, plans,
+// or prior architecture".
+var taskStartPattern = regexp.MustCompile(`(?i)\bpast decisions?\b|\bplan(s|ning)?\b|\barchitecture\b|\bprior(\s+issues?)?\b`)
+
+// parseTranscriptMessages is shared between AnalyzeTranscript and
+// countHeimdallWrites. Moves the transcript-walk logic here so it has one
+// home. If hook_stop.go already has an equivalent, refactor to use this
+// one (keep the public types in hook_stop.go; just share the parser).
+func parseTranscriptMessages(data []byte) []parsedMsg {
+	var msgs []parsedMsg
+	for i, line := range bytes.Split(data, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if json.Unmarshal(line, &entry) != nil {
+			continue
+		}
+		role, _ := entry["role"].(string)
+		if role == "" {
+			continue
+		}
+		p := parsedMsg{Role: role, Index: i}
+		switch v := entry["content"].(type) {
+		case string:
+			p.Content = v
+		case []any:
+			var parts []string
+			for _, block := range v {
+				m, ok := block.(map[string]any)
+				if !ok {
+					continue
+				}
+				p.ContentBlocks = append(p.ContentBlocks, m)
+				if t, _ := m["type"].(string); t == "text" {
+					if s, _ := m["text"].(string); s != "" {
+						parts = append(parts, s)
+					}
+				}
+			}
+			p.Content = strings.Join(parts, "\n")
+		}
+		msgs = append(msgs, p)
+	}
+	return msgs
+}
+```
+
+Each evaluator returns (triggers, followed, misses). Leave stubs with clear TODOs for the actual scanning inside each — the scanning logic follows the same pattern (iterate msgs, detect trigger, scan window for matching tool_use block name).
+
+### Step 7.2: Tests + fixtures
+
+Create the three fixture transcripts. Assert:
+
+- `transcript_missed_read.jsonl` → `AnalyzeTranscript` returns 1 miss, rule=read_large_file.
+- `transcript_missed_correction.jsonl` → 1 miss, rule=user_correction.
+- `transcript_all_compliant.jsonl` → 0 misses, Followed == Triggers.
+
+Plus one synthetic test:
+
+```go
+func TestAnalyzeTranscript_EmptyAndMalformed(t *testing.T) {
+	res := AnalyzeTranscript(nil)
+	if res.Triggers != 0 || len(res.Misses) != 0 {
+		t.Errorf("expected empty result on nil input, got %+v", res)
+	}
+	res = AnalyzeTranscript([]byte("{ not json\n"))
+	if res.Triggers != 0 || len(res.Misses) != 0 {
+		t.Errorf("expected empty result on malformed input, got %+v", res)
+	}
+}
+```
+
+### Step 7.3: Wire analyzer into HookSessionEnd + review record
+
+In `internal/cli/hook_stop.go`, inside `HookSessionEnd`, after computing `candidates` and `writes`, also compute `analysis := AnalyzeTranscript(transcript)`. Pass `analysis.Misses` as a new parameter to `writeLastSessionReview`.
+
+Extend `writeLastSessionReview` signature:
+
+```go
+func writeLastSessionReview(projectDir, sessionID string, endedAt time.Time, candidates []CandidateEvent, writes int, misses []MissedCall) error {
+	// Updated suppression: skip only when candidates <= 2 AND writes >= 1 AND len(misses) == 0.
+	if len(candidates) <= 2 && writes >= 1 && len(misses) == 0 {
+		return nil
+	}
+	// … same JSON record, plus "misses" field carrying up to 5 miss entries.
+}
+```
+
+Update the record schema to include:
+
+```json
+{
+  "misses": [
+    {"rule":"user_correction","expected_tool":"heimdall_remember","trigger":"no, actually do it the other way","turn":3},
+    ...
+  ],
+  "triggers": 7,
+  "followed": 4
+}
+```
+
+### Step 7.4: Extend `lastSessionReview` type + renderer in `hook.go`
+
+In `internal/cli/hook.go`, extend the `lastSessionReview` type:
+
+```go
+type lastSessionReview struct {
+	SessionID   string       `json:"session_id"`
+	EndedAt     int64        `json:"ended_at"`
+	Candidates  int          `json:"candidates"`
+	Writes      int          `json:"writes"`
+	TopMarkers  []string     `json:"top_markers"`
+	Excerpts    []string     `json:"excerpts"`
+	Misses      []reviewMiss `json:"misses,omitempty"`
+	Triggers    int          `json:"triggers,omitempty"`
+	Followed    int          `json:"followed,omitempty"`
+}
+
+type reviewMiss struct {
+	Rule           string `json:"rule"`
+	ExpectedTool   string `json:"expected_tool"`
+	TriggerExcerpt string `json:"trigger"`
+	Turn           int    `json:"turn"`
+}
+```
+
+In `renderLastSessionReview`, after the existing excerpts section, append a misses section when `len(rev.Misses) > 0`:
+
+```
+Missed heimdall calls (2/7 compliant):
+- user_correction → expected heimdall_remember: "no, actually do it the other way"
+- external_content → expected heimdall_index_text: "<WebFetch result from https://…>"
+
+heimdall_remember any items above that still matter.
+```
+
+Limit to 5 missed-call lines. If `Followed == 0 && Triggers > 0`, include a stronger opener ("No heimdall calls matched any of the N triggered rules this session.").
+
+### Step 7.5: Add `analyze-session` CLI subcommand
+
+In `internal/cli/hooks.go` (the admin-hooks dispatcher), add a new case:
+
+```go
+case "analyze-session":
+    return HooksAnalyzeSession(cfg, stdin, stdout, stderr, env, rest)
+```
+
+Implementation in a new function `HooksAnalyzeSession` (in the same file or a sibling `hooks_analyze_session.go`):
+
+- Flags: `--transcript <path>` (required), `--format <text|json>` (default text).
+- Reads the transcript, runs `AnalyzeTranscript`, renders a human summary to stdout + a structured JSON blob to `hooks.log` (event=`mcp.compliance`).
+- Exit code 0 on success; 1 only if the file can't be read.
+
+Human output shape:
+
+```
+Transcript: /path/to/transcript.jsonl
+Triggers: 7 rules fired
+Followed: 4 (57%)
+Misses:
+  - user_correction → heimdall_remember (turn 3)
+    "no, actually do it the other way"
+  - external_content → heimdall_index_text (turn 8)
+    "<WebFetch 2.3 KB>"
+```
+
+### Step 7.6: Tests pass
+
+Run: `go test ./internal/cli/ -run TestAnalyze -v` → PASS.
+Run: `go test ./... -count=1` → no regressions.
+Smoke: `heimdall-mcp hooks analyze-session --transcript internal/cli/testdata/transcript_missed_correction.jsonl` → prints 1 miss.
+
+### Step 7.7: Commit
+
+```bash
+git add internal/cli/missed_calls.go internal/cli/missed_calls_test.go internal/cli/testdata/transcript_missed_*.jsonl internal/cli/testdata/transcript_all_compliant.jsonl internal/cli/hook_stop.go internal/cli/hook.go internal/cli/hook_stop_test.go internal/cli/hook_test.go internal/cli/hooks.go
+git commit -m "feat(observability): missed-call analyzer + heimdall-mcp hooks analyze-session
+
+Adds a rule registry (mirroring the MCP instruction block's
+trigger→action pairs) and an AnalyzeTranscript function that detects
+cases where Claude should have called a heimdall tool but didn't.
+Extends the last-session-review record with a misses[] field + Triggers
+/ Followed counters; extends the SessionStart renderer to surface those
+misses so the nag names specific rule violations. New CLI subcommand
+'heimdall-mcp hooks analyze-session' re-runs the analyzer on historical
+transcripts. Addresses P0.5-b observability gap."
+```
+
+---
+
 ## Task 5: Acceptance gate — manual two-session end-to-end
 
 **Goal:** Verify the full round-trip in a real Claude Code session. This can't be unit-tested — it requires Claude Code to actually fire SessionStart/SessionEnd hooks and emit tool_use blocks into a real transcript.
