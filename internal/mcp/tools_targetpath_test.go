@@ -550,6 +550,75 @@ func TestResolveRunIndexBaseDir_EmptyPathFallsBack(t *testing.T) {
 	}
 }
 
+// TestResolveStatusBaseDir_NormalizesPath — PR #73 re-review N-1.
+// Cosmetic variants of an absolute path (`/foo/./`, `/foo/../foo`,
+// trailing slash) must reach the same registered entry as the
+// canonical cleaned form. Otherwise the exact-match registry-bypass
+// contract is soft: a registered project could silently fall through
+// to `<input>/.heimdall_db` just because the caller typed `./`.
+func TestResolveStatusBaseDir_NormalizesPath(t *testing.T) {
+	s := helperServer(t)
+
+	real := t.TempDir()
+	base := filepath.Join(real, ".heimdall_db")
+	s.Registry.Register("proj", real, base)
+
+	// Each variant must resolve to the registered DBPath — not to
+	// `<variant>/.heimdall_db`.
+	variants := []string{
+		real,                          // canonical (control)
+		real + "/",                    // trailing slash
+		real + "/.",                   // embedded current-dir
+		filepath.Join(real, "sub", ".."), // via ..
+	}
+	for _, v := range variants {
+		got := s.resolveStatusBaseDir(v)
+		if got != base {
+			t.Errorf("resolveStatusBaseDir(%q) = %q, want %q (should normalize)", v, got, base)
+		}
+	}
+}
+
+// TestResolveRunIndexBaseDir_NormalizesPath — same as the status
+// sibling above but for the write-path resolver. Writes MUST land in
+// the registered location regardless of cosmetic path variants.
+func TestResolveRunIndexBaseDir_NormalizesPath(t *testing.T) {
+	s := helperServer(t)
+
+	real := t.TempDir()
+	base := filepath.Join(real, ".heimdall_db")
+	s.Registry.Register("proj", real, base)
+
+	variants := []string{
+		real,
+		real + "/",
+		real + "/.",
+		filepath.Join(real, "sub", ".."),
+	}
+	for _, v := range variants {
+		got := s.resolveRunIndexBaseDir(v)
+		if got != base {
+			t.Errorf("resolveRunIndexBaseDir(%q) = %q, want %q (should normalize)", v, got, base)
+		}
+	}
+}
+
+// TestResolveStatusBaseDir_NormalizesUnregisteredPath — for an
+// unregistered absolute path, the helper returns <Clean(input)>/.heimdall_db
+// (not `<raw>/.heimdall_db`). Locks the cleaned-fallback shape so a
+// trailing slash in `path` doesn't produce a trailing-slash DBPath that
+// would downstream mismatch a later registered entry.
+func TestResolveStatusBaseDir_NormalizesUnregisteredPath(t *testing.T) {
+	s := helperServer(t)
+
+	dir := t.TempDir()
+	got := s.resolveStatusBaseDir(dir + "/")
+	want := filepath.Join(dir, ".heimdall_db")
+	if got != want {
+		t.Errorf("resolveStatusBaseDir(%q) = %q, want %q", dir+"/", got, want)
+	}
+}
+
 // resultText is a tiny helper to extract the text payload from an
 // MCPToolResult so tests can assert on it.
 func resultText(r MCPToolResult) string {

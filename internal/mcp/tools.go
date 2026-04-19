@@ -560,14 +560,19 @@ func (s *Server) checkAndTriggerReindex(store *heimdall.VectorStore, dbDir strin
 // wrong project when an absolute filesystem path happens to share a
 // substring with a registered project name. Exact path equality is
 // required for the invariant to hold.
+//
+// The input is filepath.Clean-ed before comparison so cosmetic
+// differences like trailing slashes, embedded `.`, or `..` segments
+// don't escape the exact-match guarantee (PR #73 re-review N-1).
 func (s *Server) resolveRunIndexBaseDir(absPath string) string {
 	if absPath != "" {
+		cleaned := filepath.Clean(absPath)
 		for _, p := range s.Registry.All() {
-			if p.Path == absPath {
+			if p.Path == cleaned {
 				return p.DBPath
 			}
 		}
-		return filepath.Join(absPath, ".heimdall_db")
+		return filepath.Join(cleaned, ".heimdall_db")
 	}
 	// Last-ditch: fall through to the shared resolver, which ends at
 	// <cwd>/.heimdall_db only if nothing else matches.
@@ -597,12 +602,16 @@ func (s *Server) resolveStatusBaseDir(input string) string {
 		return s.resolveDBDir("")
 	}
 	if filepath.IsAbs(input) {
+		// Normalize before comparison so cosmetic variants like
+		// "/foo/./", "/foo/../foo", and trailing slashes cannot escape
+		// the exact-match registry bypass (PR #73 re-review N-1).
+		cleaned := filepath.Clean(input)
 		for _, p := range s.Registry.All() {
-			if p.Path == input {
+			if p.Path == cleaned {
 				return p.DBPath
 			}
 		}
-		return filepath.Join(input, ".heimdall_db")
+		return filepath.Join(cleaned, ".heimdall_db")
 	}
 	// Name-style input — delegate to the shared resolver. A purely
 	// name-based substring match is intentional here (users call

@@ -308,12 +308,26 @@ func acquireMigrationLock(lockPath string) (*os.File, error) {
 		return nil, err
 	}
 
-	// EEXIST — inspect the age of the existing lock.
-	info, statErr := os.Stat(lockPath)
+	// EEXIST — inspect the age of the existing lock. Use Lstat so a
+	// symlink planted at lockPath (with write access to baseDir — an
+	// existing trust-boundary assumption) cannot spoof an ancient
+	// mtime on a target file the attacker doesn't own. Matches the
+	// existing Lstat-refuses-symlink-source discipline on the migration
+	// source. See PR #73 re-review N-2.
+	info, statErr := os.Lstat(lockPath)
 	if statErr != nil {
 		// The lock file disappeared between OpenFile and Stat — treat as
 		// "not ours to claim this pass" and let the caller no-op. A
 		// subsequent invocation will get a clean OpenFile.
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		// Refuse to trust a symlinked lockfile — treat it as contention
+		// and leave the symlink in place. Removing the symlink here
+		// would still be safe (Remove on a symlink unlinks the link,
+		// not the target), but treating it as contention surfaces the
+		// anomaly to the operator via the caller's no-op path.
+		log.Printf("heimdall: legacy-migration lock at %s is a symlink; refusing to treat as stale (possible tampering) — returning contention", lockPath)
 		return nil, err
 	}
 	age := time.Since(info.ModTime())
@@ -335,6 +349,126 @@ func acquireMigrationLock(lockPath string) (*os.File, error) {
 		return nil, retryErr
 	}
 	return lock, nil
+}
+
+// FindLegacyLatestDirs scans baseDir for entries whose name ends in
+// `_latest` and have a sibling canonical `<name>` directory. Returns
+// the full paths of each legacy dir. This is the reader side for the
+// `heimdall-mcp cleanup-legacy-latest` administrative command.
+//
+// It intentionally only reports dirs that already have a canonical
+// sibling — otherwise removing the `_latest` dir would silently drop
+// user data. When the canonical sibling is missing, the reader layer
+// (ModelDBDir) still points at the `_latest` dir; users who want to
+// migrate it to canonical should run an index (which fires
+// MigrateLegacyLatestDir) rather than manually deleting.
+//
+// Never descends. Non-directory entries are skipped. If baseDir
+// doesn't exist or is unreadable the function returns nil, nil
+// (non-fatal; caller treats "nothing to clean up" as success).
+func FindLegacyLatestDirs(baseDir string) ([]LegacyLatestReport, error) {
+	if baseDir == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	// Build a set of non-legacy dir names so we can pair them up.
+	canonical := make(map[string]bool)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, "_latest") {
+			canonical[name] = true
+		}
+	}
+
+	var out []LegacyLatestReport
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, "_latest") {
+			continue
+		}
+		sibling := strings.TrimSuffix(name, "_latest")
+		legacyPath := filepath.Join(baseDir, name)
+		canonPath := filepath.Join(baseDir, sibling)
+		// Count rows if possible so the operator can see WHAT they'd
+		// be deleting. Best-effort; errors become -1 rows.
+		rows := countLegacyRows(legacyPath)
+		out = append(out, LegacyLatestReport{
+			LegacyPath:        legacyPath,
+			CanonicalPath:     canonPath,
+			CanonicalHasSibling: canonical[sibling],
+			LegacyRowCount:    rows,
+		})
+	}
+	return out, nil
+}
+
+// LegacyLatestReport describes one `<model>_latest/` dir for the
+// cleanup-legacy-latest CLI command.
+type LegacyLatestReport struct {
+	LegacyPath          string // absolute path to the `<model>_latest/` dir
+	CanonicalPath       string // absolute path to the expected `<model>/` canonical sibling
+	CanonicalHasSibling bool   // true when CanonicalPath exists (safe to delete legacy)
+	LegacyRowCount      int64  // rows in legacy vectors.db; -1 if unreadable
+}
+
+// countLegacyRows opens the legacy dir's vectors.db read-only and
+// returns the row count from the `entries` table. Non-destructive.
+// Returns -1 on any error (dir missing, db missing, schema different).
+func countLegacyRows(legacyDir string) int64 {
+	dbPath := filepath.Join(legacyDir, "vectors.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return -1
+	}
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro&_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return -1
+	}
+	defer db.Close()
+	var n int64
+	err = db.QueryRow(`SELECT COUNT(*) FROM entries`).Scan(&n)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// RemoveLegacyLatestDir deletes `<baseDir>/<name>_latest/` (where name
+// is derived from the model) recursively. Fails loudly if the
+// canonical sibling does not exist — that's a user-data-loss red flag.
+// Callers must have confirmed via FindLegacyLatestDirs that the dir is
+// safe to remove.
+func RemoveLegacyLatestDir(legacyPath string) error {
+	if !strings.HasSuffix(legacyPath, "_latest") {
+		return &removeSafetyError{reason: "path does not have the _latest suffix; refusing to remove for safety", path: legacyPath}
+	}
+	// Require that the canonical sibling exist, otherwise we'd be
+	// dropping user data with no canonical replacement.
+	canonical := strings.TrimSuffix(legacyPath, "_latest")
+	if _, err := os.Stat(canonical); err != nil {
+		return &removeSafetyError{reason: "no canonical sibling exists; removing would delete the only copy of the data", path: legacyPath}
+	}
+	return os.RemoveAll(legacyPath)
+}
+
+type removeSafetyError struct {
+	reason string
+	path   string
+}
+
+func (e *removeSafetyError) Error() string {
+	return "refusing to remove " + e.path + ": " + e.reason
 }
 
 // readEmbeddingModel opens a vectors.db read-only and reads the embedding_model

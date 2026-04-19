@@ -517,3 +517,68 @@ func TestMigrateLegacyLatestDir_FreshLockDefersToActiveProcess(t *testing.T) {
 		t.Errorf("fresh lock must be preserved, not stomped: %v", err)
 	}
 }
+
+// TestMigrateLegacyLatestDir_SymlinkLockIsNotStaleRecovered — PR #73
+// re-review N-2. An attacker (or a careless operator) who plants a
+// symlink at the lock path pointing at an ancient file MUST NOT cause
+// the stale-lock recovery path to fire. os.Lstat on the lock rejects
+// the symlink even if its resolved-target mtime is years old.
+//
+// Scenario: legacy dir exists and is populated; lock path is a
+// symlink pointing at a brand-new scratch file. Without the Lstat
+// fix, os.Stat would follow the link, see a fresh mtime, return
+// "fresh lock" — migration would defer. That's fine. Flip it: point
+// the symlink at an ANCIENT file (old mtime). Without Lstat, stale
+// recovery would trigger and migration would proceed. With Lstat,
+// we treat the symlink as contention (defer).
+func TestMigrateLegacyLatestDir_SymlinkLockIsNotStaleRecovered(t *testing.T) {
+	if os.Getenv("CI_SKIP_SYMLINK_TESTS") == "1" {
+		t.Skip("symlink tests disabled via CI_SKIP_SYMLINK_TESTS")
+	}
+
+	baseDir := t.TempDir()
+	const model = "nomic-embed-text"
+	seedLegacyDir(t, baseDir, model, 100)
+
+	// Create a "fresh file" elsewhere, but with an OLD mtime so that
+	// if the stale-check followed the symlink it would trigger
+	// recovery and silently proceed with migration.
+	targetDir := t.TempDir()
+	target := filepath.Join(targetDir, "spoof-target")
+	if err := os.WriteFile(target, []byte("bait"), 0600); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(target, past, past); err != nil {
+		t.Fatalf("chtimes target: %v", err)
+	}
+
+	sanitized := sanitizeModelDirName(NormalizeModelName(model))
+	lockPath := filepath.Join(baseDir, ".heimdall-legacy-migrate-"+sanitized+".lock")
+	if err := os.Symlink(target, lockPath); err != nil {
+		t.Skipf("symlink not supported on this platform: %v", err)
+	}
+
+	migrated, err := MigrateLegacyLatestDir(baseDir, model)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if migrated {
+		t.Fatalf("stale-lock recovery followed a symlink — should have treated it as contention; migrated=true")
+	}
+
+	// Legacy must still be on disk — the defer path should leave it alone.
+	legacyPath := filepath.Join(baseDir, sanitized+"_latest")
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Errorf("legacy must remain when we defer on symlink lock: %v", err)
+	}
+
+	// The symlink itself must still exist (we didn't stomp it — we
+	// left it alone as contention).
+	fi, err := os.Lstat(lockPath)
+	if err != nil {
+		t.Errorf("symlink lock should still exist: %v", err)
+	} else if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("lockPath mode = %v, want symlink (we must not have replaced it)", fi.Mode())
+	}
+}
