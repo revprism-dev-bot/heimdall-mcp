@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
@@ -18,11 +19,33 @@ import (
 )
 
 // Server holds runtime state for the MCP server.
+//
+// ollama / ollamaMu implement a server-scoped OllamaClient singleton so
+// concurrent MCP tool calls share one semaphore (pre-refactor each tool
+// call built its own client with its own semaphore → effective cap was
+// tool_call_count × max_concurrent). See pr74-review-concurrency.md
+// F5/M1 for the regression scenario.
 type Server struct {
 	Cfg         config.Config
 	Registry    *registry.Registry
 	Index       IndexState
 	MemoryStore *heimdall.MemoryStore
+
+	ollamaMu    sync.Mutex
+	ollama      *heimdall.OllamaClient
+	ollamaKey   ollamaClientKey
+}
+
+// ollamaClientKey captures the subset of config that determines client
+// identity. If any of these change between invocations we rebuild.
+// Currently only endpoint matters — concurrency / timeout / retry
+// changes mid-session don't migrate to in-flight calls, which matches
+// the "next invocation picks up new values" promise.
+type ollamaClientKey struct {
+	endpoint       string
+	maxConcurrent  int
+	timeoutMs      int
+	maxRetries     int
 }
 
 // TextResult creates a successful text result.
@@ -30,17 +53,47 @@ func TextResult(text string) MCPToolResult {
 	return MCPToolResult{Content: []MCPContent{{Type: "text", Text: text}}}
 }
 
-// newOllamaClient constructs an OllamaClient honoring the Server's Config.
-// Centralizes `EmbedMaxConcurrent` / `EmbedTimeoutMs` / `EmbedMaxRetries`
-// wiring so every MCP tool inherits the same bursty-safe defaults. See
-// heimdall.NewOllamaClientFromConfig for semantics.
+// newOllamaClient returns a server-scoped OllamaClient singleton that
+// honors the Server's Config and environment overrides (via
+// config.ResolveEmbedConfig). Centralizes `EmbedMaxConcurrent` /
+// `EmbedTimeoutMs` / `EmbedMaxRetries` wiring so every MCP tool shares
+// the same counting semaphore — one server, one cap, regardless of how
+// many concurrent tool calls land.
+//
+// The client is cached keyed on the resolved config values; if a
+// subsequent toolConfigure mutates any of them mid-session, the next
+// call rebuilds. In-flight calls keep their original client (matches
+// the "config changes take effect on next invocation" promise).
+//
+// Env overrides are applied to a transient copy — Server.Cfg is NEVER
+// mutated, so a later SaveConfig(Cfg) does not persist env-var tuning
+// to disk. See heimdall.NewOllamaClientFromConfig for sentinel
+// semantics and pr74-review-security-config.md H1 for the persistence
+// hazard this avoids.
 func (s *Server) newOllamaClient() *heimdall.OllamaClient {
-	return heimdall.NewOllamaClientFromConfig(
-		s.Cfg.OllamaEndpoint,
-		s.Cfg.EmbedMaxConcurrent,
-		s.Cfg.EmbedTimeoutMs,
-		s.Cfg.EmbedMaxRetries,
+	effective := config.ResolveEmbedConfig(s.Cfg)
+	key := ollamaClientKey{
+		endpoint:      effective.OllamaEndpoint,
+		maxConcurrent: effective.EmbedMaxConcurrent,
+		timeoutMs:     effective.EmbedTimeoutMs,
+		maxRetries:    effective.EmbedMaxRetries,
+	}
+
+	s.ollamaMu.Lock()
+	defer s.ollamaMu.Unlock()
+
+	if s.ollama != nil && s.ollamaKey == key {
+		return s.ollama
+	}
+
+	s.ollama = heimdall.NewOllamaClientFromConfig(
+		effective.OllamaEndpoint,
+		effective.EmbedMaxConcurrent,
+		effective.EmbedTimeoutMs,
+		effective.EmbedMaxRetries,
 	)
+	s.ollamaKey = key
+	return s.ollama
 }
 
 // ErrResult creates an error text result.

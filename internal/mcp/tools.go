@@ -636,7 +636,7 @@ func (s *Server) toolStatus(args json.RawMessage) MCPToolResult {
 		"excludePatterns": s.Cfg.ExcludePatterns,
 	}
 
-	client := heimdall.NewOllamaClient(endpoint)
+	client := s.newOllamaClient()
 	if err := client.Ping(ctx); err != nil {
 		status["ollamaRunning"] = false
 	} else {
