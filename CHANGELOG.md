@@ -43,6 +43,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
 
 ### Fixed
 
+- **Sub-repos with a broken `.heimdall_db` are now registered anyway.**
+  `IndexSubRepos` used to fire `OnSubRepoDiscovered` only AFTER
+  `OpenStore` succeeded — so a sub-repo whose SQLite file was truncated,
+  wrong-schema, WAL-desynced, or permission-denied (common when users
+  sync `.heimdall_db/` across machines via git / gitea) was silently
+  dropped from the project registry. Symptom reported against v0.0.3:
+  `heimdall-mcp index <wrapper>` auto-registered `wrapper-app` (already
+  present with a stale dbPath) but not `wrapper-service` or
+  `wrapper-infra`. The callback now fires immediately after the sub-repo
+  is identified (post user-exclude filter, pre-model-resolution,
+  pre-`OpenStore`), so registration is independent of per-sub-repo
+  store health. The stored `dbPath` is the sub-repo's `.heimdall_db`
+  root (model-agnostic); `Registry.Register` tuple-dedupes so repeat
+  runs stay a no-op. Sub-repo `OpenStore` failures are additionally
+  surfaced on stderr (`sub-repo <name> (<path>) failed: <err>`) so they
+  stand out in CI logs and are not hidden when stdout is piped.
+  Regression tests: `TestIndexSubRepos_RegistersEvenWhenStoreOpenFails`
+  (exact v0.0.3 repro) and
+  `TestIndexSubRepos_DiscoveryFiresForEveryDiscoveredSubRepo` (property:
+  event count == non-user-excluded discovered count, regardless of
+  per-sub-repo outcome).
 - **`heimdall_index` and `heimdall_index_text`: write to the target path, not the MCP server's CWD.**
   Before this fix, `runIndex` and `toolIndexText` computed `baseDir` from
   `os.Getwd()` and `filepath.Join(cwd, ".heimdall_db")`, so reindexes invoked
