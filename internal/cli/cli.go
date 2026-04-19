@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -171,6 +172,8 @@ func RunCLI(cfg config.Config, args []string) {
 		os.Exit(CLIUninstallHooks(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), args[1:]))
 	case "skills":
 		os.Exit(CLISkills(cfg, os.Stdin, os.Stdout, os.Stderr, envMap(), cleanArgs, SkillsDeps{}))
+	case "cleanup-legacy-latest":
+		os.Exit(cliCleanupLegacyLatest(cleanArgs))
 	case "version", "--version", "-V":
 		fmt.Println(buildVersion())
 	case "help", "--help", "-h":
@@ -207,6 +210,10 @@ func RunCLI(cfg config.Config, args []string) {
 		fmt.Println("  heimdall-mcp hooks cache-clear [flags]     Drop hook_cache contents")
 		fmt.Println("  heimdall-mcp hooks cache-stats [flags]     Show hook_cache stats")
 		fmt.Println("  heimdall-mcp sessions list|report          Per-session savings metrics")
+		fmt.Println("  heimdall-mcp cleanup-legacy-latest [path] [--force]")
+		fmt.Println("                                             Scan for <model>_latest/ dirs with a canonical")
+		fmt.Println("                                             sibling and prompt to remove them. Use --force")
+		fmt.Println("                                             to skip the prompt (non-interactive / scripts).")
 		fmt.Println("  heimdall-mcp version                       Print the binary version")
 		fmt.Println()
 		fmt.Println("Options:")
@@ -890,6 +897,8 @@ func cliConfigure(args []string) {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  heimdall-mcp config get [key]                   Get config (full or specific key)\n")
 		fmt.Fprintf(os.Stderr, "  heimdall-mcp config set <key> <val>             Set a config key\n")
+		fmt.Fprintf(os.Stderr, "  heimdall-mcp config show [--effective]          Print config; --effective includes\n")
+		fmt.Fprintf(os.Stderr, "                                                  HEIMDALL_EMBED_* env resolution + clamps\n")
 		fmt.Fprintf(os.Stderr, "  heimdall-mcp configure --llm-classifier-model=<model>\n")
 		fmt.Fprintf(os.Stderr, "                                                  One-shot setter for the LLM classifier fallback\n")
 		fmt.Fprintf(os.Stderr, "\nKeys: model, git.enabled, git.depth, git.include_diffs, git.branches,\n")
@@ -900,6 +909,29 @@ func cliConfigure(args []string) {
 	}
 
 	switch args[0] {
+	case "show":
+		// `heimdall-mcp config show [--effective]` — lightweight
+		// operator observability (PR #74 re-review N-2). When
+		// --effective is passed we print the post-env-resolved embed
+		// config with per-field source attribution so operators can
+		// diagnose "why is indexing slow?" without reading source
+		// code or restarting the server.
+		effective := false
+		for _, a := range args[1:] {
+			if a == "--effective" {
+				effective = true
+			}
+		}
+		base := config.LoadConfig()
+		if !effective {
+			// Plain `show` is an alias for `get` with no key: print
+			// the raw config.json as-is.
+			out, _ := json.MarshalIndent(base, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+		eff := config.ResolveEmbedConfig(base)
+		showEffectiveEmbedConfig(base, eff)
 	case "get":
 		cfg := config.LoadConfig()
 		if len(args) > 1 {
@@ -958,6 +990,53 @@ func cliConfigure(args []string) {
 		fmt.Fprintf(os.Stderr, "Unknown config action: %s (use 'get' or 'set')\n", args[0])
 		os.Exit(1)
 	}
+}
+
+// showEffectiveEmbedConfig prints the resolved embed config with
+// per-field source attribution so operators can diagnose "why is
+// indexing slow" without reading source. Each field reports:
+//   - the effective value (after env + clamps)
+//   - whether it came from env (shows env var + value) or config.json
+//   - the underlying config.json value (for comparison when env overrode)
+//
+// Output is human-readable key: value lines; no JSON — this is a
+// diagnostic surface, not a machine-consumed one.
+func showEffectiveEmbedConfig(base, effective config.Config) {
+	fmt.Println("Effective embed config (after HEIMDALL_EMBED_* env overrides + clamps):")
+	fmt.Println()
+
+	describe := func(field, envVar string, baseVal, effVal int) {
+		// Determine source:
+		//   - if env var is set AND non-empty, env took precedence
+		//     (even if ResolveEmbedConfig rejected it — the user
+		//     intent is still env-flavored).
+		//   - else config.json.
+		env := os.Getenv(envVar)
+		switch {
+		case env != "":
+			fmt.Printf("  %-22s = %d\n", field, effVal)
+			fmt.Printf("  %-22s   source: env %s=%q (config.json=%d)\n", "", envVar, env, baseVal)
+		default:
+			fmt.Printf("  %-22s = %d\n", field, effVal)
+			fmt.Printf("  %-22s   source: config.json\n", "")
+		}
+	}
+
+	describe("embedMaxConcurrent", "HEIMDALL_EMBED_MAX_CONCURRENT",
+		base.EmbedMaxConcurrent, effective.EmbedMaxConcurrent)
+	describe("embedTimeoutMs", "HEIMDALL_EMBED_TIMEOUT_MS",
+		base.EmbedTimeoutMs, effective.EmbedTimeoutMs)
+	describe("embedMaxRetries", "HEIMDALL_EMBED_MAX_RETRIES",
+		base.EmbedMaxRetries, effective.EmbedMaxRetries)
+
+	fmt.Println()
+	fmt.Println("Legend:")
+	fmt.Println("  embedMaxConcurrent: -1 = use default (2), 0 = unbounded, N = cap at N")
+	fmt.Println("  embedMaxRetries:    -1 = explicit zero retries, 0 = use default (2), N = literal")
+	fmt.Println("  Clamps (applied after env + config.json merge):")
+	fmt.Printf("    embedMaxConcurrent ≤ %d\n", config.MaxEmbedConcurrent)
+	fmt.Printf("    embedTimeoutMs     ∈ [%d, %d]\n", config.MinEmbedTimeoutMs, config.MaxEmbedTimeoutMs)
+	fmt.Printf("    embedMaxRetries    ≤ %d\n", config.MaxEmbedRetries)
 }
 
 func getConfigKey(cfg *config.Config, key string) (any, bool) {
@@ -1204,4 +1283,111 @@ func cliModels(cfg config.Config) {
 func resolveAnyLocalModelDB(cfg config.Config, baseDir string) (string, string) {
 	client := newOllamaClient(cfg)
 	return heimdall.ResolveUsableModelDB(context.Background(), client, baseDir, cfg.Model)
+}
+
+// cliCleanupLegacyLatest implements `heimdall-mcp cleanup-legacy-latest
+// [path] [--force]` — the administrative escape valve reserved by
+// v2 plan New-OQ-3. Scans `<path>/.heimdall_db/` for `<model>_latest/`
+// dirs with a canonical `<model>/` sibling and prompts (or accepts
+// --force) to remove them.
+//
+// Safety invariants:
+//
+//   - Only removes dirs whose canonical `<model>/` sibling exists on
+//     disk. Removing a legacy dir with no sibling would silently drop
+//     the only copy of user data.
+//   - `--force` skips the prompt but still enforces the sibling check.
+//   - Never removes anything outside `<path>/.heimdall_db/` (no
+//     descent into project subdirs).
+//   - Prints a summary of row counts before prompting so the operator
+//     sees what they're about to delete.
+func cliCleanupLegacyLatest(args []string) int {
+	force := false
+	target := ""
+	for _, a := range args {
+		switch a {
+		case "--force", "-f":
+			force = true
+		default:
+			if strings.HasPrefix(a, "-") {
+				fmt.Fprintf(os.Stderr, "cleanup-legacy-latest: unknown flag %q\n", a)
+				return 2
+			}
+			if target != "" {
+				fmt.Fprintf(os.Stderr, "cleanup-legacy-latest: unexpected positional argument %q (already have %q)\n", a, target)
+				return 2
+			}
+			target = a
+		}
+	}
+	if target == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cleanup-legacy-latest: cannot determine cwd: %v\n", err)
+			return 1
+		}
+		target = cwd
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cleanup-legacy-latest: invalid path: %v\n", err)
+		return 1
+	}
+	baseDir := filepath.Join(abs, ".heimdall_db")
+
+	reports, err := heimdall.FindLegacyLatestDirs(baseDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cleanup-legacy-latest: scan failed: %v\n", err)
+		return 1
+	}
+	if len(reports) == 0 {
+		fmt.Printf("No legacy <model>_latest/ directories found in %s\n", baseDir)
+		return 0
+	}
+
+	fmt.Printf("Found %d legacy _latest dir(s) under %s:\n", len(reports), baseDir)
+	removable := make([]heimdall.LegacyLatestReport, 0, len(reports))
+	for _, r := range reports {
+		status := "SAFE to remove (canonical sibling exists)"
+		if !r.CanonicalHasSibling {
+			status = "SKIP — no canonical sibling (would lose data)"
+		}
+		rowInfo := ""
+		if r.LegacyRowCount >= 0 {
+			rowInfo = fmt.Sprintf(" [%d rows]", r.LegacyRowCount)
+		}
+		fmt.Printf("  %s%s\n    → %s\n", r.LegacyPath, rowInfo, status)
+		if r.CanonicalHasSibling {
+			removable = append(removable, r)
+		}
+	}
+	if len(removable) == 0 {
+		fmt.Println("\nNothing safe to remove. Re-index each model (heimdall-mcp index <path>) to migrate legacy dirs to canonical, then re-run this command.")
+		return 0
+	}
+
+	if !force {
+		fmt.Printf("\nRemove %d legacy directory(ies) listed above? [y/N] ", len(removable))
+		reader := bufio.NewReader(os.Stdin)
+		line, _ := reader.ReadString('\n')
+		line = strings.TrimSpace(strings.ToLower(line))
+		if line != "y" && line != "yes" {
+			fmt.Println("Aborted.")
+			return 0
+		}
+	}
+
+	failures := 0
+	for _, r := range removable {
+		if err := heimdall.RemoveLegacyLatestDir(r.LegacyPath); err != nil {
+			fmt.Fprintf(os.Stderr, "  FAILED %s: %v\n", r.LegacyPath, err)
+			failures++
+			continue
+		}
+		fmt.Printf("  removed %s\n", r.LegacyPath)
+	}
+	if failures > 0 {
+		return 1
+	}
+	return 0
 }

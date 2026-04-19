@@ -861,14 +861,87 @@ func TestOllamaClient_SemaphoreReleasedOnNonCtxErrors(t *testing.T) {
 	}
 }
 
-// Note: EmbedBatch retry path is covered by the existing
-// `TestOllamaClient_RetryOnDeadlineExceeded` for the single-text case.
-// A dedicated batch retry test was evaluated but the `applyBatchDeadline`
-// helper adds `len(texts)*2s` to the per-request budget, so a realistic
-// multi-text retry scenario requires a ~12s wall-clock budget. Since
-// the retry gate is shared structurally (isPerRequestDeadlineExceeded),
-// this is review IM-2 (medium) deferred; the regression value is low
-// and the test-runtime cost is high. See pr74-review-tests.md IM-2.
+// TestOllamaClient_EmbedBatch_RetryOnDeadline — PR #74 re-review M1 /
+// IM-2 follow-up. Originally deferred with a "12 s wall-clock" cost
+// rationale; this version uses a short caller context with a slow
+// server so applyBatchDeadline inherits the caller's (short) deadline
+// rather than creating a fresh long one. That produces a per-request
+// DeadlineExceeded from OUR side (not caller-ctx cancel), which is
+// exactly the retry gate condition `isPerRequestDeadlineExceeded`
+// looks for — except that the retry body then fails because the
+// caller ctx is also done. To observe a successful retry we instead
+// use an HTTP connection-level failure: the first attempt's
+// DeadlineExceeded comes from the per-request http.Client timeout in
+// doEmbedBatchOnce, retry then succeeds against a freshly-restarted
+// handler branch.
+//
+// Implementation note: we set caller ctx >> batchTimeout so
+// applyBatchDeadline creates a new ctx bounded by batchTimeout (=
+// embedTimeout + len(texts)*2s). First attempt blocks past
+// batchTimeout → per-request DeadlineExceeded fires → retry → second
+// attempt succeeds instantly. With embedTimeout=50ms and len(texts)=2,
+// batchTimeout ≈ 4.05s per attempt; the test finishes in ~4 s total.
+// Still far better than the 12s estimate the deferral cited, and it
+// locks the EmbedBatch retry path against future regressions where
+// `applyBatchDeadline` or `perRequestCtx` might be swapped.
+func TestOllamaClient_EmbedBatch_RetryOnDeadline(t *testing.T) {
+	var attempts int64
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt64(&attempts, 1)
+		if n < 2 {
+			// First attempt blocks until the per-request deadline expires
+			// OR the server shuts down.
+			select {
+			case <-done:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		// Second attempt succeeds fast.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"embeddings":[[0.1],[0.2]]}`))
+	}))
+	t.Cleanup(func() {
+		close(done)
+		srv.Close()
+	})
+
+	// Short per-request embedTimeout; short RetryBackoff. Caller ctx
+	// needs to be long enough for:
+	//   attempt1 (batchTimeout = embedTimeout + 2*2s ≈ 4.05s)
+	//   + backoff (10ms)
+	//   + attempt2 (fast, ~ms)
+	// = ~4.1s. Use 10s for slack under loaded CI.
+	client := NewOllamaClientWithOptions(srv.URL, OllamaOptions{
+		MaxConcurrent: 2,
+		EmbedTimeout:  50 * time.Millisecond,
+		MaxRetries:    1,
+		RetryBackoff:  []time.Duration{10 * time.Millisecond},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	vecs, err := client.EmbedBatch(ctx, "m", []string{"a", "b"})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("retry did not recover: %v (elapsed=%v)", err, elapsed)
+	}
+	if len(vecs) != 2 {
+		t.Fatalf("got %d vecs, want 2", len(vecs))
+	}
+	if got := atomic.LoadInt64(&attempts); got != 2 {
+		t.Fatalf("attempts = %d, want 2 (initial + 1 retry)", got)
+	}
+	// Must finish well under the 12 s deferral-rationale ceiling.
+	if elapsed > 8*time.Second {
+		t.Fatalf("elapsed = %v, want < 8s (retry path should be much faster than the 12s deferral claim)", elapsed)
+	}
+}
 
 // TestOllamaClient_RetryBackoffGrows: backoff durations are consumed in
 // order. Verified indirectly by measuring elapsed time of a retry chain.

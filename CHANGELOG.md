@@ -8,6 +8,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **`embed_max_concurrent: 0` now means UNBOUNDED** (previously silently
+  capped at the safe default of 2). This fixes the long-standing bug
+  where explicit `0` was remapped to the default. If your `config.json`
+  contains a literal `embed_max_concurrent: 0` (possible if you ran a
+  pre-fix build with `HEIMDALL_EMBED_*` env vars set and those values
+  leaked to disk before the H1 persistence fix), it NOW means "no
+  bound per server". To restore the safe default of 2 embeds in
+  flight, set `embed_max_concurrent: -1` or remove the key entirely.
+  Most operators only need to audit `~/.config/heimdall-mcp/config.json`
+  for the literal `0` after upgrading.
+- **`HEIMDALL_EMBED_MAX_CONCURRENT=-1` is rejected at the env layer.**
+  The `-1` sentinel is an internal config.json convention only; the
+  env surface treats any negative value as invalid input (matching
+  `HEIMDALL_EMBED_TIMEOUT_MS` / `..._MAX_RETRIES`). A rejection is
+  logged; the on-disk value remains in effect.
+- **Legacy `<model>_latest/` dirs are auto-migrated** on first access.
+  Opt out with `HEIMDALL_DISABLE_LEGACY_MIGRATION=1`; when opt-out is
+  set, writes still land in the canonical dir — only the rename is
+  skipped. Use `heimdall-mcp cleanup-legacy-latest [path]` to audit
+  and remove legacy dirs manually once their canonical siblings
+  exist.
+
 ### Fixed
 
 - **`heimdall_index` and `heimdall_index_text`: write to the target path, not the MCP server's CWD.**
@@ -99,6 +123,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
 - **Added `dbPath` to `heimdall_status` output.**
   The resolved baseDir is now echoed so callers can confirm which store
   the MCP is reading without re-running resolution elsewhere.
+- **`heimdall-mcp config show [--effective]` CLI subcommand.**
+  Prints the effective embed config (after `HEIMDALL_EMBED_*` env
+  resolution + safety clamps) with per-field source attribution so
+  operators can diagnose "why is indexing slow" without reading source
+  or guessing. Without `--effective`, prints the raw config.json.
+- **`heimdall-mcp cleanup-legacy-latest [path] [--force]` CLI subcommand.**
+  Scans `<path>/.heimdall_db/` for `<model>_latest/` dirs whose
+  canonical `<model>/` sibling exists on disk, reports row counts,
+  and removes them on confirmation (or `--force` for scripts). Safe
+  by default: never removes a legacy dir whose canonical sibling is
+  missing.
 - `heimdall.NewOllamaClientWithLimit(endpoint, maxConcurrent int)` — additive
   constructor. The original `NewOllamaClient(endpoint)` remains and now
   applies `DefaultEmbedMaxConcurrent = 2` transparently for backward

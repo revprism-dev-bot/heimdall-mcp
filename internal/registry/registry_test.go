@@ -1,9 +1,12 @@
 package registry
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -202,5 +205,154 @@ func TestRegistry_RepairNeverRemovesEntries(t *testing.T) {
 	r := LoadRegistry()
 	if len(r.All()) != 1 {
 		t.Errorf("entry count = %d, want 1 (repair must not delete)", len(r.All()))
+	}
+}
+
+// withRegistryDir points XDG_CONFIG_HOME at a temp dir for the duration
+// of t so registryPath() is sandboxed. Returns the directory that will
+// hold projects.json.
+func withRegistryDir(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	return filepath.Join(tmp, "heimdall-mcp")
+}
+
+// TestLoadRegistry_LogsOnCorruptJSON pins the log-surface contract added
+// for the PR #73 re-review "nice-to-have" gap. A corrupt projects.json
+// must (1) log a diagnostic, (2) reset Projects to nil so downstream
+// resolvers don't see partial garbage, and (3) not panic.
+//
+// Before this fix the reader path silently returned an empty registry,
+// which masked real state loss.
+func TestLoadRegistry_LogsOnCorruptJSON(t *testing.T) {
+	dir := withRegistryDir(t)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	regPath := filepath.Join(dir, "projects.json")
+	// Malformed JSON — not a valid object.
+	if err := os.WriteFile(regPath, []byte("{not-json"), 0644); err != nil {
+		t.Fatalf("seed corrupt registry: %v", err)
+	}
+
+	// Capture log output.
+	var buf bytes.Buffer
+	origOut := log.Writer()
+	origFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(origOut)
+		log.SetFlags(origFlags)
+	}()
+
+	r := LoadRegistry()
+	if r == nil {
+		t.Fatalf("LoadRegistry returned nil on corrupt file (must return an empty registry, not nil)")
+	}
+	if len(r.Projects) != 0 {
+		t.Errorf("Projects len = %d, want 0 (must reset after parse failure); got %+v", len(r.Projects), r.Projects)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "corrupt") {
+		t.Errorf("log output did not mention corruption: %q", got)
+	}
+	if !strings.Contains(got, regPath) {
+		t.Errorf("log output did not include registry path %q: %q", regPath, got)
+	}
+}
+
+// TestRegistry_Save_Atomic_NoTempFileLeftOnSuccess — after a successful
+// Save, the only file in the registry directory must be projects.json.
+// No temp-file leaks.
+func TestRegistry_Save_Atomic_NoTempFileLeftOnSuccess(t *testing.T) {
+	dir := withRegistryDir(t)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	r := LoadRegistry()
+	r.Register("alpha", "/tmp/alpha", "/tmp/alpha/.heimdall_db")
+	if err := r.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == "projects.json" {
+			continue
+		}
+		if strings.HasSuffix(name, ".tmp") || strings.Contains(name, "projects-") {
+			t.Errorf("temp file leaked after successful Save: %s", name)
+		}
+	}
+
+	// Content round-trip check — file is valid JSON.
+	data, err := os.ReadFile(filepath.Join(dir, "projects.json"))
+	if err != nil {
+		t.Fatalf("read projects.json: %v", err)
+	}
+	var parsed Registry
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("projects.json not valid JSON after Save: %v (%q)", err, data)
+	}
+	if len(parsed.Projects) != 1 || parsed.Projects[0].Name != "alpha" {
+		t.Errorf("Save did not round-trip: %+v", parsed.Projects)
+	}
+}
+
+// TestRegistry_Save_Atomic_NoTempLeakOnRenameFailure — simulates a
+// rename failure by making the final path be an existing directory
+// (os.Rename into a directory fails). The temp file must be cleaned
+// up regardless.
+//
+// This exercises the deferred-cleanup branch in Save() and pins the
+// invariant that failure paths don't leak temps.
+func TestRegistry_Save_Atomic_NoTempLeakOnRenameFailure(t *testing.T) {
+	dir := withRegistryDir(t)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	r := LoadRegistry()
+	r.Register("alpha", "/tmp/alpha", "/tmp/alpha/.heimdall_db")
+
+	// Block the target path: create a directory where projects.json
+	// should live. os.Rename of a regular file onto a non-empty dir
+	// fails on Linux.
+	blocker := filepath.Join(dir, "projects.json")
+	if err := os.MkdirAll(blocker, 0755); err != nil {
+		t.Fatalf("mkdir blocker: %v", err)
+	}
+	// Put a file in it so rename to the directory name fails on all
+	// POSIX filesystems (empty dir could swap on some).
+	if err := os.WriteFile(filepath.Join(blocker, "sentinel"), []byte("x"), 0644); err != nil {
+		t.Fatalf("seed blocker: %v", err)
+	}
+
+	if err := r.Save(); err == nil {
+		t.Fatalf("Save succeeded unexpectedly — blocker directory should have made rename fail")
+	}
+
+	// Assert no temp files remain in the registry dir.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		// The blocker dir we created is expected; anything else that
+		// looks temp is a leak.
+		if name == "projects.json" {
+			continue
+		}
+		if strings.HasPrefix(name, "projects-") && strings.HasSuffix(name, ".tmp") {
+			t.Errorf("temp file leaked after failed Save: %s", name)
+		}
 	}
 }

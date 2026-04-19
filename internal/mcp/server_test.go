@@ -108,6 +108,13 @@ func TestServerNewOllamaClient_AppliesConfigCorrectly(t *testing.T) {
 			if client.TestMaxRetries() != tc.wantRetries {
 				t.Errorf("maxRetries = %d, want %d", client.TestMaxRetries(), tc.wantRetries)
 			}
+			// Endpoint assertion (PR #74 re-review L1). Guards against a
+			// future refactor accidentally swapping positional args so
+			// the Model string ends up passed as endpoint.
+			if client.TestEndpoint() != tc.cfg.OllamaEndpoint {
+				t.Errorf("endpoint = %q, want %q (positional-arg wiring regression)",
+					client.TestEndpoint(), tc.cfg.OllamaEndpoint)
+			}
 		})
 	}
 }
@@ -269,5 +276,159 @@ func TestServerNewOllamaClient_EnvOverrideDoesNotMutateCfg(t *testing.T) {
 	if s.Cfg.EmbedMaxRetries != snapshot.EmbedMaxRetries {
 		t.Errorf("s.Cfg.EmbedMaxRetries = %d, want %d (unchanged — env must be transient)",
 			s.Cfg.EmbedMaxRetries, snapshot.EmbedMaxRetries)
+	}
+}
+
+// TestServer_ConfigureSetRaceFreeUnderRace — PR #74 re-review N-1 race
+// guard. Concurrent `heimdall_configure set embedMaxConcurrent ...` +
+// `newOllamaClient()` calls must not race on Server.Cfg. Before the fix,
+// `newOllamaClient` read every embed field of s.Cfg outside any lock,
+// while `configureSet` wrote via `def.Set(&s.Cfg, ...)` unsynchronized.
+// Run this test under `-race` to catch regressions.
+func TestServer_ConfigureSetRaceFreeUnderRace(t *testing.T) {
+	t.Setenv("HEIMDALL_EMBED_MAX_CONCURRENT", "")
+	t.Setenv("HEIMDALL_EMBED_TIMEOUT_MS", "")
+	t.Setenv("HEIMDALL_EMBED_MAX_RETRIES", "")
+
+	// Sandbox SaveConfig so test writes don't touch the user's config.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	s := &Server{Cfg: config.Config{
+		OllamaEndpoint:     "http://localhost:11434",
+		Model:              "nomic-embed-text",
+		EmbedMaxConcurrent: 2,
+		EmbedTimeoutMs:     1000,
+		EmbedMaxRetries:    1,
+	}}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: cycle embedMaxConcurrent through a small set of values via
+	// configureSet. Uses the json.RawMessage input surface the actual
+	// MCP tool invokes to exercise the same code path end-to-end.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			val := 2 + (i % 4) // 2,3,4,5
+			args := []byte(`{"action":"set","key":"embedMaxConcurrent","value":` +
+				strconvItoa(val) + `}`)
+			_ = s.toolConfigure(args)
+		}
+	}()
+
+	// Readers: hammer newOllamaClient concurrently.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = s.newOllamaClient()
+			}
+		}()
+	}
+
+	// Let the storm run long enough for the race detector to observe
+	// concurrent read/write on the Cfg fields if unprotected.
+	time.Sleep(75 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+// strconvItoa is a tiny local helper to keep the test independent of
+// strconv import bloat at the top of the file.
+func strconvItoa(n int) string {
+	// We only pass small positive ints, so this is safe + allocates
+	// once per call. No need for a full implementation.
+	if n == 0 {
+		return "0"
+	}
+	digits := []byte{}
+	for n > 0 {
+		digits = append([]byte{byte('0' + n%10)}, digits...)
+		n /= 10
+	}
+	return string(digits)
+}
+
+// TestServerNewOllamaClient_RebuildDisposesOldClient — PR #74 re-review
+// N-3. After a config-driven rebuild, the OLD client must have had
+// Dispose() called so its HTTP keep-alive pool is released. We can't
+// directly observe CloseIdleConnections, but we CAN verify that the
+// rebuild does not panic and that the new client is a distinct object,
+// AND that Dispose() on a client with in-flight work does not break
+// subsequent Embed calls.
+func TestServerNewOllamaClient_RebuildDisposesOldClient(t *testing.T) {
+	t.Setenv("HEIMDALL_EMBED_MAX_CONCURRENT", "")
+	t.Setenv("HEIMDALL_EMBED_TIMEOUT_MS", "")
+	t.Setenv("HEIMDALL_EMBED_MAX_RETRIES", "")
+
+	// A slow HTTP server so we can keep a request in-flight on the OLD
+	// client during a rebuild.
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"embeddings":[[1.0]]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	s := &Server{Cfg: config.Config{
+		OllamaEndpoint:     srv.URL,
+		EmbedMaxConcurrent: 4,
+		EmbedTimeoutMs:     5000,
+		EmbedMaxRetries:    -1,
+	}}
+
+	oldClient := s.newOllamaClient()
+
+	// Fire an in-flight request on the old client.
+	embedDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := oldClient.Embed(ctx, "m", "t")
+		embedDone <- err
+	}()
+	<-started
+
+	// Trigger a rebuild by changing cfg. This should call Dispose() on
+	// oldClient — which must NOT cancel the in-flight request.
+	s.CfgMu.Lock()
+	s.Cfg.EmbedMaxConcurrent = 8
+	s.CfgMu.Unlock()
+	newClient := s.newOllamaClient()
+	if newClient == oldClient {
+		t.Fatalf("rebuild did not produce a new client")
+	}
+
+	// Let the in-flight request finish — it must NOT have been
+	// cancelled by Dispose.
+	close(release)
+	select {
+	case err := <-embedDone:
+		if err != nil {
+			t.Errorf("in-flight embed on old client failed after Dispose: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight embed on old client never returned")
 	}
 }

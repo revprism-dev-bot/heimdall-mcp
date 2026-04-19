@@ -107,7 +107,19 @@ func (r *Registry) repairStaleDBPaths() {
 	}
 }
 
-// Save persists the registry to disk.
+// Save persists the registry to disk atomically.
+//
+// Atomic-write recipe: write to a unique temp file in the SAME directory
+// (so the rename stays on one filesystem — no EXDEV), fsync the temp
+// file, then os.Rename into place. On any failure before rename we
+// best-effort remove the temp so the dir doesn't leak. On rename
+// success we take no further action — the new file now IS the registry.
+//
+// Rationale (PR #73 re-review / v2 R-v2-4): a crash between the old
+// os.WriteFile's truncate-write-close sequence would leave the registry
+// truncated (header-only → corrupt JSON). LoadRegistry now logs +
+// resets on parse failure (registry.go:LoadRegistry), but preventing
+// the truncation in the first place is strictly better.
 func (r *Registry) Save() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -121,7 +133,48 @@ func (r *Registry) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(r.filePath, data, 0644)
+
+	// Create the temp file in the same directory so the rename is
+	// atomic within the filesystem. os.CreateTemp handles name
+	// collisions via a random suffix.
+	tmp, err := os.CreateTemp(dir, "projects-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// Ensure cleanup on any failure. os.Remove is idempotent (no-op on
+	// ENOENT after a successful rename).
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	// fsync before rename so the data is actually on disk, not just in
+	// the page cache. This is what makes the atomic-rename "durable"
+	// rather than just "atomic-on-crash-but-maybe-lost".
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		// chmod failures are non-fatal (umask may have given us the
+		// right mode already); log-and-proceed via no log here to
+		// keep Save quiet — the rename is what matters.
+	}
+	if err := os.Rename(tmpName, r.filePath); err != nil {
+		return err
+	}
+	renamed = true
+	return nil
 }
 
 // Register adds or updates a project in the registry.
