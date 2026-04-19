@@ -896,3 +896,92 @@ func TestHookSessionStart_LogsSessionID(t *testing.T) {
 		t.Fatalf("expected session=abc-xyz in hooks.log:\n%s", string(logData))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// renderLastSessionReview tests (Task 3: SessionStart nag renderer)
+// ---------------------------------------------------------------------------
+
+// writeReviewFile is a local helper for tests; in-repo callers use
+// internal/cli/hook_stop.go's writer (landing in Task 4). Defining it here
+// keeps this task's tests runnable before Task 4 merges.
+func writeReviewFile(t *testing.T, projectDir string, body string) string {
+	t.Helper()
+	dir := filepath.Join(projectDir, ".heimdall_db", "hooks")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	p := filepath.Join(dir, "last-session-review.json")
+	if err := os.WriteFile(p, []byte(body), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return p
+}
+
+func TestSessionStartBlock_IncludesLastSessionReview(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+		"session_id": "s-1",
+		"ended_at": ` + fmt.Sprintf("%d", time.Now().Unix()-60) + `,
+		"candidates": 7,
+		"writes": 0,
+		"top_markers": ["correction","correction","workaround"],
+		"excerpts": [
+			"no, the other file — move the check before the loop not after",
+			"actually heimdall_remember still works when search is down",
+			"binding to 127.0.0.1 instead of localhost fixed macOS ::1"
+		]
+	}`
+	reviewPath := writeReviewFile(t, dir, body)
+
+	out := renderLastSessionReview(dir, time.Now())
+	if !strings.Contains(out, "### Last session review") {
+		t.Errorf("expected header; got %q", out)
+	}
+	if !strings.Contains(out, "7 candidate remember-moments") {
+		t.Errorf("expected count line; got %q", out)
+	}
+	if !strings.Contains(out, "move the check before the loop") {
+		t.Errorf("expected first excerpt; got %q", out)
+	}
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Errorf("expected review file unlinked after render; err=%v", err)
+	}
+}
+
+func TestSessionStartBlock_SkipsMissingReviewFile(t *testing.T) {
+	dir := t.TempDir()
+	out := renderLastSessionReview(dir, time.Now())
+	if out != "" {
+		t.Errorf("expected empty output when file missing, got %q", out)
+	}
+}
+
+func TestSessionStartBlock_SkipsStaleReviewFile(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+		"session_id": "s-old",
+		"ended_at": ` + fmt.Sprintf("%d", time.Now().Add(-8*24*time.Hour).Unix()) + `,
+		"candidates": 5,
+		"writes": 0,
+		"top_markers": ["correction"],
+		"excerpts": ["stale"]
+	}`
+	reviewPath := writeReviewFile(t, dir, body)
+
+	out := renderLastSessionReview(dir, time.Now())
+	if out != "" {
+		t.Errorf("expected empty output for stale file, got %q", out)
+	}
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Errorf("expected stale review file unlinked without render; err=%v", err)
+	}
+}
+
+func TestSessionStartBlock_SkipsMalformedReviewFile(t *testing.T) {
+	dir := t.TempDir()
+	_ = writeReviewFile(t, dir, "{ not json")
+	out := renderLastSessionReview(dir, time.Now())
+	if out != "" {
+		t.Errorf("expected empty output on malformed file, got %q", out)
+	}
+}

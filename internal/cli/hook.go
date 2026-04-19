@@ -436,9 +436,103 @@ func formatSessionStartBlock(status heimdall.StatusInfo, model, projectRoot stri
 		}
 	}
 
+	// NEW: render the last-session review if present. Silent no-op when
+	// missing/stale/malformed — so this line is safe to land before the
+	// writer in hook_stop.go is live.
+	b.WriteString(renderLastSessionReview(projectRoot, now))
+
 	appendSkillsSection(&b, skillBullets)
 
 	b.WriteString("\n_retrieved via heimdall-mcp_\n")
+	return b.String()
+}
+
+// lastSessionReview is the on-disk shape of .heimdall_db/hooks/last-session-review.json.
+// Written by HookSessionEnd (see internal/cli/hook_stop.go) and read once by
+// renderLastSessionReview at the next SessionStart. Keeping the type local to
+// hook.go avoids a package cycle with hook_stop.go — the writer side defines
+// its own equivalent; both serialize/deserialize through JSON so structural
+// compatibility is what matters, not type identity.
+type lastSessionReview struct {
+	SessionID  string   `json:"session_id"`
+	EndedAt    int64    `json:"ended_at"`
+	Candidates int      `json:"candidates"`
+	Writes     int      `json:"writes"`
+	TopMarkers []string `json:"top_markers"`
+	Excerpts   []string `json:"excerpts"`
+}
+
+const lastSessionReviewMaxAge = 7 * 24 * time.Hour
+
+// renderLastSessionReview returns the "### Last session review" markdown
+// section for inclusion in the SessionStart block, or empty string if:
+//   - the review file is missing
+//   - the file is malformed
+//   - the review is older than 7 days
+//
+// The review file is unlinked in all cases where it exists and is readable
+// (including stale and malformed), so a bad file doesn't keep nagging.
+// Only the successful-render path writes output; the unlink is side-effect.
+func renderLastSessionReview(projectDir string, now time.Time) string {
+	path := filepath.Join(projectDir, ".heimdall_db", "hooks", "last-session-review.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// Missing or unreadable — quietly skip. No unlink (nothing to unlink on ENOENT).
+		return ""
+	}
+	// Unlink before rendering: consume-once semantics survive even a render panic.
+	_ = os.Remove(path)
+
+	var rev lastSessionReview
+	if err := json.Unmarshal(data, &rev); err != nil {
+		heimdall.LogHookEvent("WARN", "session-start", map[string]any{"err": "review_json_parse_failed"})
+		return ""
+	}
+	endedAt := time.Unix(rev.EndedAt, 0)
+	if now.Sub(endedAt) > lastSessionReviewMaxAge {
+		return ""
+	}
+
+	// Counts by marker, preserving priority order.
+	markerCounts := map[string]int{}
+	for _, m := range rev.TopMarkers {
+		markerCounts[m]++
+	}
+	var markerParts []string
+	for _, m := range []string{"correction", "workaround", "teaching", "frustration"} {
+		if c := markerCounts[m]; c > 0 {
+			markerParts = append(markerParts, fmt.Sprintf("%d %s", c, m))
+		}
+	}
+	markerSummary := strings.Join(markerParts, ", ")
+
+	var b strings.Builder
+	b.WriteString("\n### Last session review\n")
+	fmt.Fprintf(&b, "%d candidate remember-moments", rev.Candidates)
+	if markerSummary != "" {
+		fmt.Fprintf(&b, " (%s)", markerSummary)
+	}
+	fmt.Fprintf(&b, " but only %d heimdall_remember / heimdall_index_text calls this session.\n\n", rev.Writes)
+
+	if len(rev.Excerpts) > 0 {
+		b.WriteString("Examples:\n")
+		for i, ex := range rev.Excerpts {
+			if i >= 3 {
+				break
+			}
+			marker := ""
+			if i < len(rev.TopMarkers) {
+				marker = rev.TopMarkers[i]
+			}
+			if marker != "" {
+				fmt.Fprintf(&b, "- %s: %q\n", marker, ex)
+			} else {
+				fmt.Fprintf(&b, "- %q\n", ex)
+			}
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("If any of these still matter, heimdall_remember them now.\n")
 	return b.String()
 }
 
