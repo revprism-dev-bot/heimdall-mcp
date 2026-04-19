@@ -182,9 +182,10 @@ func (s *Server) toolConfigure(args json.RawMessage) MCPToolResult {
 }
 
 func (s *Server) configureGet(key string) MCPToolResult {
+	snap := s.cfgSnapshot()
 	if key == "" {
 		// Return full config
-		out, err := json.MarshalIndent(s.Cfg, "", "  ")
+		out, err := json.MarshalIndent(snap, "", "  ")
 		if err != nil {
 			return ErrResult("marshal error: " + err.Error())
 		}
@@ -196,7 +197,7 @@ func (s *Server) configureGet(key string) MCPToolResult {
 		return ErrResult(fmt.Sprintf("unknown config key %q — valid keys: %s", key, validKeysList()))
 	}
 
-	value := def.Get(&s.Cfg)
+	value := def.Get(&snap)
 	out, _ := json.MarshalIndent(map[string]any{
 		"key":   key,
 		"value": value,
@@ -229,18 +230,28 @@ func (s *Server) configureSet(key string, value any) MCPToolResult {
 		}
 	}
 
+	// Write under the Cfg write lock so concurrent readers in
+	// newOllamaClient / cfgSnapshot observe a consistent Cfg. Release
+	// before the (potentially slow) SaveConfig I/O so concurrent readers
+	// aren't blocked on disk writes (PR #74 re-review N-1).
+	s.CfgMu.Lock()
 	if err := def.Set(&s.Cfg, value); err != nil {
+		s.CfgMu.Unlock()
 		return ErrResult(err.Error())
 	}
+	cfgCopy := s.Cfg
+	echoValue := def.Get(&s.Cfg)
+	s.CfgMu.Unlock()
 
-	// Persist to disk
-	if err := config.SaveConfig(s.Cfg); err != nil {
+	// Persist to disk using the snapshot so we don't re-read s.Cfg
+	// outside the lock.
+	if err := config.SaveConfig(cfgCopy); err != nil {
 		return ErrResult("config saved in memory but failed to persist: " + err.Error())
 	}
 
 	response := map[string]any{
 		"key":   key,
-		"value": def.Get(&s.Cfg),
+		"value": echoValue,
 		"saved": true,
 	}
 	if key == "model" {
@@ -272,7 +283,8 @@ func (s *Server) toolManagePaths(args json.RawMessage) MCPToolResult {
 }
 
 func (s *Server) managePathsList() MCPToolResult {
-	out, _ := json.MarshalIndent(s.Cfg.IndexedPaths, "", "  ")
+	snap := s.cfgSnapshot()
+	out, _ := json.MarshalIndent(snap.IndexedPaths, "", "  ")
 	return TextResult(string(out))
 }
 
@@ -290,9 +302,14 @@ func (s *Server) managePathsAdd(path string) MCPToolResult {
 		return ErrResult(fmt.Sprintf("path is not a directory: %s", path))
 	}
 
-	// Check for duplicate
+	// Check for duplicate, then append + persist under the Cfg write
+	// lock. Callers of cfgSnapshot / newOllamaClient are readers — we
+	// must not race them (PR #74 re-review N-1). Release before
+	// SaveConfig to keep disk I/O off the lock.
+	s.CfgMu.Lock()
 	for _, existing := range s.Cfg.IndexedPaths {
 		if existing == path {
+			s.CfgMu.Unlock()
 			out, _ := json.MarshalIndent(map[string]any{
 				"path":    path,
 				"status":  "already indexed",
@@ -301,17 +318,19 @@ func (s *Server) managePathsAdd(path string) MCPToolResult {
 			return TextResult(string(out))
 		}
 	}
-
-	// Add and persist
 	s.Cfg.IndexedPaths = append(s.Cfg.IndexedPaths, path)
-	if err := config.SaveConfig(s.Cfg); err != nil {
+	cfgCopy := s.Cfg
+	total := len(s.Cfg.IndexedPaths)
+	s.CfgMu.Unlock()
+
+	if err := config.SaveConfig(cfgCopy); err != nil {
 		return ErrResult("path added in memory but failed to persist: " + err.Error())
 	}
 
 	out, _ := json.MarshalIndent(map[string]any{
 		"path":   path,
 		"status": "added",
-		"total":  len(s.Cfg.IndexedPaths),
+		"total":  total,
 	}, "", "  ")
 	return TextResult(string(out))
 }
@@ -321,6 +340,7 @@ func (s *Server) managePathsRemove(path string) MCPToolResult {
 		return ErrResult("path is required for remove action")
 	}
 
+	s.CfgMu.Lock()
 	idx := -1
 	for i, p := range s.Cfg.IndexedPaths {
 		if p == path {
@@ -329,20 +349,22 @@ func (s *Server) managePathsRemove(path string) MCPToolResult {
 		}
 	}
 	if idx == -1 {
+		s.CfgMu.Unlock()
 		return ErrResult(fmt.Sprintf("path not found in indexed paths: %s", path))
 	}
-
-	// Remove by index
 	s.Cfg.IndexedPaths = append(s.Cfg.IndexedPaths[:idx], s.Cfg.IndexedPaths[idx+1:]...)
+	cfgCopy := s.Cfg
+	total := len(s.Cfg.IndexedPaths)
+	s.CfgMu.Unlock()
 
-	if err := config.SaveConfig(s.Cfg); err != nil {
+	if err := config.SaveConfig(cfgCopy); err != nil {
 		return ErrResult("path removed in memory but failed to persist: " + err.Error())
 	}
 
 	out, _ := json.MarshalIndent(map[string]any{
 		"path":   path,
 		"status": "removed",
-		"total":  len(s.Cfg.IndexedPaths),
+		"total":  total,
 	}, "", "  ")
 	return TextResult(string(out))
 }

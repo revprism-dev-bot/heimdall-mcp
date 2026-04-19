@@ -25,7 +25,16 @@ import (
 // call built its own client with its own semaphore → effective cap was
 // tool_call_count × max_concurrent). See pr74-review-concurrency.md
 // F5/M1 for the regression scenario.
+//
+// CfgMu guards all reads and writes of Cfg. Prior versions treated Cfg
+// as "effectively read-only" because stdio Handle calls were sequential,
+// but `runIndex` / `autoIndexOnSearch` / `toolIndexText` are fire-and-
+// forget goroutines — and `configureSet` writes Cfg fields — so
+// reads from `newOllamaClient` (which calls ResolveEmbedConfig(s.Cfg))
+// concurrent with a mid-session `heimdall_configure set` race on the
+// int fields. See PR #74 re-review N-1 (concurrency).
 type Server struct {
+	CfgMu       sync.RWMutex
 	Cfg         config.Config
 	Registry    *registry.Registry
 	Index       IndexState
@@ -34,6 +43,16 @@ type Server struct {
 	ollamaMu    sync.Mutex
 	ollama      *heimdall.OllamaClient
 	ollamaKey   ollamaClientKey
+}
+
+// cfgSnapshot returns a value copy of s.Cfg under a read lock. Callers
+// that only need fields (endpoint, model, embed tunables) should use
+// this helper rather than referencing s.Cfg directly, which is a race
+// with `configureSet` unless the goroutine is main-thread stdio.
+func (s *Server) cfgSnapshot() config.Config {
+	s.CfgMu.RLock()
+	defer s.CfgMu.RUnlock()
+	return s.Cfg
 }
 
 // ollamaClientKey captures the subset of config that determines client
@@ -71,7 +90,11 @@ func TextResult(text string) MCPToolResult {
 // semantics and pr74-review-security-config.md H1 for the persistence
 // hazard this avoids.
 func (s *Server) newOllamaClient() *heimdall.OllamaClient {
-	effective := config.ResolveEmbedConfig(s.Cfg)
+	// Read Cfg under the read lock then release BEFORE taking ollamaMu.
+	// ResolveEmbedConfig operates on the snapshot value copy — no
+	// further s.Cfg reads.
+	base := s.cfgSnapshot()
+	effective := config.ResolveEmbedConfig(base)
 	key := ollamaClientKey{
 		endpoint:      effective.OllamaEndpoint,
 		maxConcurrent: effective.EmbedMaxConcurrent,
@@ -84,6 +107,16 @@ func (s *Server) newOllamaClient() *heimdall.OllamaClient {
 
 	if s.ollama != nil && s.ollamaKey == key {
 		return s.ollama
+	}
+
+	// Rebuild: the old client is NOT closed (in-flight requests still
+	// hold its sem / httpClient). Graceful disposal releases idle
+	// HTTP keep-alive connections so we don't accumulate a tail of
+	// stale sockets per config rebuild (PR #74 re-review N-3). Does
+	// NOT cancel in-flight requests; they drain against the old client
+	// and release their slots naturally.
+	if s.ollama != nil {
+		s.ollama.Dispose()
 	}
 
 	s.ollama = heimdall.NewOllamaClientFromConfig(

@@ -204,6 +204,31 @@ func NewOllamaClientWithOptions(endpoint string, opts OllamaOptions) *OllamaClie
 	}
 }
 
+// Dispose releases the client's cheap, non-blocking, externally-visible
+// resources. Specifically: closes idle HTTP keep-alive connections on
+// the embedded http.Client. In-flight requests are NOT cancelled and
+// retain their semaphore slots; callers that hold a reference to this
+// client continue to work until their requests complete naturally.
+//
+// Dispose is idempotent and safe to call concurrently with in-flight
+// requests (CloseIdleConnections is documented thread-safe in net/http).
+// Called by Server.newOllamaClient on the OLD client during a
+// config-driven rebuild so stale sockets don't accumulate (PR #74
+// re-review N-3).
+//
+// Dispose intentionally does NOT zero `c.sem`: existing acquirers must
+// still be able to release their slots. Go's GC reclaims the channel
+// once every defer'd release has fired and the Server drops its
+// reference.
+func (c *OllamaClient) Dispose() {
+	if c == nil {
+		return
+	}
+	if c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
+	}
+}
+
 // acquireEmbedSlot blocks until the semaphore admits this call, or ctx is
 // cancelled. Returns a release func (always non-nil; safe to call when
 // acquire returned an error — it's a no-op in that case).

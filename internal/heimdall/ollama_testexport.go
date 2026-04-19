@@ -19,3 +19,19 @@ func (c *OllamaClient) TestEmbedTimeout() time.Duration { return c.embedTimeout 
 // TestMaxRetries returns the client's configured maxRetries (post
 // FromConfig sentinel resolution).
 func (c *OllamaClient) TestMaxRetries() int { return c.maxRetries }
+
+// TestEndpoint returns the client's endpoint string. Added so tests
+// can assert that the 1st positional argument of NewOllamaClientFromConfig
+// did not get swapped with another parameter in a future refactor (PR
+// #74 re-review L1).
+func (c *OllamaClient) TestEndpoint() string { return c.endpoint }
+
+// TestSemCap returns the semaphore capacity (len(sem channel buffer))
+// or 0 when unbounded. Tests rely on this to distinguish
+// `sem == nil` (explicit-unbounded) from a positive capacity.
+func (c *OllamaClient) TestSemCap() int {
+	if c.sem == nil {
+		return 0
+	}
+	return cap(c.sem)
+}
