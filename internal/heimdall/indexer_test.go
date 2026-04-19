@@ -1650,6 +1650,193 @@ func TestIndexSubRepos_NilCallbacksAreSafe(t *testing.T) {
 	}
 }
 
+// TestIndexSubRepos_RegistersEvenWhenStoreOpenFails reproduces the exact
+// symptom from the v0.0.3 handoff: a user synced `.heimdall_db/` across
+// machines (git/gitea), the SQLite file on the target machine is broken
+// (truncated / wrong schema / permission-denied), and `OpenStore` fails.
+// PR #75 claimed this was fixed by moving OnSubRepoDiscovered "before the
+// incremental short-circuit" — but the callback still fired AFTER
+// successful OpenStore, so a broken sub-repo DB caused the sub-repo to
+// be silently dropped from the registry (app was already registered
+// with a stale dbPath, service + infra never appeared).
+//
+// Discovery is about identifying sub-repos, not about store health. The
+// OnSubRepoDiscovered callback MUST fire for every discovered (and
+// user-not-excluded) sub-repo regardless of whether OpenStore succeeds.
+//
+// Repro technique: place a regular file at `<sub>/.heimdall_db`, which
+// makes `ModelDBDir` → `OpenStore` fail because `MkdirAll` cannot create
+// a subdir under a non-directory. This is the same trick used by
+// TestSubRepoResult_NilResultOnStoreOpenFailure and is portable across
+// Linux/macOS/CI (no chmod / root / EBUSY tricks).
+func TestIndexSubRepos_RegistersEvenWhenStoreOpenFails(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(root, "payments-service")
+	if err := os.MkdirAll(filepath.Join(sub, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "c.go"), []byte("package c\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Force OpenStore to fail: `.heimdall_db` exists as a FILE, so the
+	// later MkdirAll(<sub>/.heimdall_db/<model>) returns ENOTDIR.
+	if err := os.WriteFile(filepath.Join(sub, ".heimdall_db"), []byte("blocker"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+
+	type discoveryEvent struct {
+		path, name, dbPath string
+	}
+	var discovered []discoveryEvent
+	opts := SubRepoOpts{
+		OnSubRepoDiscovered: func(path, name, dbPath string) {
+			discovered = append(discovered, discoveryEvent{path, name, dbPath})
+		},
+	}
+	results, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", opts)
+	if err != nil {
+		t.Fatalf("discovery-level err = %v; expected nil (store failures are per-entry)", err)
+	}
+
+	// Sanity: per-entry failure is surfaced (same contract as
+	// TestSubRepoResult_NilResultOnStoreOpenFailure).
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+	if results[0].Err == nil {
+		t.Errorf("expected per-entry Err for store-open failure; got nil")
+	}
+
+	// Core assertion: the discovery callback fired EVEN THOUGH OpenStore
+	// failed. Prior to the fix this slice is empty — the callback was
+	// gated behind successful OpenStore (indexer.go pre-fix: OpenStore
+	// at line 312, callback at 346, with `continue` at 323).
+	if len(discovered) != 1 {
+		t.Fatalf("OnSubRepoDiscovered fired %d times; want 1 (registration must be independent of store health)", len(discovered))
+	}
+	got := discovered[0]
+	if got.path != sub {
+		t.Errorf("discovered.path = %q, want %q", got.path, sub)
+	}
+	if got.name != "payments-service" {
+		t.Errorf("discovered.name = %q, want %q", got.name, "payments-service")
+	}
+	wantDB := filepath.Join(sub, ".heimdall_db")
+	if got.dbPath != wantDB {
+		t.Errorf("discovered.dbPath = %q, want %q", got.dbPath, wantDB)
+	}
+}
+
+// TestIndexSubRepos_DiscoveryFiresForEveryDiscoveredSubRepo is the
+// higher-level property invariant for Problem #3 + the OpenStore-failure
+// regression above. For any wrapper root, the number of
+// OnSubRepoDiscovered events MUST equal the number of discovered
+// sub-repos that were NOT user-excluded, regardless of per-sub-repo
+// success or failure.
+//
+// Fixture: one healthy sub-repo ("app"), one with broken store
+// ("service", `.heimdall_db` blocker), and one user-excluded
+// ("infra-excluded"). Expected event count = 2 (the two non-excluded
+// ones). A passing test proves: registration is independent of
+// OpenStore outcome AND user-excluded sub-repos are filtered out
+// before the callback fires (matching the pre-filter contract in
+// IndexSubRepos).
+func TestIndexSubRepos_DiscoveryFiresForEveryDiscoveredSubRepo(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Healthy sub-repo.
+	app := filepath.Join(root, "app")
+	if err := os.MkdirAll(filepath.Join(app, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "a.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Broken-store sub-repo (same blocker trick as the test above).
+	service := filepath.Join(root, "service")
+	if err := os.MkdirAll(filepath.Join(service, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(service, "s.go"), []byte("package s\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(service, ".heimdall_db"), []byte("blocker"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// User-excluded sub-repo (by exclude glob). Must NOT appear in the
+	// discovery callback stream.
+	excluded := filepath.Join(root, "infra-excluded")
+	if err := os.MkdirAll(filepath.Join(excluded, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(excluded, "i.go"), []byte("package i\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Confirm DiscoverSubReposAbs sees all 3 raw. The property below
+	// excludes the user-excluded one.
+	raw, err := DiscoverSubReposAbs(root)
+	if err != nil {
+		t.Fatalf("DiscoverSubReposAbs: %v", err)
+	}
+	if len(raw) != 3 {
+		t.Fatalf("discovery saw %d sub-repos, want 3", len(raw))
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{
+		MaxChunkSize: 1500,
+		ExcludeGlobs: []string{"infra-excluded"},
+	})
+
+	var discovered []string
+	opts := SubRepoOpts{
+		OnSubRepoDiscovered: func(path, name, dbPath string) {
+			discovered = append(discovered, name)
+		},
+	}
+	if _, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", opts); err != nil {
+		t.Fatalf("IndexSubRepos: %v", err)
+	}
+
+	// Property: event count == (discovered - user-excluded), regardless
+	// of per-sub-repo success/failure.
+	wantNames := map[string]bool{"app": true, "service": true}
+	if len(discovered) != len(wantNames) {
+		t.Fatalf("OnSubRepoDiscovered fired %d times; want %d (names=%v)", len(discovered), len(wantNames), discovered)
+	}
+	for _, n := range discovered {
+		if !wantNames[n] {
+			t.Errorf("unexpected discovery event for %q (user-excluded or unknown)", n)
+		}
+		delete(wantNames, n)
+	}
+	for n := range wantNames {
+		t.Errorf("missing discovery event for %q", n)
+	}
+}
+
 // --- Problem #2 (handoff) — sub_project tagging regression tests ---
 
 // countSubProjectValues returns the COUNT(*) grouped by sub_project from

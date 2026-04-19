@@ -595,7 +595,18 @@ func newSubRepoCLIOpts(w io.Writer, outerStart time.Time) heimdall.SubRepoOpts {
 			elapsed := time.Since(subStart).Round(time.Second)
 			fmt.Fprintln(w) // end the \r progress line
 			if res.Err != nil || res.Result == nil {
+				// User-facing line on the configured writer (usually
+				// stdout, may be a test buffer) — keeps the existing
+				// terminal output shape.
 				fmt.Fprintf(w, "  FAILED after %s: %v\n", elapsed, res.Err)
+				// Additionally surface the failure on stderr with the
+				// sub-repo path so callers piping stdout (e.g. scripts
+				// grepping for a summary) still see per-sub-repo errors
+				// and so CI logs show which sub-repo was broken. The
+				// sub-repo is already registered at this point (the
+				// discovery callback fires before OpenStore), so this
+				// line is purely diagnostic.
+				fmt.Fprintf(os.Stderr, "sub-repo %s (%s) failed: %v\n", res.Name, res.Path, res.Err)
 				return
 			}
 			fmt.Fprintf(w, "  Done: %d files, %d chunks, %s elapsed\n",

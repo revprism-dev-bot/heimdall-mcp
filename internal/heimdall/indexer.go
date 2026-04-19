@@ -157,14 +157,26 @@ type SubRepoOpts struct {
 	// with the finalized SubRepoResult (whether successful or failed).
 	// Nil to skip.
 	OnSubRepoDone func(res SubRepoResult)
-	// OnSubRepoDiscovered fires exactly ONCE per discovered-and-not-excluded
-	// sub-repo, after store-open succeeds but BEFORE the incremental
-	// short-circuit — so no-op incremental runs still register the entry.
-	// Prior to this callback the caller only registered sub-repos whose
-	// Result != nil, so transient store-open failures or incremental no-ops
-	// left the entry absent from the registry (handoff Problem #3). The
-	// callback is invoked with the sub-repo Path, Name, and DBPath for
-	// idempotent upsert. Nil to skip (preserves historical behaviour).
+	// OnSubRepoDiscovered fires exactly ONCE per discovered-and-not-
+	// user-excluded sub-repo, BEFORE any per-sub-repo work that can fail
+	// (model resolution, OpenStore, backfill, indexing). Registration is
+	// semantically about discovery, not about whether the store opens
+	// cleanly on this run — so a corrupt / schema-mismatched / permission-
+	// denied .heimdall_db from another machine does NOT suppress the
+	// registration callback.
+	//
+	// Prior to this contract the caller only registered sub-repos whose
+	// Result != nil (handoff Problem #3 — no-op incremental runs dropped
+	// entries) AND then, briefly, only after successful OpenStore — which
+	// left sub-repos with corrupt stores silently absent from the
+	// registry (v0.0.3 bug: app registered with stale dbPath, service +
+	// infra never appeared). Firing before OpenStore fixes both cases.
+	//
+	// Callback is invoked with the sub-repo Path, Name, and DBPath
+	// (the .heimdall_db root — no model subdir, because registration
+	// is model-agnostic). The caller's Register implementation MUST be
+	// idempotent (Registry.Register tuple-dedupes). Nil to skip
+	// (preserves historical behaviour).
 	OnSubRepoDiscovered func(path, name, dbPath string)
 }
 
@@ -276,6 +288,33 @@ func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, opts SubRep
 			DBPath: filepath.Join(subAbs, ".heimdall_db"),
 		}
 
+		// Fire the discovery callback IMMEDIATELY, before any work that
+		// can fail (model resolution, OpenStore, backfill, indexing).
+		// Registration is semantically about "this sub-repo exists and
+		// should live in the registry", not about whether its store
+		// happens to open cleanly on this run.
+		//
+		// Why this matters (v0.0.3 bug): a user who syncs .heimdall_db/
+		// across machines via git/gitea can land with a corrupt SQLite
+		// file (truncated, wrong schema, WAL out of sync, permissions)
+		// on the target. Pre-fix, OpenStore ran first; a failure there
+		// `continue`d past the callback, so the sub-repo was discovered
+		// but never registered (wrapper-app was already present with a
+		// stale dbPath, -service and -infra silently dropped). The
+		// post-loop safety net in cli.go only runs for sub-repos with
+		// Result != nil, so store failures slipped every gate.
+		//
+		// Callback contract:
+		//   - fires exactly once per discovered-and-not-user-excluded
+		//     sub-repo, regardless of subsequent per-sub-repo outcome
+		//   - dbPath is the sub-repo's .heimdall_db root (no model
+		//     subdir), because registration is model-agnostic
+		//   - caller's Register implementation MUST be idempotent
+		//     (Registry.Register tuple-dedupes)
+		if opts.OnSubRepoDiscovered != nil {
+			opts.OnSubRepoDiscovered(subRes.Path, subRes.Name, subRes.DBPath)
+		}
+
 		if opts.OnSubRepoStart != nil {
 			opts.OnSubRepoStart(subRes.Name, i+1, total)
 		}
@@ -336,16 +375,10 @@ func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, opts SubRep
 		// per-file progress events via an intermediate channel drained in
 		// parallel; the consumer only sees the forwarded callback, not the
 		// channel.
-		// Fire the discovery callback immediately after successful
-		// store-open and BEFORE indexing (including the incremental
-		// short-circuit inside indexFiles). This lets the orchestrator
-		// register the sub-repo even when no files changed on a
-		// second incremental run — handoff Problem #3. The caller's
-		// register implementation must be idempotent (tuple dedupe in
-		// Registry.Register is).
-		if opts.OnSubRepoDiscovered != nil {
-			opts.OnSubRepoDiscovered(subRes.Path, subRes.Name, subRes.DBPath)
-		}
+		//
+		// Discovery callback already fired above (before OpenStore) so
+		// the orchestrator has registered this sub-repo even if store
+		// open and/or indexing fail on this run.
 
 		// Backfill pre-fix rows: any existing chunk in this sub-repo's
 		// store that carries sub_project='' (or NULL) is promoted to
