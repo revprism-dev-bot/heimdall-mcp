@@ -5,8 +5,19 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 )
+
+// reservedSentinelName matches dunder sentinel names like "__root__" that
+// the filter path reserves (see heimdall.SubProjectRoot). Registering a
+// project whose Name matches this pattern would create ambiguity between
+// the sentinel ("filter to outer/wrapper only") and a sub-repo literally
+// named "__root__". Per locked R-v2-1 / plan §12, sub-repo registration
+// rejects such names with a WARN log. The pattern is intentionally
+// restrictive (lowercase ASCII only) — operational sub-repo names from
+// tooling never match.
+var reservedSentinelName = regexp.MustCompile(`^__[a-z]+__$`)
 
 // ProjectEntry maps a project name to its index location.
 type ProjectEntry struct {
@@ -41,6 +52,17 @@ func registryPath() string {
 // lean on registry integrity, so a silent reset was masking real state
 // loss. Atomic save (a separate PR) will prevent the corruption in the
 // first place; this log surfaces the reader side for now.
+//
+// After a successful load, `repairStaleDBPaths` walks every entry and
+// rewrites DBPath to the canonical <path>/.heimdall_db location when:
+//   - DBPath != canonical location, AND
+//   - the canonical location exists on disk.
+//
+// This closes the A-L-5 / D-02 repair gap — the symptom seen in the
+// handoff where a sub-repo entry's dbPath pointed at its parent wrapper
+// despite the sub-repo having its own .heimdall_db/ directory. Repair
+// NEVER deletes entries (D-08 I12); it only updates dbPath. Every
+// rewrite is logged at WARN so operators can audit the change.
 func LoadRegistry() *Registry {
 	r := &Registry{filePath: registryPath()}
 
@@ -54,8 +76,35 @@ func LoadRegistry() *Registry {
 		// code paths. Any subsequent Register() call will Save() a clean
 		// file.
 		r.Projects = nil
+		return r
 	}
+	r.repairStaleDBPaths()
 	return r
+}
+
+// repairStaleDBPaths normalises in-memory entries whose DBPath does not
+// match the canonical <Path>/.heimdall_db location but where the
+// canonical location exists on disk. NEVER deletes entries; only
+// updates DBPath. Called only from LoadRegistry; holds the registry
+// mutex because it mutates r.Projects.
+func (r *Registry) repairStaleDBPaths() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, p := range r.Projects {
+		if p.Path == "" {
+			continue
+		}
+		canonical := filepath.Clean(filepath.Join(p.Path, ".heimdall_db"))
+		if filepath.Clean(p.DBPath) == canonical {
+			continue
+		}
+		info, err := os.Stat(canonical)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		log.Printf("heimdall: repairing stale DBPath for project %q: %s → %s (canonical store exists)", p.Name, p.DBPath, canonical)
+		r.Projects[i].DBPath = canonical
+	}
 }
 
 // Save persists the registry to disk atomically.
@@ -129,12 +178,31 @@ func (r *Registry) Save() error {
 }
 
 // Register adds or updates a project in the registry.
+//
+// Dedupe is keyed on the (Name, Path) TUPLE — the pre-fix code used
+// `Name OR Path` which meant two distinct projects that happened to share
+// a sub-repo basename (e.g. two wrappers each containing a "shared/"
+// sub-repo) would clobber each other. The tuple contract is the locked
+// A-L-3 / D-03 decision and is guarded by
+// TestRegistry_TupleDedupe_AllowsSharedNamesAtDistinctPaths.
+//
+// Reserved-sentinel names (`^__[a-z]+__$`, e.g. `__root__`) are rejected
+// with a WARN log and a no-op — those names are reserved for filter
+// sentinels (see heimdall.SubProjectRoot). Rejecting at Register keeps
+// downstream search filters unambiguous. Guarded by
+// TestRegistry_Register_RejectsReservedSentinelName.
 func (r *Registry) Register(name, projectPath, dbPath string) {
+	if reservedSentinelName.MatchString(name) {
+		log.Printf("heimdall: refusing to register project with reserved sentinel name %q (pattern ^__[a-z]+__$); pick a different name", name)
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	for i, p := range r.Projects {
-		if p.Name == name || p.Path == projectPath {
+		if p.Name == name && p.Path == projectPath {
+			// Tuple match: update in place (usually just refreshes DBPath
+			// after a legacy → canonical move).
 			r.Projects[i] = ProjectEntry{Name: name, Path: projectPath, DBPath: dbPath}
 			return
 		}

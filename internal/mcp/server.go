@@ -728,6 +728,18 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 	}
 	dbDir := heimdall.ModelDBDir(baseDir, s.Cfg.Model)
 
+	// Auto-derive sub_project from the registered project entry when we
+	// can: if input.Project resolves to a registry entry, use its name so
+	// ingested external text participates in sub_project filters exactly
+	// like code chunks (Problem #2 — external content writer was silently
+	// dropping the tag). Empty project → "" (outer/wrapper semantics).
+	subProjectTag := ""
+	if input.Project != "" {
+		if p := s.Registry.Find(input.Project); p != nil {
+			subProjectTag = p.Name
+		}
+	}
+
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
 		return sanitizeStoreError("store", err)
@@ -765,6 +777,7 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 			SourceType:    sourceType,
 			Metadata:      metadataStr,
 			Relationships: relationshipsStr,
+			SubProject:    subProjectTag,
 		})
 	}
 

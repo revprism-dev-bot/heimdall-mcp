@@ -341,11 +341,16 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlags []string
 		if i > 0 {
 			fmt.Println()
 		}
-		subResults := indexWithModel(ctx, cfg, client, absPath, baseDir, modelName, effectiveExcludes)
+		// Pass the registry so indexWithModel can register each sub-repo
+		// unconditionally via IndexSubRepos.OnSubRepoDiscovered — that
+		// fires after successful store-open but BEFORE the incremental
+		// short-circuit, so no-op runs still refresh the registry. The
+		// downstream loop below is the idempotent safety net.
+		subResults := indexWithModel(ctx, cfg, client, absPath, baseDir, modelName, effectiveExcludes, reg)
 
-		// Register each successful sub-repo in the project registry. Failures
-		// are surfaced in the summary but do not get registered (otherwise
-		// `heimdall-mcp projects` would list broken entries).
+		// Idempotent safety net: re-register each sub-repo that got as far
+		// as producing a Result. Registry.Register tuple-dedupes, so this
+		// is a no-op for entries already registered during discovery.
 		for _, sr := range subResults {
 			if sr.Err != nil || sr.Result == nil {
 				continue
@@ -380,8 +385,11 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlags []string
 
 // indexWithModel runs the outer indexing pass followed by a sub-repo pass
 // and prints the categorized summary (plan §G6). Returns the sub-repo
-// results so the caller can register them.
-func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.OllamaClient, absPath, baseDir, modelName string, excludeGlobs []string) []heimdall.SubRepoResult {
+// results so the caller can register them. reg (nullable) is wired into
+// IndexSubRepos.OnSubRepoDiscovered so each sub-repo is registered at
+// discovery time (before the incremental short-circuit) — the caller's
+// post-loop Register call remains as an idempotent safety net.
+func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.OllamaClient, absPath, baseDir, modelName string, excludeGlobs []string, reg *registry.Registry) []heimdall.SubRepoResult {
 	heimdall.MigrateToModelDir(baseDir, modelName)
 	if _, err := heimdall.MigrateLegacyLatestDir(baseDir, modelName); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: legacy-latest migration for %s: %v\n", baseDir, err)
@@ -449,6 +457,11 @@ func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.Oll
 	// Wire CLI callbacks so the user sees per-sub-repo progress instead of
 	// minutes of silence while 60k+ files quietly embed (PR #67 regression).
 	subOpts := newSubRepoCLIOpts(os.Stdout, startTime)
+	if reg != nil {
+		subOpts.OnSubRepoDiscovered = func(path, name, dbPath string) {
+			reg.Register(name, path, dbPath)
+		}
+	}
 	subResults, subErr := indexer.IndexSubRepos(ctx, modelName, subOpts)
 	if subErr != nil {
 		fmt.Fprintf(os.Stderr, "Warning: sub-repo discovery failed: %v\n", subErr)
