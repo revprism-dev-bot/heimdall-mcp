@@ -837,7 +837,7 @@ func main() {
 		hooksLogFlag = flag.String("hooks-log", heimdall.HookLogPath(), "path to hooks.log for prompt_embed_b64 lookup")
 		dbFlag       = flag.String("db", "", "path to .heimdall_db/<model>/ directory (must contain vectors.db); when empty, auto-detects from CWD")
 		modelFlag    = flag.String("model", "nomic-embed-text", "embedding model name")
-		ollamaFlag   = flag.String("ollama", "http://localhost:11434", "Ollama endpoint")
+		ollamaFlag   = flag.String("ollama", "http://127.0.0.1:11434", "Ollama endpoint")
 		t1Min        = flag.Float64("t1-min", 0.40, "T1 grid min (redundant threshold)")
 		t1Max        = flag.Float64("t1-max", 0.70, "T1 grid max")
 		t1Step       = flag.Float64("t1-step", 0.05, "T1 grid step")

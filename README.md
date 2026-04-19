@@ -129,7 +129,7 @@ Heimdall is local-first. There are three distinct boundaries worth keeping strai
 
 **Stays on your machine (what Heimdall actually does):**
 
-- Embedding generation (Ollama at `http://localhost:11434`, configurable via `ollamaEndpoint`)
+- Embedding generation (Ollama at `http://127.0.0.1:11434`, configurable via `ollamaEndpoint`)
 - SQLite vector store + memory store (under `.heimdall_db/` and `~/.config/heimdall-mcp/`)
 - Hook execution (the six `SessionStart`/`UserPromptSubmit`/`PreToolUse`/`PostToolUse`/`Stop`/`SessionEnd` handlers)
 - MCP tool execution (`heimdall_search`, `heimdall_index`, `heimdall_recall`, `heimdall_remember`, etc.)
@@ -350,7 +350,7 @@ Create `~/.config/heimdall-mcp/config.json` or use `heimdall_configure` / `heimd
 
 ```json
 {
-  "ollamaEndpoint": "http://localhost:11434",
+  "ollamaEndpoint": "http://127.0.0.1:11434",
   "model": "nomic-embed-text",
   "contextDepth": 1,
   "maxContextTokens": 4096,
