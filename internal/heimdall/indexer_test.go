@@ -1649,3 +1649,369 @@ func TestIndexSubRepos_NilCallbacksAreSafe(t *testing.T) {
 		t.Errorf("FilesIndexed = %d, want 1", results[0].Result.FilesIndexed)
 	}
 }
+
+// --- Problem #2 (handoff) — sub_project tagging regression tests ---
+
+// countSubProjectValues returns the COUNT(*) grouped by sub_project from
+// the given store's entries table. Helper used by the tagging tests so
+// assertions are one-liners.
+func countSubProjectValues(t *testing.T, store *VectorStore) map[string]int {
+	t.Helper()
+	db := store.DB()
+	rows, err := db.Query(`SELECT COALESCE(sub_project, ''), COUNT(*) FROM entries GROUP BY sub_project`)
+	if err != nil {
+		t.Fatalf("count sub_project: %v", err)
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var k string
+		var n int
+		if err := rows.Scan(&k, &n); err != nil {
+			t.Fatal(err)
+		}
+		out[k] = n
+	}
+	return out
+}
+
+// TestIndexSubRepos_AllChunksCarrySubProjectName is the planner-2 §2.1
+// regression for Problem #2. Prior to the fix, NewIndexer(subAbs, …) was
+// used for the sub-repo indexer pass — DiscoverSubRepos(subAbs) returns
+// the sub-repo's CHILDREN (not itself), so every chunk landed with
+// SubProject="". Post-fix, the sub-repo indexer is constructed via
+// NewIndexerWithSubProject(subAbs, …, subRes.Name), so every chunk in the
+// sub-repo's own store carries the sub-repo's own name.
+func TestIndexSubRepos_AllChunksCarrySubProjectName(t *testing.T) {
+	root := t.TempDir()
+	// Outer wrapper with one top-level file (outer chunks remain untagged).
+	if err := os.WriteFile(filepath.Join(root, "outer.go"), []byte("package outer\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Two sub-repos with one file each.
+	alphaDir := filepath.Join(root, "alpha")
+	if err := os.MkdirAll(filepath.Join(alphaDir, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(alphaDir, "a.go"), []byte("package alpha\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	betaDir := filepath.Join(root, "beta")
+	if err := os.MkdirAll(filepath.Join(betaDir, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(betaDir, "b.go"), []byte("package beta\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	if _, err := idx.IndexAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alpha sub-repo's own store must contain only rows with sub_project="alpha".
+	alphaStore, err := OpenStore(filepath.Join(alphaDir, ".heimdall_db", "nomic-embed-text"))
+	if err != nil {
+		t.Fatalf("open alpha store: %v", err)
+	}
+	defer alphaStore.Close()
+	got := countSubProjectValues(t, alphaStore)
+	if got["alpha"] == 0 {
+		t.Errorf("alpha store: expected chunks tagged sub_project='alpha', got %v", got)
+	}
+	if got[""] > 0 {
+		t.Errorf("alpha store: found %d rows with sub_project='' (regression of Problem #2)", got[""])
+	}
+	if len(got) != 1 {
+		t.Errorf("alpha store: expected exactly one sub_project value, got %v", got)
+	}
+
+	// Beta sub-repo's own store must contain only rows with sub_project="beta".
+	betaStore, err := OpenStore(filepath.Join(betaDir, ".heimdall_db", "nomic-embed-text"))
+	if err != nil {
+		t.Fatalf("open beta store: %v", err)
+	}
+	defer betaStore.Close()
+	got = countSubProjectValues(t, betaStore)
+	if got["beta"] == 0 {
+		t.Errorf("beta store: expected chunks tagged sub_project='beta', got %v", got)
+	}
+	if got[""] > 0 {
+		t.Errorf("beta store: found %d rows with sub_project='' (regression of Problem #2)", got[""])
+	}
+}
+
+// TestIndexAll_OuterChunksHaveEmptySubProject verifies the invariant that
+// outer/wrapper chunks produced by the outer walk always carry sub_project=''
+// (so consumers of the __root__ sentinel see stable behaviour). Because
+// sub-repo directories are SkipDir'd during the outer walk, the only chunks
+// the outer store ever holds are outer chunks.
+func TestIndexAll_OuterChunksHaveEmptySubProject(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "outer.go"), []byte("package outer\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	subDir := filepath.Join(root, "alpha")
+	if err := os.MkdirAll(filepath.Join(subDir, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "a.go"), []byte("package alpha\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	if _, err := idx.IndexAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	got := countSubProjectValues(t, outerStore)
+	if got[""] == 0 {
+		t.Errorf("outer store: expected chunks tagged sub_project='', got %v", got)
+	}
+	for k := range got {
+		if k != "" {
+			t.Errorf("outer store: unexpected non-empty sub_project %q (=%d rows)", k, got[k])
+		}
+	}
+}
+
+// TestIndexSubRepos_BackfillsLegacyRows verifies that on a second
+// IndexSubRepos pass against a sub-repo store that already contains rows
+// with sub_project='' (a pre-fix store), those rows are promoted to the
+// sub-repo name. This is the D-05 backfill behaviour plumbed through
+// IndexSubRepos at store-open time.
+func TestIndexSubRepos_BackfillsLegacyRows(t *testing.T) {
+	root := t.TempDir()
+	subDir := filepath.Join(root, "alpha")
+	if err := os.MkdirAll(filepath.Join(subDir, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "a.go"), []byte("package alpha\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-seed the sub-repo's store with a row carrying sub_project=''
+	// (legacy pre-fix state).
+	subDBDir := filepath.Join(subDir, ".heimdall_db", "nomic-embed-text")
+	if err := os.MkdirAll(subDBDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	seedStore, err := OpenStore(subDBDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seedStore.Upsert([]VectorRecord{{
+		ID:         "legacy-row",
+		FilePath:   "legacy.go",
+		StartLine:  1,
+		EndLine:    1,
+		Content:    "// legacy",
+		Kind:       "file",
+		Embedding:  []float32{0.1, 0.2, 0.3},
+		SourceType: "code",
+		SubProject: "", // pre-fix marker
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	seedStore.Close()
+
+	outerStore, err := OpenStore(filepath.Join(t.TempDir(), "outer-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerStore.Close()
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexer(root, embedder, outerStore, ChunkerOpts{MaxChunkSize: 1500})
+	if _, err := idx.IndexSubRepos(context.Background(), "nomic-embed-text", SubRepoOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-open and verify the legacy row was backfilled.
+	after, err := OpenStore(subDBDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer after.Close()
+	got := countSubProjectValues(t, after)
+	if got[""] > 0 {
+		t.Errorf("backfill did not promote legacy rows: %d still have sub_project='' (got %v)", got[""], got)
+	}
+	if got["alpha"] == 0 {
+		t.Errorf("expected backfilled rows with sub_project='alpha', got %v", got)
+	}
+}
+
+// TestBackfillSubProject_NullBecomesEmpty — D-05 (B-2). Direct-NULL rows
+// (possible on stores written by binaries that predate the ALTER TABLE
+// DEFAULT '' column) are also promoted by BackfillSubProject.
+func TestBackfillSubProject_NullBecomesEmpty(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Directly insert a row with sub_project = NULL via raw SQL to
+	// simulate a pre-ALTER-TABLE state. INSERT OR REPLACE on a column
+	// with DEFAULT '' won't produce a NULL via the Upsert API, so we
+	// bypass it.
+	if _, err := store.DB().Exec(`INSERT INTO entries
+		(id, file_path, start_line, end_line, content, kind, identifier,
+		 vector, mod_time, content_hash, source_type, metadata, relationships,
+		 summary, context_path, sub_project)
+		VALUES ('null-row','f.go',1,1,'x','file','',X'00',0,'','code','{}','[]','','', NULL)`,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := store.BackfillSubProject("alpha")
+	if err != nil {
+		t.Fatalf("BackfillSubProject: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("rows affected = %d, want 1 (NULL → 'alpha')", n)
+	}
+
+	got := countSubProjectValues(t, store)
+	if got["alpha"] != 1 {
+		t.Errorf("after backfill: want 1 row with sub_project='alpha', got %v", got)
+	}
+}
+
+// TestBackfillSubProject_Idempotent — D-05 (B-2, I11). Calling backfill a
+// second time with the same name is a no-op (0 rows affected) because
+// every row already has a non-empty sub_project.
+func TestBackfillSubProject_Idempotent(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.Upsert([]VectorRecord{{
+		ID:         "r1",
+		FilePath:   "a.go",
+		StartLine:  1,
+		EndLine:    1,
+		Content:    "// a",
+		Kind:       "file",
+		Embedding:  []float32{0.1, 0.2, 0.3},
+		SourceType: "code",
+		SubProject: "",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	n1, err := store.BackfillSubProject("alpha")
+	if err != nil {
+		t.Fatalf("first backfill: %v", err)
+	}
+	if n1 != 1 {
+		t.Errorf("first backfill rows = %d, want 1", n1)
+	}
+
+	n2, err := store.BackfillSubProject("alpha")
+	if err != nil {
+		t.Fatalf("second backfill: %v", err)
+	}
+	if n2 != 0 {
+		t.Errorf("second backfill rows = %d, want 0 (idempotent)", n2)
+	}
+
+	// Different name must NOT overwrite existing non-empty tags.
+	n3, err := store.BackfillSubProject("beta")
+	if err != nil {
+		t.Fatalf("third backfill: %v", err)
+	}
+	if n3 != 0 {
+		t.Errorf("third backfill rows = %d, want 0 (only '' rows should be touched)", n3)
+	}
+}
+
+// TestBackfillSubProject_RejectsEmptyName guards the contract: empty name
+// is a programming error, not a silent no-op.
+func TestBackfillSubProject_RejectsEmptyName(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.BackfillSubProject(""); err == nil {
+		t.Errorf("BackfillSubProject(\"\") expected error, got nil")
+	}
+}
+
+// TestSearchFiltered_RootSentinel — OQ-c. sub_project="__root__" filters to
+// outer/wrapper chunks only.
+func TestSearchFiltered_RootSentinel(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	recs := []VectorRecord{
+		{ID: "outer-row", FilePath: "outer.go", StartLine: 1, EndLine: 1, Content: "outer", Kind: "file", Embedding: []float32{1, 0, 0}, SourceType: "code", SubProject: ""},
+		{ID: "alpha-row", FilePath: "alpha/a.go", StartLine: 1, EndLine: 1, Content: "alpha", Kind: "file", Embedding: []float32{1, 0, 0}, SourceType: "code", SubProject: "alpha"},
+	}
+	if err := store.Upsert(recs); err != nil {
+		t.Fatal(err)
+	}
+	results := store.SearchFiltered(context.Background(), []float32{1, 0, 0}, 0, "", SubProjectRoot, nil)
+	if len(results) == 0 {
+		t.Fatalf("__root__ sentinel returned zero results; want outer row")
+	}
+	for _, r := range results {
+		if r.Record.SubProject != "" {
+			t.Errorf("result has SubProject=%q, want '' (__root__ must exclude sub-repo rows)", r.Record.SubProject)
+		}
+	}
+}
+
+// TestNewIndexerWithSubProject_ExplicitOverrideWins covers the constructor
+// contract: even if DiscoverSubRepos(root) would match a file's first
+// component, the explicit override takes precedence.
+func TestNewIndexerWithSubProject_ExplicitOverrideWins(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	dbDir := filepath.Join(t.TempDir(), ".heimdall_db")
+	store, err := OpenStore(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	embedder := &StubEmbedder{Vectors: make(map[string][]float32), Dimension: 3}
+	idx := NewIndexerWithSubProject(root, embedder, store, ChunkerOpts{MaxChunkSize: 1500}, "forced")
+	if _, err := idx.IndexAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	got := countSubProjectValues(t, store)
+	if got["forced"] == 0 {
+		t.Errorf("expected rows with sub_project='forced', got %v", got)
+	}
+	if got[""] > 0 {
+		t.Errorf("expected no rows with sub_project='', got %v", got)
+	}
+}

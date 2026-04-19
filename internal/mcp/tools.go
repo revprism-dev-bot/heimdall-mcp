@@ -390,7 +390,7 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 								// mismatch the sub-repo's store.
 								subEmbedder = heimdall.NewOllamaEmbedder(client, sr.Model)
 							}
-							gitResult, gitErr := heimdall.IndexGitCommits(ctx, sr.Path, 200, subEmbedder, subStore)
+							gitResult, gitErr := heimdall.IndexGitCommitsWithSubProject(ctx, sr.Path, 200, subEmbedder, subStore, sr.Name)
 							if gitErr != nil {
 								log.Printf("git commit indexing for %s failed: %v", sr.Name, gitErr)
 							} else if gitResult.CommitsIndexed > 0 {
