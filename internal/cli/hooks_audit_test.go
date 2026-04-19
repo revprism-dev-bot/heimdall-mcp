@@ -451,15 +451,23 @@ func TestDispatchHooks_Help_MentionsAuditGuardrails(t *testing.T) {
 // Plan 11a §5.4 item 9: audit-guardrails must bucket `class=unknown →
 // llm:<class>` verdicts and `prompt_version=N` in separate sections.
 func TestHooksAudit_LLMVerdictsAndPromptVersion(t *testing.T) {
+	// Relative timestamps so the fixture doesn't bit-rot when the
+	// wall-clock slides past the hard-coded date (the --since=24h
+	// filter here was masking the seeded entries once UTC moved past
+	// 2026-04-19).
+	now := time.Now().UTC()
+	fmtTS := func(offsetSec int) string {
+		return now.Add(-time.Duration(offsetSec) * time.Second).Format(time.RFC3339)
+	}
 	seedAuditLog(t, []string{
 		// Three classify rows whose rule_id is `llm:<model>`. The LLM
 		// fallback upgraded ClassUnknown to allow/warn/block.
-		`2026-04-18T10:00:00Z INFO event=pre-tool-use stage=classify mode=block class=allow rule_id=llm:llama3.2:3b reason=benign`,
-		`2026-04-18T10:00:01Z INFO event=pre-tool-use stage=classify mode=block class=warn  rule_id=llm:llama3.2:3b reason=r`,
-		`2026-04-18T10:00:02Z WARN event=pre-tool-use stage=classify mode=block class=block rule_id=llm:llama3.2:3b reason=p`,
+		fmtTS(5) + ` INFO event=pre-tool-use stage=classify mode=block class=allow rule_id=llm:llama3.2:3b reason=benign`,
+		fmtTS(4) + ` INFO event=pre-tool-use stage=classify mode=block class=warn  rule_id=llm:llama3.2:3b reason=r`,
+		fmtTS(3) + ` WARN event=pre-tool-use stage=classify mode=block class=block rule_id=llm:llama3.2:3b reason=p`,
 		// Two llm.classifier.classify telemetry rows, one per prompt version.
-		`2026-04-18T10:00:03Z INFO event=pre-tool-use stage=llm.classifier.classify model=llama3.2:3b prompt_version=1 elapsed_ms=120 class=allow reason_len=12`,
-		`2026-04-18T10:00:04Z INFO event=pre-tool-use stage=llm.classifier.classify model=llama3.2:3b prompt_version=2 elapsed_ms=110 class=warn reason_len=14`,
+		fmtTS(2) + ` INFO event=pre-tool-use stage=llm.classifier.classify model=llama3.2:3b prompt_version=1 elapsed_ms=120 class=allow reason_len=12`,
+		fmtTS(1) + ` INFO event=pre-tool-use stage=llm.classifier.classify model=llama3.2:3b prompt_version=2 elapsed_ms=110 class=warn reason_len=14`,
 	})
 	out, errBuf, code := runAudit(t, "--format=json", "--since=24h")
 	if code != 0 {
