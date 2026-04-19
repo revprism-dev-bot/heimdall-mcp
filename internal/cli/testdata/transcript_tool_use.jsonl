@@ -1,0 +1,4 @@
+{"role":"assistant","content":[{"type":"text","text":"I'll remember that."},{"type":"tool_use","name":"heimdall_remember","input":{"content":"use -tags integration for tests"}}]}
+{"role":"user","content":"also index that Jira ticket I shared"}
+{"role":"assistant","content":[{"type":"tool_use","name":"heimdall_index_text","input":{"text":"..."}}]}
+{"role":"assistant","content":"Here's a plain text message, no tool use."}

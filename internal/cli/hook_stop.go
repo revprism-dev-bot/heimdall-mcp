@@ -1,11 +1,16 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
@@ -136,7 +141,9 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 		if _, err := os.Stat(payload.TranscriptPath); err == nil {
 			transcript, err := os.ReadFile(payload.TranscriptPath)
 			if err == nil && len(transcript) > 0 {
-				summary := extractTranscriptSummary(transcript)
+				summary, candidates := extractTranscriptSummary(transcript)
+				writes := countHeimdallWrites(transcript)
+
 				if summary != "" {
 					memDBPath := config.ResolveMemoryDBPath()
 					memStore, err := heimdall.OpenMemoryStore(memDBPath)
@@ -157,6 +164,13 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 						}
 					}
 				}
+
+				if err := writeLastSessionReview(projectDir, payload.SessionID, time.Now(), candidates, writes); err != nil {
+					heimdall.LogHookEvent("WARN", "session-end", map[string]any{
+						"err": "review_write_failed",
+						"msg": err.Error(),
+					})
+				}
 			}
 		}
 	}
@@ -176,56 +190,235 @@ func resolveBufferDir(projectDir string) string {
 	return filepath.Join(projectDir, ".heimdall_db", "hooks", "sessions")
 }
 
-func extractTranscriptSummary(data []byte) string {
-	var messages []string
-	start := 0
-	for i := 0; i < len(data); i++ {
-		if data[i] == '\n' {
-			line := data[start:i]
-			start = i + 1
-			if len(line) == 0 {
-				continue
-			}
-			var entry map[string]any
-			if json.Unmarshal(line, &entry) != nil {
-				continue
-			}
-			if role, _ := entry["role"].(string); role == "assistant" {
-				if content, _ := entry["content"].(string); content != "" {
-					messages = append(messages, content)
-				}
-			}
-		}
+// CandidateEvent is one remember-worthy moment detected in a transcript scan.
+// Excerpt is capped at 200 chars; Marker is one of: correction, frustration,
+// teaching, workaround.
+type CandidateEvent struct {
+	Marker  string
+	Excerpt string
+}
+
+// Marker priority (highest first) for review-record ranking.
+var candidateMarkerPriority = []string{"correction", "workaround", "teaching", "frustration"}
+
+// markerPatterns maps marker class → compiled regex. Regexes scan user
+// messages only. Precompiled at package init.
+var markerPatterns = map[string]*regexp.Regexp{
+	"correction":  regexp.MustCompile(`(?i)\bactually\b|\bno,?\s|\bdon['']?t\b|\bstop\b|\binstead\b|\bwrong\b`),
+	"frustration": regexp.MustCompile(`(?i)\bfuck\b|\bwhy\b|\bbroken\b`),
+	"teaching":    regexp.MustCompile(`(?i)\bturns out\b|\bfyi\b|\bheads up\b|\bfor reference\b`),
+	"workaround":  regexp.MustCompile(`(?i)\bworkaround\b|\bhack\b|\btrick\b|\bgotcha\b`),
+}
+
+const (
+	extractorMaxOutput  = 20 * 1024
+	extractorExcerptMax = 200
+	extractorTailCount  = 3
+	extractorTailLen    = 800
+)
+
+// extractTranscriptSummary scans the full JSONL transcript for user-side
+// marker hits and returns:
+//   - summary: concatenated context windows around each hit (user message
+//     + preceding assistant message), deduplicated, joined with
+//     "\n\n---\n\n", capped at 20 KB. On zero hits, falls back to the
+//     last 3 assistant messages trimmed to 800 chars each.
+//   - candidates: one entry per hit with marker class + ≤200-char excerpt.
+//
+// Single byte-scan pass; O(len(data)) + O(hits × regex_cost).
+func extractTranscriptSummary(data []byte) (string, []CandidateEvent) {
+	type parsed struct {
+		role    string
+		content string
 	}
-	if start < len(data) {
-		line := data[start:]
-		if len(line) > 0 {
-			var entry map[string]any
-			if json.Unmarshal(line, &entry) == nil {
-				if role, _ := entry["role"].(string); role == "assistant" {
-					if content, _ := entry["content"].(string); content != "" {
-						messages = append(messages, content)
-					}
+	var msgs []parsed
+
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	sc.Buffer(make([]byte, 2*1024*1024), 2*1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if json.Unmarshal(line, &entry) != nil {
+			continue
+		}
+		role, _ := entry["role"].(string)
+		if role == "" {
+			continue
+		}
+		content := extractContentText(entry["content"])
+		if content == "" {
+			continue
+		}
+		msgs = append(msgs, parsed{role: role, content: content})
+	}
+
+	var candidates []CandidateEvent
+	var windows []string
+	seen := map[string]bool{}
+
+	for i, m := range msgs {
+		if m.role != "user" {
+			continue
+		}
+		for _, marker := range candidateMarkerPriority {
+			if markerPatterns[marker].MatchString(m.content) {
+				excerpt := m.content
+				if len(excerpt) > extractorExcerptMax {
+					excerpt = excerpt[:extractorExcerptMax]
 				}
+				candidates = append(candidates, CandidateEvent{Marker: marker, Excerpt: excerpt})
+
+				var win strings.Builder
+				if i > 0 && msgs[i-1].role == "assistant" {
+					win.WriteString("assistant: ")
+					win.WriteString(trimTo(msgs[i-1].content, extractorTailLen))
+					win.WriteString("\n\n")
+				}
+				win.WriteString("user: ")
+				win.WriteString(trimTo(m.content, extractorTailLen))
+				s := win.String()
+				if !seen[s] {
+					seen[s] = true
+					windows = append(windows, s)
+				}
+				break
 			}
 		}
 	}
 
-	if len(messages) > 5 {
-		messages = messages[len(messages)-5:]
+	if len(windows) == 0 {
+		var tail []string
+		for i := len(msgs) - 1; i >= 0 && len(tail) < extractorTailCount; i-- {
+			if msgs[i].role == "assistant" {
+				tail = append([]string{trimTo(msgs[i].content, extractorTailLen)}, tail...)
+			}
+		}
+		windows = tail
 	}
-	if len(messages) == 0 {
+
+	summary := strings.Join(windows, "\n\n---\n\n")
+	if len(summary) > extractorMaxOutput {
+		summary = summary[:extractorMaxOutput]
+	}
+	return summary, candidates
+}
+
+// extractContentText handles both Claude Code transcript content shapes:
+// a bare string, or an array of content blocks with {"type":"text","text":"..."}.
+// Returns the concatenated text portion; tool_use blocks are ignored here
+// (counted separately by countHeimdallWrites).
+func extractContentText(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return v
+	case []any:
+		var parts []string
+		for _, block := range v {
+			m, ok := block.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := m["type"].(string); t == "text" {
+				if text, _ := m["text"].(string); text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
 		return ""
 	}
-	result := ""
-	for _, m := range messages {
-		if len(m) > 500 {
-			m = m[:500]
+}
+
+func trimTo(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// countHeimdallWrites returns the number of tool_use blocks in the
+// transcript whose name is heimdall_remember or heimdall_index_text.
+func countHeimdallWrites(data []byte) int {
+	n := 0
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	sc.Buffer(make([]byte, 2*1024*1024), 2*1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
 		}
-		result += m + "\n\n"
+		var entry map[string]any
+		if json.Unmarshal(line, &entry) != nil {
+			continue
+		}
+		raw, ok := entry["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, block := range raw {
+			m, ok := block.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := m["type"].(string); t != "tool_use" {
+				continue
+			}
+			name, _ := m["name"].(string)
+			if name == "heimdall_remember" || name == "heimdall_index_text" {
+				n++
+			}
+		}
 	}
-	if len(result) > 5000 {
-		result = result[:5000]
+	return n
+}
+
+// writeLastSessionReview persists a review record when the session warrants
+// nagging the next SessionStart. Suppression: skip when candidates <= 2 AND
+// writes >= 1 (well-behaved session). Only 3 highest-priority excerpts.
+func writeLastSessionReview(projectDir, sessionID string, endedAt time.Time, candidates []CandidateEvent, writes int) error {
+	if len(candidates) <= 2 && writes >= 1 {
+		return nil
 	}
-	return result
+
+	priorityIdx := map[string]int{}
+	for i, m := range candidateMarkerPriority {
+		priorityIdx[m] = i
+	}
+	ranked := make([]CandidateEvent, len(candidates))
+	copy(ranked, candidates)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return priorityIdx[ranked[i].Marker] < priorityIdx[ranked[j].Marker]
+	})
+
+	topMarkers := make([]string, 0, 3)
+	excerpts := make([]string, 0, 3)
+	for i, c := range ranked {
+		if i >= 3 {
+			break
+		}
+		topMarkers = append(topMarkers, c.Marker)
+		excerpts = append(excerpts, c.Excerpt)
+	}
+
+	record := map[string]any{
+		"session_id":  sessionID,
+		"ended_at":    endedAt.Unix(),
+		"candidates":  len(candidates),
+		"writes":      writes,
+		"top_markers": topMarkers,
+		"excerpts":    excerpts,
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(projectDir, ".heimdall_db", "hooks")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "last-session-review.json"), data, 0600)
 }
