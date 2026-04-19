@@ -37,15 +37,50 @@ type Indexer struct {
 	store    *VectorStore
 	opts     ChunkerOpts
 	root     string
+	// subProjectOverride, when non-empty, forces every chunk produced by
+	// this indexer to carry the given value in its SubProject field. Used
+	// by IndexSubRepos so that sub-repo indexers (whose root is the sub-repo
+	// itself) tag their own chunks with the sub-repo's name rather than ""
+	// (the old behaviour that made sub_project filters return zero rows —
+	// see handoff Problem #2). For the outer/wrapper indexer this field is
+	// empty and the standard DiscoverSubRepos-based tagging applies, which
+	// only ever tags outer chunks with "" because sub-repo files are
+	// SkipDir'd before reaching the tagger.
+	subProjectOverride string
 }
 
 // NewIndexer creates an indexer for the given project root.
+//
+// The returned indexer tags chunks via DiscoverSubRepos(root), which is
+// correct for the outer/wrapper pass but always yields "" when the root
+// itself is a sub-repo (because DiscoverSubRepos enumerates immediate
+// children, not root). Use NewIndexerWithSubProject to force a sub_project
+// tag when indexing a sub-repo as its own project.
 func NewIndexer(root string, embedder Embedder, store *VectorStore, opts ChunkerOpts) *Indexer {
 	return &Indexer{
 		embedder: embedder,
 		store:    store,
 		opts:     opts,
 		root:     root,
+	}
+}
+
+// NewIndexerWithSubProject creates an indexer whose produced chunks all
+// carry subProject as their SubProject field, overriding the
+// DiscoverSubRepos-based tagging. subProject must be non-empty; callers
+// who want the default behaviour should use NewIndexer instead. Passing
+// an empty string is a programming error (it would silently disable the
+// override and fall back to DiscoverSubRepos tagging — masking the
+// caller's intent). This constructor is the fix for handoff Problem #2:
+// sub-repo chunks now carry the sub-repo's own name so sub_project-scoped
+// searches against the sub-repo's store return the expected rows.
+func NewIndexerWithSubProject(root string, embedder Embedder, store *VectorStore, opts ChunkerOpts, subProject string) *Indexer {
+	return &Indexer{
+		embedder:           embedder,
+		store:              store,
+		opts:               opts,
+		root:               root,
+		subProjectOverride: subProject,
 	}
 }
 
@@ -122,6 +157,15 @@ type SubRepoOpts struct {
 	// with the finalized SubRepoResult (whether successful or failed).
 	// Nil to skip.
 	OnSubRepoDone func(res SubRepoResult)
+	// OnSubRepoDiscovered fires exactly ONCE per discovered-and-not-excluded
+	// sub-repo, after store-open succeeds but BEFORE the incremental
+	// short-circuit — so no-op incremental runs still register the entry.
+	// Prior to this callback the caller only registered sub-repos whose
+	// Result != nil, so transient store-open failures or incremental no-ops
+	// left the entry absent from the registry (handoff Problem #3). The
+	// callback is invoked with the sub-repo Path, Name, and DBPath for
+	// idempotent upsert. Nil to skip (preserves historical behaviour).
+	OnSubRepoDiscovered func(path, name, dbPath string)
 }
 
 // SubRepoResult describes one sub-repo's indexing outcome.
@@ -292,7 +336,36 @@ func (idx *Indexer) IndexSubRepos(ctx context.Context, model string, opts SubRep
 		// per-file progress events via an intermediate channel drained in
 		// parallel; the consumer only sees the forwarded callback, not the
 		// channel.
-		subIdx := NewIndexer(subAbs, idx.embedder, subStore, idx.opts)
+		// Fire the discovery callback immediately after successful
+		// store-open and BEFORE indexing (including the incremental
+		// short-circuit inside indexFiles). This lets the orchestrator
+		// register the sub-repo even when no files changed on a
+		// second incremental run — handoff Problem #3. The caller's
+		// register implementation must be idempotent (tuple dedupe in
+		// Registry.Register is).
+		if opts.OnSubRepoDiscovered != nil {
+			opts.OnSubRepoDiscovered(subRes.Path, subRes.Name, subRes.DBPath)
+		}
+
+		// Backfill pre-fix rows: any existing chunk in this sub-repo's
+		// store that carries sub_project='' (or NULL) is promoted to
+		// the sub-repo name so post-fix sub_project filters immediately
+		// see those rows. Idempotent: rows that already match name are
+		// unaffected; rows with a different non-empty name are left
+		// alone. Swallows the error — a backfill failure should not
+		// block indexing (the store still works, filters just miss
+		// legacy rows until a future reindex repopulates them).
+		if _, backfillErr := subStore.BackfillSubProject(subRes.Name); backfillErr != nil {
+			// Best-effort; continue indexing.
+			_ = backfillErr
+		}
+
+		// Use NewIndexerWithSubProject so every chunk produced by this
+		// sub-repo's indexer carries the sub-repo name (e.g.
+		// "payments-analyzer-app"). Prior to this fix sub-repo stores
+		// were universally tagged with "" and sub_project filters
+		// returned zero rows (handoff Problem #2).
+		subIdx := NewIndexerWithSubProject(subAbs, idx.embedder, subStore, idx.opts, subRes.Name)
 		var r *IndexResult
 		var indexErr error
 		if opts.OnProgress != nil {
@@ -541,7 +614,20 @@ func (idx *Indexer) indexFiles(ctx context.Context, incremental bool, progress c
 
 		// Embed all chunks (batch if supported, fallback to one-at-a-time)
 		fileHash := hashFile(path)
-		subProject := subProjectForFile(relPath, subRepoDirs)
+		// Sub-project tagging: if this indexer was constructed via
+		// NewIndexerWithSubProject, every chunk carries that explicit value
+		// (fixes Problem #2 — sub-repo indexers rooted at subAbs previously
+		// produced "" for every row because DiscoverSubRepos(subAbs) returns
+		// the sub-repo's CHILDREN, not itself). Otherwise fall back to the
+		// original DiscoverSubRepos-based tagger — which for the outer
+		// wrapper always returns "" (sub-repo dirs are SkipDir'd) and for
+		// any future multi-root usage preserves historical behaviour.
+		var subProject string
+		if idx.subProjectOverride != "" {
+			subProject = idx.subProjectOverride
+		} else {
+			subProject = subProjectForFile(relPath, subRepoDirs)
+		}
 		info, _ := os.Stat(path)
 		var mtime int64
 		if info != nil {

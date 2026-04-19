@@ -26,7 +26,22 @@ type gitCommit struct {
 // IndexGitCommits indexes recent git commits from a repository for semantic search.
 // It runs `git log` to extract commits, embeds them, and upserts into the store.
 // depth controls how many commits to index.
+//
+// Deprecated: pass a sub_project tag via IndexGitCommitsWithSubProject so
+// commit rows can be filtered by sub_project consistently with file-code
+// rows. This thin wrapper preserves existing callers and stamps
+// sub_project="" (outer/wrapper semantics).
 func IndexGitCommits(ctx context.Context, repoPath string, depth int, embedder Embedder, store *VectorStore) (*GitIndexResult, error) {
+	return IndexGitCommitsWithSubProject(ctx, repoPath, depth, embedder, store, "")
+}
+
+// IndexGitCommitsWithSubProject is the explicit-sub-project form of
+// IndexGitCommits. Every commit record produced carries subProject in its
+// SubProject field so search filters (`sub_project = ?`) return the
+// expected rows. Pass "" for outer/wrapper stores; pass the sub-repo name
+// (e.g. filepath.Base(sr.Path)) when writing into a sub-repo store.
+// Closes handoff Problem #2 for the commit writer.
+func IndexGitCommitsWithSubProject(ctx context.Context, repoPath string, depth int, embedder Embedder, store *VectorStore, subProject string) (*GitIndexResult, error) {
 	if depth <= 0 {
 		depth = 200
 	}
@@ -99,6 +114,7 @@ func IndexGitCommits(ctx context.Context, repoPath string, depth int, embedder E
 			SourceType:    "commit",
 			Metadata:      fmt.Sprintf(`{"hash":"%s"}`, c.Hash),
 			Relationships: "[]",
+			SubProject:    subProject,
 		})
 	}
 

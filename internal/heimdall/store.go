@@ -15,6 +15,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// SubProjectRoot is the reserved sentinel that callers pass as sub_project
+// to restrict a search to outer/wrapper chunks only (rows whose sub_project
+// is NULL or ''). Empty string continues to mean "no filter". Per locked
+// OQ-c / R-v2-1 the registry rejects sub-repo names matching ^__[a-z]+__$
+// to prevent collision with this sentinel.
+const SubProjectRoot = "__root__"
+
 // VectorRecord is a single indexed chunk with its embedding.
 type VectorRecord struct {
 	ID            string    `json:"id"`
@@ -225,8 +232,20 @@ func (s *VectorStore) SearchFiltered(ctx context.Context, query []float32, topK 
 		args = append(args, sourceType)
 	}
 	if subProject != "" {
-		conditions = append(conditions, `sub_project = ?`)
-		args = append(args, subProject)
+		// SubProjectRoot sentinel: "__root__" filters to outer/wrapper
+		// chunks only (rows whose sub_project is empty OR NULL). This is
+		// the locked OQ-c semantic — empty string continues to mean "no
+		// filter" (back-compat), but callers who want wrapper-only hits
+		// can now express that intent. Reserved sentinel names matching
+		// ^__[a-z]+__$ are rejected at registry.Register time to avoid
+		// collision with a sub-repo literally named "__root__". See
+		// handoff Problem #2 / plan OQ-c / R-v2-1.
+		if subProject == SubProjectRoot {
+			conditions = append(conditions, `(sub_project IS NULL OR sub_project = '')`)
+		} else {
+			conditions = append(conditions, `sub_project = ?`)
+			args = append(args, subProject)
+		}
 	}
 	if cfg.scopePath != "" {
 		conditions = append(conditions, `context_path LIKE ? || '%'`)
@@ -690,4 +709,38 @@ func (s *VectorStore) DB() *sql.DB {
 // write-level coordination with the store.
 func (s *VectorStore) Mu() *sync.RWMutex {
 	return &s.mu
+}
+
+// BackfillSubProject sets the sub_project column to name for every row in
+// the store whose sub_project is currently NULL or '' (the default for
+// stores indexed before Problem #2 was fixed). It is safe to call on a
+// store that already has fully-populated sub_project values — it is a
+// no-op (idempotent).
+//
+// The helper exists specifically for legacy sub-repo stores written by
+// pre-fix binaries: those rows carry '' (or NULL) and the post-fix search
+// filter (`sub_project = ?`) returns zero hits. Running this helper once
+// at the top of a sub-repo indexing pass promotes the existing rows into
+// the post-fix tagging regime without a full reindex.
+//
+// name must be non-empty. An empty name is rejected rather than silently
+// doing nothing, because every legitimate backfill caller has a concrete
+// sub-repo name to stamp (IndexSubRepos passes filepath.Base(subPath)).
+//
+// Returns the number of rows updated. See TestBackfillSubProject_*.
+func (s *VectorStore) BackfillSubProject(name string) (int64, error) {
+	if name == "" {
+		return 0, os.ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		`UPDATE entries SET sub_project = ? WHERE sub_project IS NULL OR sub_project = ''`,
+		name,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }

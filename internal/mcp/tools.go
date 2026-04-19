@@ -363,7 +363,16 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 					// project, register each, and index its git commits INTO
 					// ITS OWN STORE (fixes the tools.go:362 bug where sub-repo
 					// commits were being written to the outer store).
-					subResults, subErr := indexer.IndexSubRepos(ctx, s.Cfg.Model, heimdall.SubRepoOpts{})
+					subResults, subErr := indexer.IndexSubRepos(ctx, s.Cfg.Model, heimdall.SubRepoOpts{
+						OnSubRepoDiscovered: func(path, name, dbPath string) {
+							// Register unconditionally on discovery so
+							// incremental no-op runs and transient index
+							// errors still leave the sub-repo in the
+							// registry. See handoff Problem #3 +
+							// Registry.Register tuple dedupe.
+							s.Registry.Register(name, path, dbPath)
+						},
+					})
 					if subErr != nil {
 						log.Printf("sub-repo discovery failed: %v", subErr)
 					}
@@ -390,7 +399,7 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 								// mismatch the sub-repo's store.
 								subEmbedder = heimdall.NewOllamaEmbedder(client, sr.Model)
 							}
-							gitResult, gitErr := heimdall.IndexGitCommits(ctx, sr.Path, 200, subEmbedder, subStore)
+							gitResult, gitErr := heimdall.IndexGitCommitsWithSubProject(ctx, sr.Path, 200, subEmbedder, subStore, sr.Name)
 							if gitErr != nil {
 								log.Printf("git commit indexing for %s failed: %v", sr.Name, gitErr)
 							} else if gitResult.CommitsIndexed > 0 {
