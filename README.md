@@ -563,6 +563,26 @@ Heimdall automatically migrates existing data:
 
 No manual migration steps are needed.
 
+### Legacy `<model>_latest/` → `<model>/` migration
+
+Older heimdall-mcp releases occasionally created model subdirectories with
+the suffix `_latest` — e.g. `.heimdall_db/nomic-embed-text_latest/` — when
+Ollama reported the model name as `nomic-embed-text:latest`. Current
+releases drop the suffix and canonicalize on `.heimdall_db/<model>/`.
+
+On the first write (CLI `index`, MCP `heimdall_index`, or MCP
+`heimdall_index_text`) per project, heimdall-mcp renames
+`<baseDir>/<model>_latest/` to `<baseDir>/<model>/`. The rename is
+lock-protected (concurrent writers are safe), skips symlinks, and
+preserves data. If both directories already exist, it logs and leaves
+them in place so the operator can manually merge them.
+
+To opt out of the rename (e.g. during a staged rollout or while auditing
+the state by hand), set the `HEIMDALL_DISABLE_LEGACY_MIGRATION=1`
+environment variable before starting the MCP server or running the CLI.
+The reader (`ModelDBDir`) still picks whichever directory holds the more
+recent data when both exist.
+
 ## License
 
 Apache-2.0

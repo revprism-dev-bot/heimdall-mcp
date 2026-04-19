@@ -227,10 +227,15 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 		},
 		{
 			Name:        "heimdall_status",
-			Description: "Check the status of the Heimdall context engine: Ollama reachability, model availability, index statistics, and indexing progress.",
+			Description: "Check the status of the Heimdall context engine: Ollama reachability, model availability, index statistics, and indexing progress. Pass the optional `path` parameter to target a specific project — resolution routes through the project registry (registry-first, cwd-last). Without `path`, the server falls back to the CWD registry entry, then to <cwd>/.heimdall_db.",
 			InputSchema: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
+				"type": "object",
+				"properties": map[string]any{
+					"path": map[string]any{
+						"type":        "string",
+						"description": "Optional absolute path or project name. Resolves the DB for THAT project via the registry. Without this, status uses the server's CWD.",
+					},
+				},
 			},
 		},
 		{
@@ -514,7 +519,7 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 	case "heimdall_index":
 		result = s.toolIndex(params.Arguments)
 	case "heimdall_status":
-		result = s.toolStatus()
+		result = s.toolStatus(params.Arguments)
 	case "heimdall_index_text":
 		result = s.toolIndexText(params.Arguments)
 	case "heimdall_projects":
@@ -612,9 +617,16 @@ func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
 
-	// Resolve DB path — write tools use model-specific dir (creates if needed)
+	// Resolve DB path — write tools use model-specific dir (creates if needed).
+	// Both migrations fire exactly once on first access per store (idempotent,
+	// lock-protected): MigrateToModelDir moves any legacy baseDir/vectors.db
+	// into baseDir/<model>/; MigrateLegacyLatestDir renames
+	// baseDir/<model>_latest/ → baseDir/<model>/. See migrate.go.
 	baseDir := s.resolveDBDir(input.Project)
 	heimdall.MigrateToModelDir(baseDir, s.Cfg.Model)
+	if _, err := heimdall.MigrateLegacyLatestDir(baseDir, s.Cfg.Model); err != nil {
+		log.Printf("legacy-latest migration warning for %s: %v", baseDir, err)
+	}
 	dbDir := heimdall.ModelDBDir(baseDir, s.Cfg.Model)
 
 	store, err := heimdall.OpenStore(dbDir)

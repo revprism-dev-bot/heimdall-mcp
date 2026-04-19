@@ -283,9 +283,17 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 		return
 	}
 
-	cwd, _ := os.Getwd()
-	baseDir := filepath.Join(cwd, ".heimdall_db")
+	// Route the write through the registry-first resolver. Pass absPath
+	// as both the hint AND as the fallback-constructor source so users
+	// who index a directory that isn't yet registered still get
+	// baseDir = <absPath>/.heimdall_db (NOT cwd/.heimdall_db). Fixes the
+	// handoff Problem #1 symptom where reindex wrote to the MCP server's
+	// working directory instead of the target project.
+	baseDir := s.resolveRunIndexBaseDir(absPath)
 	heimdall.MigrateToModelDir(baseDir, s.Cfg.Model)
+	if _, err := heimdall.MigrateLegacyLatestDir(baseDir, s.Cfg.Model); err != nil {
+		log.Printf("legacy-latest migration warning for %s: %v", baseDir, err)
+	}
 	dbDir := heimdall.ModelDBDir(baseDir, s.Cfg.Model)
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
@@ -431,6 +439,12 @@ const staleTimeoutSeconds = 1800 // 30 minutes
 
 // autoIndexOnSearch triggers auto-indexing when no index exists and a search is attempted.
 // Returns a friendly message indicating indexing has started.
+//
+// Target-path invariant (PR1): this is the single authorized os.Getwd()
+// site in the MCP write paths. The Phase 4 behaviour expects auto-index
+// to operate on the server's CWD when no project context is available.
+// All OTHER MCP write paths (runIndex, toolIndexText, toolStatus) MUST
+// resolve through s.resolveDBDir(project). See plan D-17.
 func (s *Server) autoIndexOnSearch() MCPToolResult {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -533,7 +547,85 @@ func (s *Server) checkAndTriggerReindex(store *heimdall.VectorStore, dbDir strin
 	return fmt.Sprintf("Index is stale (>%d min). Background re-index started.", staleTimeoutSeconds/60)
 }
 
-func (s *Server) toolStatus() MCPToolResult {
+// resolveRunIndexBaseDir returns the baseDir for a write-path tool when
+// the caller provided an absolute target path. Registry-first: if the
+// target path is already registered EXACTLY (no substring match), reuse
+// its DBPath so writes land exactly where the registry already claims
+// they do. Otherwise default to <absPath>/.heimdall_db — NEVER
+// os.Getwd(). This is the target-path invariant the handoff Problem #1
+// fix depends on.
+//
+// We intentionally DO NOT use Registry.Find(absPath) here because it
+// also performs partial substring name matches, which could return the
+// wrong project when an absolute filesystem path happens to share a
+// substring with a registered project name. Exact path equality is
+// required for the invariant to hold.
+func (s *Server) resolveRunIndexBaseDir(absPath string) string {
+	if absPath != "" {
+		for _, p := range s.Registry.All() {
+			if p.Path == absPath {
+				return p.DBPath
+			}
+		}
+		return filepath.Join(absPath, ".heimdall_db")
+	}
+	// Last-ditch: fall through to the shared resolver, which ends at
+	// <cwd>/.heimdall_db only if nothing else matches.
+	return s.resolveDBDir("")
+}
+
+// resolveStatusBaseDir returns the baseDir for heimdall_status. It
+// mirrors the resolveRunIndexBaseDir exact-match contract for absolute
+// paths, fixing PR #73 review HIGH finding: status previously routed
+// through resolveDBDir, which uses Registry.Find with case-insensitive
+// substring name matching. That meant `heimdall_status path=/srv/auth`
+// could silently return stats for a registered project `auth-service`.
+//
+// Resolution order:
+//  1. If input is an absolute directory that exists on disk, return an
+//     exact-path registry match OR <input>/.heimdall_db. Substring /
+//     name fuzzy matching is bypassed entirely.
+//  2. If input is a non-empty string that is NOT an absolute path,
+//     treat it as a project name and route through resolveDBDir
+//     (registry name/path exact match → substring match → cwd
+//     fallback — the existing behavior for name-style input is
+//     preserved).
+//  3. If input is empty, fall back to resolveDBDir("") — the cwd
+//     chain (FindByCWD → <cwd>/.heimdall_db).
+func (s *Server) resolveStatusBaseDir(input string) string {
+	if input == "" {
+		return s.resolveDBDir("")
+	}
+	if filepath.IsAbs(input) {
+		for _, p := range s.Registry.All() {
+			if p.Path == input {
+				return p.DBPath
+			}
+		}
+		return filepath.Join(input, ".heimdall_db")
+	}
+	// Name-style input — delegate to the shared resolver. A purely
+	// name-based substring match is intentional here (users call
+	// `heimdall_status project=my-proj` expecting a loose lookup).
+	return s.resolveDBDir(input)
+}
+
+// toolStatus serves heimdall_status. In PR1 it gained an optional `path`
+// input parameter. Resolution routes through s.resolveStatusBaseDir,
+// which mirrors the resolveRunIndexBaseDir exact-match contract for
+// absolute paths — so `heimdall_status path=/srv/auth` cannot be
+// misrouted to an unrelated registered project named `auth-service` via
+// Registry.Find's substring matching (PR #73 review HIGH finding). Does
+// NOT use s.Index.Path as fallback because autoIndexOnSearch writes the
+// server's cwd into it on unindexed searches (tools.go:464),
+// contaminating the signal.
+func (s *Server) toolStatus(args json.RawMessage) MCPToolResult {
+	var input statusInput
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &input); err != nil {
+			return ErrResult("invalid arguments: " + err.Error())
+		}
+	}
 	ctx := context.Background()
 	endpoint := s.Cfg.OllamaEndpoint
 	model := s.Cfg.Model
@@ -562,8 +654,8 @@ func (s *Server) toolStatus() MCPToolResult {
 		}
 	}
 
-	cwd, _ := os.Getwd()
-	baseDir := filepath.Join(cwd, ".heimdall_db")
+	baseDir := s.resolveStatusBaseDir(input.Path)
+	status["dbPath"] = baseDir
 
 	// Show all available model DBs for this project
 	available := heimdall.ListAvailableModels(baseDir)
@@ -595,7 +687,9 @@ func (s *Server) toolStatus() MCPToolResult {
 		status["lastIndexed"] = "no index"
 	}
 
-	// Registered projects
+	// Registered projects — show `current:true` when CWD is inside the
+	// project (best-effort; cwd may be unavailable in some sandboxes).
+	cwd, _ := os.Getwd()
 	projects := s.Registry.All()
 	if len(projects) > 0 {
 		var projectList []map[string]string
@@ -605,8 +699,7 @@ func (s *Server) toolStatus() MCPToolResult {
 				"path":   p.Path,
 				"dbPath": p.DBPath,
 			}
-			// Highlight if CWD is inside this project
-			if registry.IsSubpath(cwd, p.Path) {
+			if cwd != "" && registry.IsSubpath(cwd, p.Path) {
 				entry["current"] = "true"
 			}
 			projectList = append(projectList, entry)

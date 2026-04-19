@@ -2,6 +2,7 @@ package heimdall
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,20 +27,120 @@ func sanitizeModelDirName(model string) string {
 // ModelDBDir returns the model-specific subdirectory within a base .heimdall_db path.
 // Strips the ":latest" tag (it's the default and config never includes it),
 // then sanitizes for use as a directory name (replaces : and / with _).
-// Also checks for the "_latest" suffixed variant on disk for backward compat.
+//
+// Mixed-state rule (v2 plan D-19 / A-L-4): when both the canonical `<model>/`
+// dir and the legacy `<model>_latest/` dir exist, pick whichever holds
+// the more recent *data* — using MAX(mod_time) from the entries table as
+// a content-aware tiebreak. When neither DB can be opened (e.g. corrupt
+// files), fall back to file mtime. This prevents an empty bare dir from
+// shadowing a populated legacy dir.
+//
+// Callers that perform writes should route through MigrateLegacyLatestDir
+// first (see migrate.go) so the mixed state becomes single-state after
+// the first write on new binaries.
 func ModelDBDir(baseDir, model string) string {
 	sanitized := sanitizeModelDirName(NormalizeModelName(model))
 	dir := filepath.Join(baseDir, sanitized)
+	legacyDir := filepath.Join(baseDir, sanitized+"_latest")
 
-	// Check if the directory exists; if not, check the _latest variant
-	// (created when Ollama reports model as "name:latest")
-	if _, err := os.Stat(dir); err != nil {
-		legacyDir := filepath.Join(baseDir, sanitized+"_latest")
-		if _, err := os.Stat(legacyDir); err == nil {
+	canonicalExists := false
+	legacyExists := false
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		canonicalExists = true
+	}
+	if info, err := os.Stat(legacyDir); err == nil && info.IsDir() {
+		legacyExists = true
+	}
+
+	switch {
+	case canonicalExists && legacyExists:
+		// Both exist — disambiguate by data recency.
+		if pickLegacyOverCanonical(legacyDir, dir) {
 			return legacyDir
 		}
+		return dir
+	case legacyExists:
+		return legacyDir
+	default:
+		// Either canonical exists or neither does; always return canonical.
+		return dir
 	}
-	return dir
+}
+
+// pickLegacyOverCanonical decides which of two existing model dirs
+// (legacy `<model>_latest/` vs canonical `<model>/`) should be returned
+// by ModelDBDir. Primary signal: MAX(mod_time) from the entries table
+// (content-aware). Fallback: file mtime on vectors.db. Ties go to the
+// canonical dir (so a fresh binary deterministically prefers the
+// non-legacy location once data equalizes).
+func pickLegacyOverCanonical(legacyDir, canonicalDir string) bool {
+	legacyRows, legacyOK := maxModTimeFromDB(filepath.Join(legacyDir, "vectors.db"))
+	canonicalRows, canonicalOK := maxModTimeFromDB(filepath.Join(canonicalDir, "vectors.db"))
+
+	// If at least one DB is queryable, compare by row mod_time.
+	if legacyOK || canonicalOK {
+		// A zero-row DB counts as mod_time=0. If the other side has any
+		// rows, the populated side wins (fixes the "empty canonical
+		// shadows legacy" bug from handoff Problem #1).
+		if legacyRows > canonicalRows {
+			return true
+		}
+		return false
+	}
+
+	// Both unopenable — fall back to file mtime.
+	return fileMtimeNewer(
+		filepath.Join(legacyDir, "vectors.db"),
+		filepath.Join(canonicalDir, "vectors.db"),
+	)
+}
+
+// maxModTimeFromDB opens a vectors.db read-only, queries
+// `SELECT COALESCE(MAX(mod_time), 0) FROM entries`, and returns the
+// value. Returns (0, false) if the DB can't be opened or queried (e.g.
+// missing file, corrupt, or table absent). A fresh store with no rows
+// returns (0, true).
+//
+// DSN matches the writer side (`store.go:OpenStore`): `_journal_mode=WAL`
+// + `_busy_timeout=5000`. DO NOT add `immutable=1` — per SQLite docs,
+// immutable=1 instructs the driver that the file will not change and
+// allows it to bypass the WAL, which would return a stale snapshot when
+// a concurrent writer has un-checkpointed rows in the WAL. The reader
+// acquires a shared lock on the WAL; writer contention is handled by
+// SQLite's own busy-timeout.
+func maxModTimeFromDB(dbPath string) (int64, bool) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return 0, false
+	}
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro&_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return 0, false
+	}
+	defer db.Close()
+
+	var v int64
+	if err := db.QueryRow(`SELECT COALESCE(MAX(mod_time), 0) FROM entries`).Scan(&v); err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// fileMtimeNewer reports whether `a` has a more recent mtime than `b`.
+// Used as the last-resort tiebreak in pickLegacyOverCanonical when
+// neither DB can be opened. Ties fall to canonical (returns false).
+func fileMtimeNewer(a, b string) bool {
+	ai, aerr := os.Stat(a)
+	bi, berr := os.Stat(b)
+	if aerr != nil && berr != nil {
+		return false
+	}
+	if aerr != nil {
+		return false
+	}
+	if berr != nil {
+		return true
+	}
+	return ai.ModTime().After(bi.ModTime())
 }
 
 // ListAvailableModels returns the model names that have indexes in the base dir.

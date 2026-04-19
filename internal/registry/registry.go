@@ -2,6 +2,7 @@ package registry
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -32,6 +33,14 @@ func registryPath() string {
 }
 
 // LoadRegistry loads the project registry from disk.
+//
+// A missing file is not an error (returns an empty registry — common on
+// first run). A corrupt file IS surfaced via log.Printf so operators
+// see the degradation instead of silently losing their registry —
+// downstream resolvers (resolveRunIndexBaseDir, resolveStatusBaseDir)
+// lean on registry integrity, so a silent reset was masking real state
+// loss. Atomic save (a separate PR) will prevent the corruption in the
+// first place; this log surfaces the reader side for now.
 func LoadRegistry() *Registry {
 	r := &Registry{filePath: registryPath()}
 
@@ -39,7 +48,13 @@ func LoadRegistry() *Registry {
 	if err != nil {
 		return r
 	}
-	json.Unmarshal(data, r)
+	if err := json.Unmarshal(data, r); err != nil {
+		log.Printf("heimdall: registry file %s is corrupt; starting with empty registry (existing entries will be silently dropped until a Save overwrites it): %v", r.filePath, err)
+		// Reset so a partially-parsed registry can't leak into downstream
+		// code paths. Any subsequent Register() call will Save() a clean
+		// file.
+		r.Projects = nil
+	}
 	return r
 }
 
