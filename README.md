@@ -364,9 +364,9 @@ Create `~/.config/heimdall-mcp/config.json` or use `heimdall_configure` / `heimd
   "lifecycleArchiveDays": 90,
   "maxChunksPerProject": 10000,
   "embedBatchSize": 32,
-  "embedMaxConcurrent": 2,
+  "embedMaxConcurrent": -1,
   "embedTimeoutMs": 30000,
-  "embedMaxRetries": 2,
+  "embedMaxRetries": -1,
   "indexedPaths": []
 }
 ```
@@ -391,9 +391,14 @@ Config precedence:
 | `lifecycle.archive_days` | int | `90` | Days before content is pruned |
 | `max_chunks_per_project` | int | `10000` | Hard cap on chunks per project DB |
 | `embed_batch_size` | int | `32` | Maximum texts per embed API call to Ollama |
-| `embed_max_concurrent` | int | `2` | Max in-flight Ollama `/api/embed` requests per client. `0` = unbounded. Env: `HEIMDALL_EMBED_MAX_CONCURRENT` |
-| `embed_timeout_ms` | int | `30000` | Per-request embed deadline (ms) when caller ctx has none. Env: `HEIMDALL_EMBED_TIMEOUT_MS` |
-| `embed_max_retries` | int | `2` | Retries on per-request `context deadline exceeded`. Caller-ctx cancels are NOT retried. Env: `HEIMDALL_EMBED_MAX_RETRIES` |
+| `embed_max_concurrent` | int | `-1` (→ 2) | Max in-flight Ollama `/api/embed` requests **per server**. Sentinel `-1` (default) = use package default (2). `0` = explicit unbounded. `N > 0` = cap at N. Clamped to `[0, 64]`. Env: `HEIMDALL_EMBED_MAX_CONCURRENT` |
+| `embed_timeout_ms` | int | `30000` | Per-request embed deadline (ms) when caller ctx has none. Clamped to `[100, 600000]` (10 min). Env: `HEIMDALL_EMBED_TIMEOUT_MS` |
+| `embed_max_retries` | int | `-1` (→ 2) | Retries on per-request `context deadline exceeded`. Sentinel `-1` = zero retries (opt out). `0` = package default (2). `N > 0` = literal. Clamped to `[0, 10]`. Caller-ctx cancels are NOT retried. Env: `HEIMDALL_EMBED_MAX_RETRIES` |
+
+Note: env values are resolved at call time onto a transient copy of the
+config — they NEVER round-trip into `config.json` via `heimdall_configure
+set` / `SaveConfig`, so you can use `HEIMDALL_EMBED_*` for ad-hoc tuning
+without worrying about persistence.
 
 ## Embedding Models
 

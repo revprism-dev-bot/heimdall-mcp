@@ -41,6 +41,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
   semaphore (default cap = 2) shared across `Embed`, `EmbedForHook`, and
   `EmbedBatch`. Per-request deadlines that fire (vs. caller-ctx cancellation)
   are retried with configurable backoff (default 2 retries, 250 ms + 500 ms).
+- **PR #74 follow-up review fixes:**
+  - *CLI honors embed config:* CLI entry points (indexer, hooks, doctor,
+    skills, sessions, install, discover, recall, ingest_session) now route
+    Ollama construction through a config-aware helper so
+    `HEIMDALL_EMBED_MAX_CONCURRENT` / `HEIMDALL_EMBED_TIMEOUT_MS` /
+    `HEIMDALL_EMBED_MAX_RETRIES` and `config.json` values take effect on
+    the primary burst-parallelism surface. (F1)
+  - *Env vars no longer persist to disk:* `LoadConfig` no longer applies
+    env overrides to the returned Config. A new `config.ResolveEmbedConfig`
+    produces a transient effective-config snapshot used by the MCP server
+    and CLI clients. Any later `SaveConfig(cfg)` therefore cannot bake
+    env-var tuning into `config.json`. (F2 / H1)
+  - *`embed_max_concurrent: 0` honoured as "unbounded":* `NewOllamaClientFromConfig`
+    no longer silently remaps 0 → default. Per-README contract 0 disables
+    the semaphore. The "use default" sentinel is now `-1`; `DefaultConfig()`
+    seeds `-1` for fresh installs so the safe default (cap = 2) still
+    applies when the key is absent or set to `-1`. (F3 / H2)
+  - *Retry backoff no longer leaks timers on ctx-cancel:* `time.After`
+    replaced with `time.NewTimer` + `Stop()` in both retry loops so a
+    cancelled caller ctx releases its timer immediately. (F4)
+  - *Server-scoped Ollama client singleton:* `Server.newOllamaClient()` now
+    returns a singleton keyed on resolved endpoint / concurrency / timeout /
+    retries. Two concurrent MCP tool calls share one counting semaphore so
+    the effective cap is per-server, not per-tool-call. HTTP keep-alive
+    pool is also reused across tool calls. (F5 / M1)
+  - *Env-int clamps:* `HEIMDALL_EMBED_TIMEOUT_MS` is clamped to
+    `[100 ms, 10 min]` (avoids `time.Duration` overflow →
+    instant-DeadlineExceeded retry storms). `HEIMDALL_EMBED_MAX_CONCURRENT`
+    is clamped to `[0, 64]`. `HEIMDALL_EMBED_MAX_RETRIES` is clamped to
+    `[0, 10]`. Violations log and clamp to the nearest boundary. (F6 / M2)
+  - *Event-driven test synchronisation:* 10 × `time.Sleep(200ms)` "goroutines
+    queued by now" oracles replaced with channel-based `waitStarted` that
+    blocks until the expected in-flight count is observed server-side.
+    Kills `-race` / loaded-CI flakiness without affecting coverage. (F7)
+  - *`Server.newOllamaClient` test coverage:* new table-driven regressions
+    in `internal/mcp/server_test.go` verify positional-arg wiring across
+    sentinel / literal / clamped inputs plus singleton identity / rebuild-
+    on-config-change behaviour. (F8)
+  - *Semaphore-release regression for non-ctx errors:* new test iterates
+    HTTP 500, decode-error, and empty-response paths with cap=1 for 3
+    consecutive calls — a slot leak would block the 2nd/3rd on the
+    semaphore wait. (F9)
 
 ### Added
 
@@ -65,12 +107,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
   tunables: `MaxConcurrent`, `EmbedTimeout`, `MaxRetries`, `RetryBackoff`.
 - `heimdall.NewOllamaClientFromConfig(endpoint, maxConcurrent, timeoutMs, maxRetries int)`
   — convenience wiring for `Config.EmbedMaxConcurrent` /
-  `Config.EmbedTimeoutMs` / `Config.EmbedMaxRetries`.
+  `Config.EmbedTimeoutMs` / `Config.EmbedMaxRetries`. Sentinel contract:
+  `-1` = use default; `0` = explicit unbounded / zero retries; `N` = literal.
+- `config.ResolveEmbedConfig(base Config) Config` — returns a transient
+  effective config with `HEIMDALL_EMBED_*` env overrides merged and values
+  clamped to documented safety ranges. Never mutates `base`.
+- `config.MaxEmbedConcurrent`, `config.MaxEmbedTimeoutMs`,
+  `config.MinEmbedTimeoutMs`, `config.MaxEmbedRetries` — clamp bounds for
+  operator-tunable fields.
 - New config keys:
-  - `embedMaxConcurrent` (int, default 2; `0` = unbounded)
-  - `embedTimeoutMs` (int, default 30000)
-  - `embedMaxRetries` (int, default 2)
-- New env-var overrides:
+  - `embedMaxConcurrent` (int, sentinel `-1` = default 2; `0` = unbounded;
+    `N` = cap at N). Default on fresh install: `-1`.
+  - `embedTimeoutMs` (int, default 30000 via package constant)
+  - `embedMaxRetries` (int, sentinel `-1` = zero retries; `0` = default 2;
+    `N` = literal). Default on fresh install: `-1`.
+- New env-var overrides (clamped at parse time):
   - `HEIMDALL_EMBED_MAX_CONCURRENT`
   - `HEIMDALL_EMBED_TIMEOUT_MS`
   - `HEIMDALL_EMBED_MAX_RETRIES`
@@ -79,7 +130,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
 
 - All MCP tools now construct the Ollama client through the central
   `Server.newOllamaClient()` helper so config-driven concurrency / timeout
-  / retry tunables take effect globally.
+  / retry tunables take effect globally. Post-fix this helper returns a
+  Server-scoped singleton so the semaphore is shared across concurrent
+  tool calls.
+- CLI indexer / hook / discovery / doctor / install / recall / sessions /
+  skills paths now build Ollama clients via the new `newOllamaClient`
+  helper so `HEIMDALL_EMBED_*` env vars and `embedMaxConcurrent` /
+  `embedTimeoutMs` / `embedMaxRetries` config take effect on the
+  command-line burst path too.
 - Per-request embed deadline is now `min(caller_deadline, embedTimeout)`.
   This caps runaway single embed calls that previously inherited huge
   caller deadlines (e.g. the 24h ctx used by the indexer).
