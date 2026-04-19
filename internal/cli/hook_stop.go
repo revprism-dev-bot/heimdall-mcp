@@ -219,11 +219,13 @@ const (
 
 // extractTranscriptSummary scans the full JSONL transcript for user-side
 // marker hits and returns:
-//   - summary: concatenated context windows around each hit (user message
-//     + preceding assistant message), deduplicated, joined with
-//     "\n\n---\n\n", capped at 20 KB. On zero hits, falls back to the
-//     last 3 assistant messages trimmed to 800 chars each.
-//   - candidates: one entry per hit with marker class + ≤200-char excerpt.
+//   - summary: concatenated context windows around each hit. Each window
+//     contains the user message plus the preceding assistant message, is
+//     deduplicated, joined with "\n\n---\n\n", and capped at 20 KB. On
+//     zero hits, falls back to the last 3 assistant messages trimmed to
+//     800 chars each.
+//   - candidates: one entry per hit with marker class plus a ≤200-char
+//     excerpt of the user message.
 //
 // Single byte-scan pass; O(len(data)) + O(hits × regex_cost).
 // roleFromLine extracts the "role" field value from a JSONL line without
@@ -398,7 +400,6 @@ func extractContentTextRaw(raw json.RawMessage) string {
 	}
 	return strings.Join(parts, "\n")
 }
-
 
 func trimTo(s string, n int) string {
 	if len(s) <= n {
