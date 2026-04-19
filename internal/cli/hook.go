@@ -454,12 +454,24 @@ func formatSessionStartBlock(status heimdall.StatusInfo, model, projectRoot stri
 // its own equivalent; both serialize/deserialize through JSON so structural
 // compatibility is what matters, not type identity.
 type lastSessionReview struct {
-	SessionID  string   `json:"session_id"`
-	EndedAt    int64    `json:"ended_at"`
-	Candidates int      `json:"candidates"`
-	Writes     int      `json:"writes"`
-	TopMarkers []string `json:"top_markers"`
-	Excerpts   []string `json:"excerpts"`
+	SessionID  string       `json:"session_id"`
+	EndedAt    int64        `json:"ended_at"`
+	Candidates int          `json:"candidates"`
+	Writes     int          `json:"writes"`
+	TopMarkers []string     `json:"top_markers"`
+	Excerpts   []string     `json:"excerpts"`
+	Misses     []reviewMiss `json:"misses,omitempty"`
+	Triggers   int          `json:"triggers,omitempty"`
+	Followed   int          `json:"followed,omitempty"`
+}
+
+// reviewMiss mirrors a MissedCall for on-disk storage. The field names use
+// JSON keys that match the writer in hook_stop.go's missRecord struct.
+type reviewMiss struct {
+	Rule           string `json:"rule"`
+	ExpectedTool   string `json:"expected_tool"`
+	TriggerExcerpt string `json:"trigger"`
+	Turn           int    `json:"turn"`
 }
 
 const lastSessionReviewMaxAge = 7 * 24 * time.Hour
@@ -533,6 +545,27 @@ func renderLastSessionReview(projectDir string, now time.Time) string {
 		b.WriteString("\n")
 	}
 	b.WriteString("If any of these still matter, heimdall_remember them now.\n")
+
+	// Misses section: surface specific rule violations.
+	if len(rev.Misses) > 0 {
+		b.WriteString("\n")
+		if rev.Followed == 0 && rev.Triggers > 0 {
+			fmt.Fprintf(&b, "No heimdall calls matched any of the %d triggered rules this session.\n", rev.Triggers)
+		} else if rev.Triggers > 0 {
+			fmt.Fprintf(&b, "Missed heimdall calls (%d/%d compliant):\n", rev.Followed, rev.Triggers)
+		} else {
+			b.WriteString("Missed heimdall calls:\n")
+		}
+		limit := 5
+		if len(rev.Misses) < limit {
+			limit = len(rev.Misses)
+		}
+		for _, m := range rev.Misses[:limit] {
+			fmt.Fprintf(&b, "- %s -> expected %s: %q\n", m.Rule, m.ExpectedTool, m.TriggerExcerpt)
+		}
+		b.WriteString("\nheimdall_remember any items above that still matter.\n")
+	}
+
 	return b.String()
 }
 

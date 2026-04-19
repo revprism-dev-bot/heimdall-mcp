@@ -985,3 +985,72 @@ func TestSessionStartBlock_SkipsMalformedReviewFile(t *testing.T) {
 		t.Errorf("expected empty output on malformed file, got %q", out)
 	}
 }
+
+// TestRenderLastSessionReview_SurfacesMisses verifies that when the review
+// file contains a misses array, the renderer includes the miss details in its
+// output.
+func TestRenderLastSessionReview_SurfacesMisses(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+		"session_id": "s-misses",
+		"ended_at": ` + fmt.Sprintf("%d", time.Now().Unix()-60) + `,
+		"candidates": 5,
+		"writes": 0,
+		"top_markers": ["correction"],
+		"excerpts": ["actually do it the other way"],
+		"misses": [
+			{"rule":"user_correction","expected_tool":"heimdall_remember","trigger":"actually do it the other way","turn":2},
+			{"rule":"external_content","expected_tool":"heimdall_index_text","trigger":"WebFetch result content","turn":5}
+		],
+		"triggers": 3,
+		"followed": 1
+	}`
+	writeReviewFile(t, dir, body)
+
+	out := renderLastSessionReview(dir, time.Now())
+	if !strings.Contains(out, "### Last session review") {
+		t.Errorf("expected header; got %q", out)
+	}
+	// Misses section should be present.
+	if !strings.Contains(out, "user_correction") {
+		t.Errorf("expected user_correction miss in output; got %q", out)
+	}
+	if !strings.Contains(out, "heimdall_remember") {
+		t.Errorf("expected heimdall_remember in output; got %q", out)
+	}
+	if !strings.Contains(out, "external_content") {
+		t.Errorf("expected external_content miss in output; got %q", out)
+	}
+	if !strings.Contains(out, "heimdall_index_text") {
+		t.Errorf("expected heimdall_index_text in output; got %q", out)
+	}
+	// Should mention compliance ratio.
+	if !strings.Contains(out, "compliant") && !strings.Contains(out, "Missed") {
+		t.Errorf("expected compliance ratio or 'Missed' mention; got %q", out)
+	}
+}
+
+// TestRenderLastSessionReview_AllMissed verifies the stronger "No heimdall
+// calls matched" opener when Followed == 0 and Triggers > 0.
+func TestRenderLastSessionReview_AllMissed(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+		"session_id": "s-all-missed",
+		"ended_at": ` + fmt.Sprintf("%d", time.Now().Unix()-60) + `,
+		"candidates": 3,
+		"writes": 0,
+		"top_markers": ["correction"],
+		"excerpts": ["no, wrong"],
+		"misses": [
+			{"rule":"user_correction","expected_tool":"heimdall_remember","trigger":"no, wrong","turn":1}
+		],
+		"triggers": 2,
+		"followed": 0
+	}`
+	writeReviewFile(t, dir, body)
+
+	out := renderLastSessionReview(dir, time.Now())
+	if !strings.Contains(out, "No heimdall calls matched") {
+		t.Errorf("expected stronger opener for all-missed case; got %q", out)
+	}
+}

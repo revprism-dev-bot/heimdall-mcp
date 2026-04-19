@@ -452,3 +452,80 @@ func TestHookSessionEnd_SuppressesOnEmptyTranscript(t *testing.T) {
 		t.Errorf("expected no review file for empty transcript")
 	}
 }
+
+// TestHookSessionEnd_RecordsMissesInReview verifies that when the transcript
+// contains a user correction not followed by heimdall_remember, the review
+// record includes a misses entry with the correct rule and expected tool.
+func TestHookSessionEnd_RecordsMissesInReview(t *testing.T) {
+	dir := t.TempDir()
+
+	// Transcript: correction without a following heimdall_remember.
+	// 5 corrections to exceed the suppression threshold (candidates > 2).
+	tPath := filepath.Join(dir, "transcript.jsonl")
+	lines := []string{
+		`{"role":"assistant","content":"I will use global state."}`,
+		`{"role":"user","content":"Actually no, do not use global variables."}`,
+		`{"role":"assistant","content":"Understood."}`,
+		`{"role":"user","content":"no, that approach is wrong too"}`,
+		`{"role":"assistant","content":"Let me try again."}`,
+		`{"role":"user","content":"stop — this is still broken"}`,
+		`{"role":"assistant","content":"OK."}`,
+	}
+	if err := os.WriteFile(tPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	payload := sessionEndPayload{
+		SessionID:      "s-misses-1",
+		TranscriptPath: tPath,
+		CWD:            dir,
+		HookEventName:  "SessionEnd",
+		Reason:         "user_exit",
+	}
+	data, _ := json.Marshal(payload)
+
+	code := HookSessionEnd(config.DefaultConfig(), bytes.NewReader(data), &bytes.Buffer{}, &bytes.Buffer{}, map[string]string{}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+
+	reviewPath := filepath.Join(dir, ".heimdall_db", "hooks", "last-session-review.json")
+	body, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatalf("review file not written: %v", err)
+	}
+	var rev map[string]any
+	if err := json.Unmarshal(body, &rev); err != nil {
+		t.Fatalf("review file malformed: %v", err)
+	}
+
+	// Verify misses field is present and non-empty.
+	missesRaw, ok := rev["misses"]
+	if !ok {
+		t.Fatalf("review file missing 'misses' field; keys: %v", rev)
+	}
+	misses, ok := missesRaw.([]any)
+	if !ok || len(misses) == 0 {
+		t.Fatalf("expected non-empty misses array, got %T: %v", missesRaw, missesRaw)
+	}
+
+	// Verify the first miss has the right rule and expected_tool.
+	firstMiss, ok := misses[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected miss to be a map, got %T", misses[0])
+	}
+	if rule, _ := firstMiss["rule"].(string); rule != "user_correction" {
+		t.Errorf("expected rule=user_correction, got %q", rule)
+	}
+	if et, _ := firstMiss["expected_tool"].(string); et != "heimdall_remember" {
+		t.Errorf("expected expected_tool=heimdall_remember, got %q", et)
+	}
+
+	// Verify triggers and followed fields are present.
+	if _, ok := rev["triggers"]; !ok {
+		t.Errorf("review file missing 'triggers' field")
+	}
+	if _, ok := rev["followed"]; !ok {
+		t.Errorf("review file missing 'followed' field")
+	}
+}

@@ -143,6 +143,7 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 			if err == nil && len(transcript) > 0 {
 				summary, candidates := extractTranscriptSummary(transcript)
 				writes := countHeimdallWrites(transcript)
+				analysis := AnalyzeTranscript(transcript)
 
 				if summary != "" {
 					memDBPath := config.ResolveMemoryDBPath()
@@ -165,7 +166,7 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 					}
 				}
 
-				if err := writeLastSessionReview(projectDir, payload.SessionID, time.Now(), candidates, writes); err != nil {
+				if err := writeLastSessionReview(projectDir, payload.SessionID, time.Now(), candidates, writes, analysis.Misses, analysis); err != nil {
 					heimdall.LogHookEvent("WARN", "session-end", map[string]any{
 						"err": "review_write_failed",
 						"msg": err.Error(),
@@ -446,9 +447,10 @@ func countHeimdallWrites(data []byte) int {
 
 // writeLastSessionReview persists a review record when the session warrants
 // nagging the next SessionStart. Suppression: skip when candidates <= 2 AND
-// writes >= 1 (well-behaved session). Only 3 highest-priority excerpts.
-func writeLastSessionReview(projectDir, sessionID string, endedAt time.Time, candidates []CandidateEvent, writes int) error {
-	if len(candidates) <= 2 && writes >= 1 {
+// writes >= 1 AND len(misses) == 0 (well-behaved session). Only 3 highest-
+// priority excerpts; up to 5 missed-call entries.
+func writeLastSessionReview(projectDir, sessionID string, endedAt time.Time, candidates []CandidateEvent, writes int, misses []MissedCall, analysis AnalysisResult) error {
+	if len(candidates) <= 2 && writes >= 1 && len(misses) == 0 {
 		return nil
 	}
 
@@ -472,6 +474,26 @@ func writeLastSessionReview(projectDir, sessionID string, endedAt time.Time, can
 		excerpts = append(excerpts, c.Excerpt)
 	}
 
+	// Serialize up to 5 miss entries for the review record.
+	type missRecord struct {
+		Rule    string `json:"rule"`
+		ExpTool string `json:"expected_tool"`
+		Trigger string `json:"trigger"`
+		Turn    int    `json:"turn"`
+	}
+	missRecords := make([]missRecord, 0, len(misses))
+	for i, mc := range misses {
+		if i >= 5 {
+			break
+		}
+		missRecords = append(missRecords, missRecord{
+			Rule:    mc.Rule,
+			ExpTool: mc.ExpectedTool,
+			Trigger: mc.TriggerExcerpt,
+			Turn:    mc.TurnIndex,
+		})
+	}
+
 	record := map[string]any{
 		"session_id":  sessionID,
 		"ended_at":    endedAt.Unix(),
@@ -479,6 +501,9 @@ func writeLastSessionReview(projectDir, sessionID string, endedAt time.Time, can
 		"writes":      writes,
 		"top_markers": topMarkers,
 		"excerpts":    excerpts,
+		"misses":      missRecords,
+		"triggers":    analysis.Triggers,
+		"followed":    analysis.Followed,
 	}
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {

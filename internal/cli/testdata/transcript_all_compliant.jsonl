@@ -1,0 +1,6 @@
+{"role":"user","content":"I have a task that references past decisions about the architecture of the data pipeline."}
+{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"heimdall_recall","input":{"query":"data pipeline architecture decisions"}}]}
+{"role":"user","content":"Actually no, do X differently instead of what you proposed."}
+{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"heimdall_remember","input":{"content":"User prefers X approach over the alternative"}}]}
+{"role":"assistant","content":[{"type":"text","text":"Reading a small config file now."},{"type":"tool_use","id":"tu3","name":"Read","input":{"file_path":"/tmp/small.txt"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu3","content":[{"type":"text","text":"line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12\nline13\nline14\nline15\nline16\nline17\nline18\nline19\nline20\nline21\nline22\nline23\nline24\nline25\nline26\nline27\nline28\nline29\nline30\nline31\nline32\nline33\nline34\nline35\nline36\nline37\nline38\nline39\nline40\nline41\nline42\nline43\nline44\nline45\nline46\nline47\nline48\nline49\nline50"}]}]}
