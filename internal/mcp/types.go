@@ -79,6 +79,14 @@ type indexInput struct {
 	Path string `json:"path"`
 }
 
+// statusInput carries the optional `path` parameter added in PR1 so
+// callers can target a specific project without relying on the server's
+// cwd. Resolution routes through s.resolveDBDir(path) (registry-first,
+// cwd-last) — see server.go:resolveDBDir.
+type statusInput struct {
+	Path string `json:"path"`
+}
+
 type indexTextInput struct {
 	Content       string          `json:"content"`       // the text to index
 	Source        string          `json:"source"`        // identifier (e.g. "JIRA-123", "confluence:page-title")

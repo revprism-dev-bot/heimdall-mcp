@@ -376,6 +376,9 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlags []string
 // results so the caller can register them.
 func indexWithModel(ctx context.Context, cfg config.Config, client *heimdall.OllamaClient, absPath, baseDir, modelName string, excludeGlobs []string) []heimdall.SubRepoResult {
 	heimdall.MigrateToModelDir(baseDir, modelName)
+	if _, err := heimdall.MigrateLegacyLatestDir(baseDir, modelName); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: legacy-latest migration for %s: %v\n", baseDir, err)
+	}
 	dbDir := heimdall.ModelDBDir(baseDir, modelName)
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
