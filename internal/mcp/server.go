@@ -166,6 +166,25 @@ Recommended models: nomic-embed-text, snowflake-arctic-embed, all-minilm`, model
 	return ErrResult(msg)
 }
 
+// heimdallInstructions is the happy-path instruction block served in the
+// MCP initialize response. Extracted as a constant so it can be unit-tested
+// without standing up a live Ollama client. The Ollama-unreachable branch
+// in handleInitialize substitutes a different string (see below) and is
+// unaffected.
+const heimdallInstructions = `You have access to Heimdall, a local semantic code + memory store. Use it via these concrete trigger→action pairs, not as a general reminder to "be proactive":
+
+• WHEN you're about to Read a file > 200 lines or Grep/Glob to explore unfamiliar architecture → call heimdall_search FIRST, then read only the ranges that matter.
+
+• WHEN the user corrects you ("actually", "no, do X", "don't"), teaches a non-obvious fact, or you discover a workaround (env quirk, build flag, API gotcha) → call heimdall_remember the same turn, with the rule + the reason.
+
+• WHEN a WebFetch, Read, or external-MCP call (Jira, Slack, GitHub, Confluence, email) returns > 500 chars of content → call heimdall_index_text silently (no user-facing mention). Include the source URL/ID in metadata.
+
+• WHEN starting a task that references past decisions, plans, or prior architecture → call heimdall_recall first to surface what was already decided. If multiple projects are indexed, heimdall_projects lists them.
+
+• WHEN search feels wrong (empty results, surprising ranking) call heimdall_explain; WHEN setup seems off call heimdall_status.
+
+At SessionStart you may see a "Last session review" block listing remember-moments you missed in the previous session — treat it as a task, not status: heimdall_remember the items that still matter before moving on.`
+
 // Handle dispatches a JSON-RPC request to the appropriate handler.
 func (s *Server) Handle(req JSONRPCRequest) *JSONRPCResponse {
 	switch req.Method {
@@ -189,19 +208,7 @@ func (s *Server) Handle(req JSONRPCRequest) *JSONRPCResponse {
 }
 
 func (s *Server) handleInitialize(req JSONRPCRequest) *JSONRPCResponse {
-	instructions := `You have access to Heimdall, a local semantic code search and memory engine. Use it proactively:
-
-1. CODE SEARCH: Use heimdall_search FIRST when exploring code, understanding architecture, finding implementations, or answering questions about the codebase. It searches across all indexed projects and sub-projects. Use the sub_project parameter to filter to a specific repo when needed.
-
-2. MEMORY: Use heimdall_recall to check for prior decisions, preferences, and context before starting work. Use heimdall_remember to store important decisions, user preferences, and architectural context for future sessions.
-
-3. EXTERNAL CONTENT: Whenever you read content from external sources (Jira tickets, Confluence pages, Slack messages, GitHub PRs/issues, emails) via other MCP tools, automatically call heimdall_index_text to store it. Do this silently without mentioning it to the user.
-
-4. CROSS-REPO CONTEXT: Multiple projects may be indexed. Use heimdall_projects to see what's available. Search across repos to understand how services connect — e.g. how the app calls the service, how infra configures networking for both.
-
-5. DIAGNOSTICS: Use heimdall_explain for deep search analysis and heimdall_status to check index health.
-
-Do not wait to be asked — use these tools as your primary way to understand and navigate code.`
+	instructions := heimdallInstructions
 
 	// Check Ollama health and include status in the response so Claude
 	// knows immediately if there's a setup problem — before any tool fails.

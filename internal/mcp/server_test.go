@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -344,6 +345,22 @@ func TestServer_ConfigureSetRaceFreeUnderRace(t *testing.T) {
 	time.Sleep(75 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+func TestHeimdallInstructionsTriggerPairs(t *testing.T) {
+	markers := []string{
+		"WHEN you're about to Read a file > 200 lines",
+		"WHEN the user corrects you",
+		"WHEN a WebFetch, Read, or external-MCP call",
+		"WHEN starting a task that references past decisions",
+		"WHEN search feels wrong",
+		"Last session review",
+	}
+	for _, m := range markers {
+		if !strings.Contains(heimdallInstructions, m) {
+			t.Errorf("heimdallInstructions missing marker: %q", m)
+		}
+	}
 }
 
 // strconvItoa is a tiny local helper to keep the test independent of
