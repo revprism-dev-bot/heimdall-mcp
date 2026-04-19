@@ -265,6 +265,311 @@ func TestMCPIndex_RegistersSubRepos(t *testing.T) {
 	}
 }
 
+// TestIndexSubRepos_RegistersUnconditionally (PR3 / Problem #3). After a
+// first successful index, wipe the in-memory registry and run the index a
+// second time. On the second run every sub-repo hits the incremental
+// short-circuit — no file changes — but OnSubRepoDiscovered must fire
+// BEFORE the short-circuit, so the registry is re-populated. Prior to
+// PR3 the callers only registered sub-repos whose Result != nil and the
+// CLI guarded on sr.Err == nil, so a no-op incremental silently left the
+// registry sparse.
+func TestIndexSubRepos_RegistersUnconditionally(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, alpha, beta := seedOuterWithSubRepos(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+
+	runIndexSync(t, srv, outer)
+	if len(srv.Registry.All()) != 3 {
+		t.Fatalf("initial run: registry len = %d, want 3", len(srv.Registry.All()))
+	}
+
+	// Wipe the in-memory registry to simulate a fresh server start where
+	// the on-disk registry was deleted. The second runIndex must repopulate
+	// it even though the incremental pass skips every file.
+	srv.Registry.Projects = nil
+	runIndexSync(t, srv, outer)
+	after := srv.Registry.All()
+	if len(after) != 3 {
+		var names []string
+		for _, p := range after {
+			names = append(names, p.Name)
+		}
+		t.Fatalf("second run (no-op incremental): registry len = %d (%v), want 3 (outer+alpha+beta)", len(after), names)
+	}
+	paths := map[string]bool{}
+	for _, p := range after {
+		paths[p.Path] = true
+	}
+	if !paths[outer] || !paths[alpha] || !paths[beta] {
+		t.Errorf("post-repair registry missing one of outer/alpha/beta: %v", paths)
+	}
+}
+
+// TestMCPSearch_SubProjectFilter_Hits (PR2 / Problem #2). After indexing a
+// wrapper + sub-repo, a search against the sub-repo's store with
+// sub_project=<sub-repo-name> returns matching rows. Prior to PR2 sub-repo
+// stores had sub_project='' universally, so the filter returned zero.
+func TestMCPSearch_SubProjectFilter_Hits(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, alpha, _ := seedOuterWithSubRepos(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+
+	runIndexSync(t, srv, outer)
+
+	alphaDB := heimdall.ModelDBDir(filepath.Join(alpha, ".heimdall_db"), model)
+	store, err := heimdall.OpenStore(alphaDB)
+	if err != nil {
+		t.Fatalf("open alpha store: %v", err)
+	}
+	defer store.Close()
+	queryVec := make([]float32, dim)
+	for i := range queryVec {
+		queryVec[i] = 1.0 / float32(dim)
+	}
+	results := store.SearchFiltered(context.Background(), queryVec, 0, "", "alpha", nil)
+	if len(results) == 0 {
+		t.Fatalf("sub_project=\"alpha\" filter returned zero rows (Problem #2 regression)")
+	}
+	for _, r := range results {
+		if r.Record.SubProject != "alpha" {
+			t.Errorf("returned row with SubProject=%q, want 'alpha'", r.Record.SubProject)
+		}
+	}
+}
+
+// TestMCPSearch_RootSentinel_FiltersToEmptySubProject (OQ-c). On the OUTER
+// store, sub_project="__root__" returns rows only (outer chunks have
+// sub_project='' — sub-repo chunks are stored in sub-repo-local stores).
+// The test asserts the sentinel syntactically works against a store that
+// might one day gain cross-tagged rows; on the outer-only store every
+// row qualifies.
+func TestMCPSearch_RootSentinel_FiltersToEmptySubProject(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, _, _ := seedOuterWithSubRepos(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+
+	runIndexSync(t, srv, outer)
+
+	outerDB := heimdall.ModelDBDir(filepath.Join(outer, ".heimdall_db"), model)
+	store, err := heimdall.OpenStore(outerDB)
+	if err != nil {
+		t.Fatalf("open outer store: %v", err)
+	}
+	defer store.Close()
+	queryVec := make([]float32, dim)
+	for i := range queryVec {
+		queryVec[i] = 1.0 / float32(dim)
+	}
+	results := store.SearchFiltered(context.Background(), queryVec, 0, "", heimdall.SubProjectRoot, nil)
+	if len(results) == 0 {
+		t.Fatalf("__root__ sentinel returned zero rows on outer store")
+	}
+	for _, r := range results {
+		if r.Record.SubProject != "" {
+			t.Errorf("__root__ returned row with SubProject=%q, want ''", r.Record.SubProject)
+		}
+	}
+}
+
+// TestGitIndexer_CommitsCarrySubProject (D-10) — after IndexSubRepos, the
+// per-sub-repo git-commit writer must stamp sub_project = <sub-repo name>
+// so commit filters match per-sub-repo semantics. Prior to PR2 the commit
+// writer never set the field.
+func TestGitIndexer_CommitsCarrySubProject(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, alpha, _ := seedOuterWithSubRepos(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+
+	runIndexSync(t, srv, outer)
+
+	alphaDB := heimdall.ModelDBDir(filepath.Join(alpha, ".heimdall_db"), model)
+	store, err := heimdall.OpenStore(alphaDB)
+	if err != nil {
+		t.Fatalf("open alpha store: %v", err)
+	}
+	defer store.Close()
+	// SearchFiltered with sourceType="commit" + sub_project="alpha" must
+	// return >=1 commit row. If the commit writer regressed to "" the
+	// sub_project filter would drop everything.
+	queryVec := make([]float32, dim)
+	for i := range queryVec {
+		queryVec[i] = 1.0 / float32(dim)
+	}
+	results := store.SearchFiltered(context.Background(), queryVec, 0, "commit", "alpha", nil)
+	if len(results) == 0 {
+		t.Fatalf("sub-repo git commits not tagged with sub_project='alpha' (Problem #2 commit-writer regression)")
+	}
+}
+
+// TestToolIndexText_AutoSetsSubProjectFromProjectPath (D-10 / Problem #2).
+// External-content ingest under a registered sub-repo must stamp
+// sub_project with the sub-repo's Name so the filter surface remains
+// consistent with file-code rows.
+func TestToolIndexText_AutoSetsSubProjectFromProjectPath(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, alpha, _ := seedOuterWithSubRepos(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+
+	runIndexSync(t, srv, outer)
+
+	// Use a unique source so we can find the exact row.
+	reqJSON, _ := json.Marshal(map[string]any{
+		"content": "some external note body",
+		"source":  "JIRA-XYZ-42",
+		"project": "alpha",
+		"type":    "ticket",
+	})
+	res := srv.toolIndexText(reqJSON)
+	if res.IsError {
+		t.Fatalf("toolIndexText returned error: %+v", res)
+	}
+
+	alphaDB := heimdall.ModelDBDir(filepath.Join(alpha, ".heimdall_db"), model)
+	store, err := heimdall.OpenStore(alphaDB)
+	if err != nil {
+		t.Fatalf("open alpha store: %v", err)
+	}
+	defer store.Close()
+	queryVec := make([]float32, dim)
+	for i := range queryVec {
+		queryVec[i] = 1.0 / float32(dim)
+	}
+	results := store.SearchFiltered(context.Background(), queryVec, 0, "ticket", "alpha", nil)
+	if len(results) == 0 {
+		t.Fatalf("toolIndexText row not tagged with sub_project='alpha' (Problem #2 external-writer regression)")
+	}
+}
+
+// seedHierarchicalOuter is like seedOuterWithSubRepos but puts files
+// inside nested directories so heimdall_ls can surface a hierarchy
+// (ListByContextPath only returns rows whose context_path has content
+// past the root prefix).
+func seedHierarchicalOuter(t *testing.T, base string) (outer, alpha, beta string) {
+	t.Helper()
+	outer = filepath.Join(base, "outer")
+	if err := os.MkdirAll(filepath.Join(outer, "src"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outer, "src", "outer.go"), []byte("package outer\n// outer-unique-token\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitInit(t, outer)
+
+	alpha = filepath.Join(outer, "alpha")
+	if err := os.MkdirAll(filepath.Join(alpha, "cmd"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(alpha, "cmd", "alpha.go"), []byte("package alpha\n// alpha-unique-token\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitInit(t, alpha)
+
+	beta = filepath.Join(outer, "beta")
+	if err := os.MkdirAll(filepath.Join(beta, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beta, "lib", "beta.go"), []byte("package beta\n// beta-unique-token\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitInit(t, beta)
+	return outer, alpha, beta
+}
+
+// TestHeimdallLs_ShowsSubRepos (PR4 verification gate). After a post-fix
+// index, toolLs against a registered sub-repo project must return a
+// populated listing (the sub-repo's own nested directories). This
+// confirms the resolveAnyModelDB → sub-repo store path post-PR2/PR3
+// tagging + registry repair, and exercises the "heimdall_ls hierarchy is
+// not sparse" symptom referenced in Problem #4.
+func TestHeimdallLs_ShowsSubRepos(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, _, _ := seedHierarchicalOuter(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+
+	runIndexSync(t, srv, outer)
+
+	reqJSON, _ := json.Marshal(map[string]any{"project": "alpha"})
+	res := srv.toolLs(reqJSON)
+	if res.IsError {
+		t.Fatalf("toolLs(project=alpha) returned error: %+v", res)
+	}
+	if len(res.Content) == 0 || res.Content[0].Text == "" {
+		t.Fatalf("toolLs(project=alpha) returned empty content: %+v", res)
+	}
+	body := res.Content[0].Text
+	if body == "No entries at this path." {
+		t.Errorf("toolLs(project=alpha) surfaced 'No entries' — sub-repo hierarchy sparse (PR4 gate failed)")
+	}
+}
+
+// TestHeimdallLs_HierarchyPopulatedAfterSubProjectTagging (PR4). After
+// indexing a hierarchical outer + sub-repos, ls against each registered
+// project's root returns non-empty entries. This is the overall
+// integration gate PR4 promised: with PR2 in place and PR3 registry-repair
+// done, the ls UX is not sparse.
+func TestHeimdallLs_HierarchyPopulatedAfterSubProjectTagging(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, _, _ := seedHierarchicalOuter(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+
+	runIndexSync(t, srv, outer)
+
+	// Every registered project must produce at least one ls entry.
+	if len(srv.Registry.All()) != 3 {
+		t.Fatalf("expected 3 registered projects (outer+alpha+beta), got %d", len(srv.Registry.All()))
+	}
+	for _, proj := range srv.Registry.All() {
+		reqJSON, _ := json.Marshal(map[string]any{"project": proj.Name})
+		res := srv.toolLs(reqJSON)
+		if res.IsError {
+			t.Errorf("toolLs(project=%s) error: %+v", proj.Name, res)
+			continue
+		}
+		if len(res.Content) == 0 {
+			t.Errorf("toolLs(project=%s) returned zero content blocks", proj.Name)
+			continue
+		}
+		if res.Content[0].Text == "No entries at this path." {
+			t.Errorf("toolLs(project=%s) = 'No entries at this path.' — hierarchy sparse", proj.Name)
+		}
+	}
+}
+
 // TestMCPIndex_SubRepoGitCommitsInSubRepoStore — plan §10.6 Test 2 —
 // is the regression test for the tools.go:362 bug (pre-PR #67, sub-repo
 // git commits were being written to the OUTER store). The fix opens a
