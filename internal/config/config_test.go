@@ -310,6 +310,36 @@ func TestResolveEmbedConfig_ZeroMeansUnbounded(t *testing.T) {
 	}
 }
 
+// TestResolveEmbedConfig_NegativeConcurrentRejected: negative env values
+// for HEIMDALL_EMBED_MAX_CONCURRENT are rejected at the env layer to
+// match HEIMDALL_EMBED_TIMEOUT_MS / HEIMDALL_EMBED_MAX_RETRIES behavior.
+// The internal `-1 = use default` sentinel is a struct-level convention
+// and must NOT be exposed as a valid env input. See pr74 review N-1.
+func TestResolveEmbedConfig_NegativeConcurrentRejected(t *testing.T) {
+	t.Setenv("HEIMDALL_EMBED_MAX_CONCURRENT", "-1")
+	t.Setenv("HEIMDALL_EMBED_TIMEOUT_MS", "")
+	t.Setenv("HEIMDALL_EMBED_MAX_RETRIES", "")
+
+	base := Config{
+		EmbedMaxConcurrent: 4,
+		EmbedTimeoutMs:     10000,
+		EmbedMaxRetries:    2,
+	}
+	cfg := ResolveEmbedConfig(base)
+
+	if cfg.EmbedMaxConcurrent != 4 {
+		t.Errorf("EmbedMaxConcurrent = %d, want 4 (negative env must be rejected, base value preserved)", cfg.EmbedMaxConcurrent)
+	}
+
+	// Also guard against the more aggressive negative (e.g. -2) to
+	// ensure we're not special-casing only the sentinel.
+	t.Setenv("HEIMDALL_EMBED_MAX_CONCURRENT", "-42")
+	cfg2 := ResolveEmbedConfig(base)
+	if cfg2.EmbedMaxConcurrent != 4 {
+		t.Errorf("EmbedMaxConcurrent = %d, want 4 (arbitrary negative env must be rejected)", cfg2.EmbedMaxConcurrent)
+	}
+}
+
 // TestApplyEnvOverrides_DoesNotMutatePersistedConfig: regression guard
 // for the pr74-review-security-config.md H1 finding. Setting an env var,
 // resolving, and then saving the base config MUST NOT leak env values

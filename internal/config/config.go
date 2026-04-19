@@ -235,10 +235,18 @@ func ResolveEmbedConfig(base Config) Config {
 
 	// Apply env overrides.
 	if v := os.Getenv("HEIMDALL_EMBED_MAX_CONCURRENT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.EmbedMaxConcurrent = n
-		} else {
+		n, err := strconv.Atoi(v)
+		switch {
+		case err != nil:
 			log.Printf("heimdall: ignoring malformed HEIMDALL_EMBED_MAX_CONCURRENT=%q: %v", v, err)
+		case n < 0:
+			// Reject negatives to match TIMEOUT_MS / MAX_RETRIES env
+			// validation. The `-1 = use default` sentinel is a
+			// struct/config-file convention only; at the env layer a
+			// negative value is invalid user input. See pr74 review N-1.
+			log.Printf("heimdall: ignoring negative HEIMDALL_EMBED_MAX_CONCURRENT=%q", v)
+		default:
+			cfg.EmbedMaxConcurrent = n
 		}
 	}
 	if v := os.Getenv("HEIMDALL_EMBED_TIMEOUT_MS"); v != "" {
