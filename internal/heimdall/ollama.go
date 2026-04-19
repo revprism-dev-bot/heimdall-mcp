@@ -100,31 +100,68 @@ func NewOllamaClientWithLimit(endpoint string, maxConcurrent int) *OllamaClient 
 
 // NewOllamaClientFromConfig is a convenience constructor that maps the
 // `EmbedMaxConcurrent` / `EmbedTimeoutMs` / `EmbedMaxRetries` fields from
-// the top-level Config (see internal/config) onto OllamaOptions. Zero
-// values fall through to package defaults — callers do not need to know
-// the defaults. Kept in the heimdall package so the heimdall ↔ config
-// cycle stays one-way.
+// the top-level Config (see internal/config) onto OllamaOptions. The
+// sentinel contract is:
+//
+//	maxConcurrent == -1 → "use package default" (DefaultEmbedMaxConcurrent=2).
+//	maxConcurrent == 0  → EXPLICIT unbounded (nil semaphore). Documented in
+//	                      README as `embed_max_concurrent: 0 = unbounded`.
+//	maxConcurrent > 0   → cap at the given value.
+//	maxConcurrent < -1  → treated as -1 (coerce to default, with warn log
+//	                      inside NewOllamaClientWithOptions for <0).
+//
+//	timeoutMs  ≤ 0 → "use package default" (DefaultEmbedTimeout=30s).
+//	timeoutMs  > 0 → apply literally (in ms).
+//
+//	maxRetries == -1 → "explicitly disable retries" (0 retries).
+//	maxRetries == 0  → "use package default" (DefaultEmbedMaxRetries=2).
+//	maxRetries > 0   → apply literally.
+//
+// The -1 sentinel for "unset / use default" keeps the JSON-zero value
+// meaningful (0 == unbounded / 0 retries explicit) while still offering a
+// safe default for callers that don't care. config.DefaultConfig() seeds
+// EmbedMaxConcurrent and EmbedMaxRetries to -1 so fresh installs land
+// on the safe defaults without surprise.
+//
+// Kept in the heimdall package so the heimdall ↔ config cycle stays one-way.
 func NewOllamaClientFromConfig(endpoint string, maxConcurrent, timeoutMs, maxRetries int) *OllamaClient {
-	opts := OllamaOptions{
-		MaxConcurrent: maxConcurrent, // 0 → unbounded (explicit opt-out),
-		MaxRetries:    DefaultEmbedMaxRetries,
-	}
-	// Zero in the config means "unset → default". Only non-zero overrides.
-	if maxConcurrent == 0 {
+	opts := OllamaOptions{}
+
+	// --- maxConcurrent ---
+	switch {
+	case maxConcurrent == -1:
+		opts.MaxConcurrent = DefaultEmbedMaxConcurrent
+	case maxConcurrent == 0:
+		// Explicit unbounded. Leave opts.MaxConcurrent at 0 — the
+		// downstream constructor creates a nil semaphore.
+		opts.MaxConcurrent = 0
+	case maxConcurrent > 0:
+		opts.MaxConcurrent = maxConcurrent
+	default:
+		// maxConcurrent < -1 — invalid sentinel. Log and coerce.
+		log.Printf("heimdall: NewOllamaClientFromConfig: invalid maxConcurrent=%d; coercing to default %d", maxConcurrent, DefaultEmbedMaxConcurrent)
 		opts.MaxConcurrent = DefaultEmbedMaxConcurrent
 	}
+
+	// --- timeoutMs ---
 	if timeoutMs > 0 {
 		opts.EmbedTimeout = time.Duration(timeoutMs) * time.Millisecond
 	}
-	if maxRetries > 0 {
+
+	// --- maxRetries ---
+	switch {
+	case maxRetries == -1:
+		opts.MaxRetries = 0
+	case maxRetries == 0:
+		opts.MaxRetries = DefaultEmbedMaxRetries
+	case maxRetries > 0:
 		opts.MaxRetries = maxRetries
-	}
-	// Allow explicit "0 retries" only via negative sentinel — zero from
-	// JSON defaults is ambiguous. Callers who want zero retries set the
-	// config field explicitly to -1 (treated as 0 after clamping below).
-	if maxRetries < 0 {
+	default:
+		// maxRetries < -1 — invalid. Coerce to zero retries.
+		log.Printf("heimdall: NewOllamaClientFromConfig: invalid maxRetries=%d; coercing to 0", maxRetries)
 		opts.MaxRetries = 0
 	}
+
 	return NewOllamaClientWithOptions(endpoint, opts)
 }
 
@@ -304,12 +341,16 @@ func (c *OllamaClient) embed(ctx context.Context, payload EmbedRequest) ([]float
 		if attempt == c.maxRetries {
 			break
 		}
-		// Sleep, but don't exceed caller ctx.
+		// Sleep, but don't exceed caller ctx. Use NewTimer + Stop so a
+		// ctx-cancel during backoff releases the timer immediately
+		// (time.After leaks its timer until the duration elapses).
 		sleep := c.backoffFor(attempt)
 		if sleep > 0 {
+			t := time.NewTimer(sleep)
 			select {
-			case <-time.After(sleep):
+			case <-t.C:
 			case <-ctx.Done():
+				t.Stop()
 				return nil, lastErr
 			}
 		}
@@ -461,9 +502,13 @@ func (c *OllamaClient) EmbedBatch(ctx context.Context, model string, texts []str
 		}
 		sleep := c.backoffFor(attempt)
 		if sleep > 0 {
+			// Use NewTimer + Stop so ctx-cancel during backoff releases
+			// the timer immediately (time.After leaks its timer).
+			t := time.NewTimer(sleep)
 			select {
-			case <-time.After(sleep):
+			case <-t.C:
 			case <-ctx.Done():
+				t.Stop()
 				return nil, lastErr
 			}
 		}
