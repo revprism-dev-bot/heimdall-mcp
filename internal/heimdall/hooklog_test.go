@@ -163,15 +163,16 @@ func TestRedactLogString_PosixStillRedacts(t *testing.T) {
 	}
 }
 
-// HD-5 (2026-04-18): default rotation threshold is 10 MB. Bumped from
-// 5 MB prophylactically after Plan 12 Stage 1 added prompt_embed_b64 +
-// hit_ids to user-prompt logs (~2 MB / 14 days, 20–25% of old cap). New
-// ceiling: 10 MB live + 1 rotation = 20 MB total. Lock the default so
-// any accidental downsizing trips a test.
-func TestHookLogMaxBytes_DefaultIs10MB(t *testing.T) {
-	const want int64 = 10 * 1024 * 1024
+// Task 6 (2026-04-19): default rotation threshold is 20 MB. Bumped from
+// 10 MB after per-MCP-tool-call log entries (duration_ms, input_bytes,
+// result_size) were added, increasing log volume. 20 MB comfortably fits
+// a week of verbose single-user logs including per-tool-call entries.
+// New ceiling: 20 MB live + 1 rotation = 40 MB total. Lock the default
+// so any accidental downsizing trips a test.
+func TestHookLogMaxBytes_DefaultIs20MB(t *testing.T) {
+	const want int64 = 20 * 1024 * 1024
 	if hookLogMaxBytes != want {
-		t.Errorf("hookLogMaxBytes default: got %d, want %d (10 MB per HD-5)", hookLogMaxBytes, want)
+		t.Errorf("hookLogMaxBytes default: got %d, want %d (20 MB per Task 6)", hookLogMaxBytes, want)
 	}
 }
 

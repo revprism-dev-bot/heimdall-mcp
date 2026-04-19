@@ -2,8 +2,11 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -360,6 +363,39 @@ func TestHeimdallInstructionsTriggerPairs(t *testing.T) {
 		if !strings.Contains(heimdallInstructions, m) {
 			t.Errorf("heimdallInstructions missing marker: %q", m)
 		}
+	}
+}
+
+func TestHandleToolsCall_LogsEveryInvocation(t *testing.T) {
+	// Capture log lines via a temporary HEIMDALL_HOOK_LOG path.
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	// Build a minimal server. Use heimdall_configure (get action) because it
+	// needs no live index or registry — the dispatcher just reads s.Cfg and
+	// returns. We only need the dispatcher to execute and emit the log line.
+	s := &Server{Cfg: config.DefaultConfig()}
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"heimdall_configure","arguments":{"action":"get","key":"model"}}`),
+	}
+	_ = s.handleToolsCall(req)
+
+	body, err := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if err != nil {
+		t.Fatalf("hooks.log not written: %v", err)
+	}
+	s2 := string(body)
+	if !strings.Contains(s2, "event=mcp.tool_call") {
+		t.Errorf("expected event=mcp.tool_call in log; got %s", s2)
+	}
+	if !strings.Contains(s2, `tool=heimdall_configure`) {
+		t.Errorf("expected tool=heimdall_configure in log; got %s", s2)
+	}
+	if !strings.Contains(s2, "duration_ms=") {
+		t.Errorf("expected duration_ms field in log; got %s", s2)
 	}
 }
 

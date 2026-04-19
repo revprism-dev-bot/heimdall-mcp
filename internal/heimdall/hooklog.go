@@ -28,10 +28,11 @@ const (
 
 // hookLogMaxBytes is the rotation threshold (§5.8). A var (not const) so the
 // rotation end-to-end test can shrink it to a few KB via SetHookLogMaxBytesForTest
-// instead of writing 10 MB of data. Default bumped from 5 MB to 10 MB per HD-5
-// (2026-04-18) after Plan 12 Stage 1 added verbose keys (prompt_embed_b64 +
-// hit_ids) to user-prompt logs; new ceiling is 10 MB live + 1 rotation = 20 MB.
-var hookLogMaxBytes int64 = 10 * 1024 * 1024
+// instead of writing 20 MB of data. Default bumped from 10 MB to 20 MB per
+// Task 6 (2026-04-19) after per-MCP-tool-call entries (duration_ms,
+// input_bytes, result_size) were added; 20 MB comfortably fits a week of
+// verbose single-user logs including per-MCP-tool-call entries.
+var hookLogMaxBytes int64 = 20 * 1024 * 1024
 
 // SetHookLogMaxBytesForTest overrides the rotation threshold for the duration
 // of one test. Returns a restore closure; callers defer it. Test-only.
@@ -69,8 +70,8 @@ func hookLogPathFromEnv(getenv func(string) string, userHome func() (string, err
 	return filepath.Join(home, ".local", "state", "heimdall", "hooks.log")
 }
 
-func osEnv(k string) string                { return os.Getenv(k) }
-func osUserHome() (string, error)          { return os.UserHomeDir() }
+func osEnv(k string) string       { return os.Getenv(k) }
+func osUserHome() (string, error) { return os.UserHomeDir() }
 
 // LogHookEvent writes one line to the hook log.
 //

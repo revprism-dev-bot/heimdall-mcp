@@ -40,9 +40,9 @@ type Server struct {
 	Index       IndexState
 	MemoryStore *heimdall.MemoryStore
 
-	ollamaMu    sync.Mutex
-	ollama      *heimdall.OllamaClient
-	ollamaKey   ollamaClientKey
+	ollamaMu  sync.Mutex
+	ollama    *heimdall.OllamaClient
+	ollamaKey ollamaClientKey
 }
 
 // cfgSnapshot returns a value copy of s.Cfg under a read lock. Callers
@@ -61,10 +61,10 @@ func (s *Server) cfgSnapshot() config.Config {
 // changes mid-session don't migrate to in-flight calls, which matches
 // the "next invocation picks up new values" promise.
 type ollamaClientKey struct {
-	endpoint       string
-	maxConcurrent  int
-	timeoutMs      int
-	maxRetries     int
+	endpoint      string
+	maxConcurrent int
+	timeoutMs     int
+	maxRetries    int
 }
 
 // TextResult creates a successful text result.
@@ -618,6 +618,7 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 		}
 	}
 
+	start := time.Now()
 	var result MCPToolResult
 	switch params.Name {
 	case "heimdall_search":
@@ -647,6 +648,10 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 	case "heimdall_manage_paths":
 		result = s.toolManagePaths(params.Arguments)
 	default:
+		heimdall.LogHookEvent("WARN", "mcp.tool_call", map[string]any{
+			"tool": params.Name,
+			"err":  "unknown_tool",
+		})
 		return &JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
@@ -654,7 +659,31 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 		}
 	}
 
+	// Structured log for every successful dispatch. Field choices:
+	//   tool        — which MCP tool ran
+	//   duration_ms — wall-clock time of the handler
+	//   input_bytes — size of the arguments JSON (not the content — privacy/size)
+	//   is_error    — whether result.IsError is true
+	//   result_size — approximate byte size of the rendered result
+	heimdall.LogHookEvent("INFO", "mcp.tool_call", map[string]any{
+		"tool":        params.Name,
+		"duration_ms": time.Since(start).Milliseconds(),
+		"input_bytes": len(params.Arguments),
+		"is_error":    result.IsError,
+		"result_size": resultSize(result),
+	})
+
 	return &JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+}
+
+// resultSize returns the approximate total byte count of text content blocks
+// in an MCPToolResult. Used for observability, not correctness.
+func resultSize(r MCPToolResult) int {
+	n := 0
+	for _, c := range r.Content {
+		n += len(c.Text)
+	}
+	return n
 }
 
 func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {
