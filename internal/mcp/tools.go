@@ -33,7 +33,7 @@ func (s *Server) toolSearch(args json.RawMessage) MCPToolResult {
 	}
 
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := s.newOllamaClient()
 	if err := client.Ping(ctx); err != nil {
 		return ollamaSetupError(s.Cfg.OllamaEndpoint, s.Cfg.Model, err)
 	}
@@ -273,7 +273,7 @@ func (s *Server) runIndex(ctx context.Context, absPath string) {
 		s.Index.Mu.Unlock()
 	}()
 
-	client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+	client := s.newOllamaClient()
 
 	if err := client.Ping(ctx); err != nil {
 		s.Index.Mu.Lock()
@@ -636,7 +636,7 @@ func (s *Server) toolStatus(args json.RawMessage) MCPToolResult {
 		"excludePatterns": s.Cfg.ExcludePatterns,
 	}
 
-	client := heimdall.NewOllamaClient(endpoint)
+	client := s.newOllamaClient()
 	if err := client.Ping(ctx); err != nil {
 		status["ollamaRunning"] = false
 	} else {

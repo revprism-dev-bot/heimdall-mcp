@@ -7,7 +7,6 @@ import (
 	"os"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
-	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
 )
 
 // --- Input types ---
@@ -222,7 +221,7 @@ func (s *Server) configureSet(key string, value any) MCPToolResult {
 	if key == "model" {
 		modelName, _ := value.(string)
 		if modelName != "" {
-			client := heimdall.NewOllamaClient(s.Cfg.OllamaEndpoint)
+			client := s.newOllamaClient()
 			ctx := context.Background()
 			if err := client.VerifyModel(ctx, modelName); err != nil {
 				return ErrResult(fmt.Sprintf("model verification failed: %v. The model must be pulled in Ollama and support embeddings. Run: ollama pull %s", err, modelName))

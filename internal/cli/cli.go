@@ -261,7 +261,7 @@ func cliIndex(cfg config.Config, path string, dbPath string, modelFlags []string
 	}
 
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	client := newOllamaClient(cfg)
 	fmt.Printf("Connecting to Ollama at %s...\n", cfg.OllamaEndpoint)
 	if err := client.Ping(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Ollama not reachable: %v\n", err)
@@ -644,7 +644,7 @@ func cliSearch(cfg config.Config, args []string) int {
 		defer cancel()
 	}
 
-	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	client := newOllamaClient(cfg)
 	pingCtx, pingCancel := context.WithTimeout(ctx, 1*time.Second)
 	pingErr := client.Ping(pingCtx)
 	pingCancel()
@@ -913,7 +913,7 @@ func cliConfigure(args []string) {
 		// Validate model before saving — verify it exists and can embed
 		if key == "model" {
 			fmt.Printf("Verifying model %q with Ollama...\n", rawVal)
-			client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+			client := newOllamaClient(cfg)
 			ctx := context.Background()
 			if err := client.VerifyModel(ctx, rawVal); err != nil {
 				fmt.Fprintf(os.Stderr, "Model verification failed: %v\n", err)
@@ -1125,7 +1125,7 @@ func cliManagePaths(cfg config.Config, args []string) {
 
 func cliModels(cfg config.Config) {
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	client := newOllamaClient(cfg)
 
 	fmt.Printf("Current model: %s\n", cfg.Model)
 	fmt.Println()
@@ -1189,6 +1189,6 @@ func cliModels(cfg config.Config) {
 // resolveAnyLocalModelDB finds any usable model index in a base dir.
 // Thin CLI-side wrapper over heimdall.ResolveUsableModelDB.
 func resolveAnyLocalModelDB(cfg config.Config, baseDir string) (string, string) {
-	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	client := newOllamaClient(cfg)
 	return heimdall.ResolveUsableModelDB(context.Background(), client, baseDir, cfg.Model)
 }

@@ -192,7 +192,7 @@ func resolveIndexModels(opts resolveOpts) ([]string, bool, error) {
 // can produce embeddings. Returns the list of results.
 func discoverEmbeddingModels(cfg config.Config) ([]discoveredModel, error) {
 	ctx := context.Background()
-	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	client := newOllamaClient(cfg)
 
 	models, err := client.ListModels(ctx)
 	if err != nil {

@@ -545,7 +545,7 @@ func newRealIndexRunner(cfg config.Config, projectRoot string) *realIndexRunner 
 // files; the list is used for logging and deadletter tracking.
 func (r *realIndexRunner) Reindex(ctx context.Context, files []string) error {
 	_ = files
-	client := heimdall.NewOllamaClient(r.cfg.OllamaEndpoint)
+	client := newOllamaClient(r.cfg)
 	if err := client.Ping(ctx); err != nil {
 		return fmt.Errorf("ollama_ping: %w", err)
 	}

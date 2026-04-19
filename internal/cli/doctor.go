@@ -591,13 +591,13 @@ func fillDoctorDeps(cfg config.Config, deps doctorDeps) doctorDeps {
 	}
 	if deps.pingOllama == nil {
 		deps.pingOllama = func(ctx context.Context, endpoint string) error {
-			c := heimdall.NewOllamaClient(endpoint)
+			c := newOllamaClientForEndpoint(endpoint)
 			return c.Ping(ctx)
 		}
 	}
 	if deps.listModels == nil {
 		deps.listModels = func(ctx context.Context, endpoint string) ([]string, error) {
-			c := heimdall.NewOllamaClient(endpoint)
+			c := newOllamaClientForEndpoint(endpoint)
 			models, err := c.ListModels(ctx)
 			if err != nil {
 				return nil, err

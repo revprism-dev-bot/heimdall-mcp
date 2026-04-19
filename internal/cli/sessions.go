@@ -299,7 +299,7 @@ func computeSemanticDriftForReport(cfg config.Config, cwd string, tsum heimdall.
 	ctx, cancel := context.WithTimeout(context.Background(), heimdall.SemanticDriftEmbedBatchTimeout+5*time.Second)
 	defer cancel()
 
-	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	client := newOllamaClient(cfg)
 	dbDir, model := heimdall.ResolveUsableModelDB(ctx, client, baseDir, cfg.Model)
 	if dbDir == "" || model == "" {
 		return nil, "no_usable_index"
