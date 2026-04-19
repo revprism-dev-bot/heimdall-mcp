@@ -226,12 +226,50 @@ const (
 //   - candidates: one entry per hit with marker class + ≤200-char excerpt.
 //
 // Single byte-scan pass; O(len(data)) + O(hits × regex_cost).
-func extractTranscriptSummary(data []byte) (string, []CandidateEvent) {
-	type parsed struct {
-		role    string
-		content string
+// roleFromLine extracts the "role" field value from a JSONL line without
+// full JSON decoding. Returns "" if the pattern is not found.
+func roleFromLine(line []byte) string {
+	const prefix = `"role":"`
+	idx := bytes.Index(line, []byte(prefix))
+	if idx < 0 {
+		return ""
 	}
-	var msgs []parsed
+	rest := line[idx+len(prefix):]
+	end := bytes.IndexByte(rest, '"')
+	if end < 0 {
+		return ""
+	}
+	return string(rest[:end])
+}
+
+// contentRawFromLine extracts the raw JSON value of the "content" key from
+// a JSONL line via lightweight struct decode (avoids map[string]any allocs).
+func contentRawFromLine(line []byte) json.RawMessage {
+	var e struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(line, &e) != nil {
+		return nil
+	}
+	return e.Content
+}
+
+func extractTranscriptSummary(data []byte) (string, []CandidateEvent) {
+	// prevAssistantRaw stores the raw JSONL line of the most recent assistant
+	// message, for lazy content decoding when a user marker hit is found.
+	// prevAssistantTail stores the trimmed content for tail-fallback tracking.
+	// We decode full content only for user messages (always small) and for
+	// the single preceding assistant message when a marker hits.
+
+	var candidates []CandidateEvent
+	var windows []string
+	seen := map[string]bool{}
+
+	// Rolling tail: last extractorTailCount assistant message raw lines.
+	type rawLine []byte
+	tailRaw := make([]rawLine, 0, extractorTailCount)
+	var prevRole string
+	var prevAssistantRaw []byte
 
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 2*1024*1024), 2*1024*1024)
@@ -240,63 +278,86 @@ func extractTranscriptSummary(data []byte) (string, []CandidateEvent) {
 		if len(line) == 0 {
 			continue
 		}
-		var entry map[string]any
-		if json.Unmarshal(line, &entry) != nil {
-			continue
-		}
-		role, _ := entry["role"].(string)
+		role := roleFromLine(line)
 		if role == "" {
 			continue
 		}
-		content := extractContentText(entry["content"])
-		if content == "" {
-			continue
-		}
-		msgs = append(msgs, parsed{role: role, content: content})
-	}
 
-	var candidates []CandidateEvent
-	var windows []string
-	seen := map[string]bool{}
-
-	for i, m := range msgs {
-		if m.role != "user" {
-			continue
-		}
-		for _, marker := range candidateMarkerPriority {
-			if markerPatterns[marker].MatchString(m.content) {
-				excerpt := m.content
-				if len(excerpt) > extractorExcerptMax {
-					excerpt = excerpt[:extractorExcerptMax]
-				}
-				candidates = append(candidates, CandidateEvent{Marker: marker, Excerpt: excerpt})
-
-				var win strings.Builder
-				if i > 0 && msgs[i-1].role == "assistant" {
-					win.WriteString("assistant: ")
-					win.WriteString(trimTo(msgs[i-1].content, extractorTailLen))
-					win.WriteString("\n\n")
-				}
-				win.WriteString("user: ")
-				win.WriteString(trimTo(m.content, extractorTailLen))
-				s := win.String()
-				if !seen[s] {
-					seen[s] = true
-					windows = append(windows, s)
-				}
-				break
+		if role == "assistant" {
+			// Store raw line for lazy decode; update tail ring.
+			lineCopy := append([]byte(nil), line...)
+			prevAssistantRaw = lineCopy
+			if len(tailRaw) < extractorTailCount {
+				tailRaw = append(tailRaw, lineCopy)
+			} else {
+				copy(tailRaw, tailRaw[1:])
+				tailRaw[extractorTailCount-1] = lineCopy
 			}
+			prevRole = "assistant"
+		} else if role == "user" {
+			// Decode user content (user messages are always small).
+			raw := contentRawFromLine(line)
+			if raw == nil {
+				prevRole = "user"
+				prevAssistantRaw = nil
+				continue
+			}
+			content := extractContentTextRaw(raw)
+			if content == "" {
+				prevRole = "user"
+				prevAssistantRaw = nil
+				continue
+			}
+
+			for _, marker := range candidateMarkerPriority {
+				if markerPatterns[marker].MatchString(content) {
+					excerpt := content
+					if len(excerpt) > extractorExcerptMax {
+						excerpt = excerpt[:extractorExcerptMax]
+					}
+					candidates = append(candidates, CandidateEvent{Marker: marker, Excerpt: excerpt})
+
+					var win strings.Builder
+					if prevRole == "assistant" && prevAssistantRaw != nil {
+						// Lazy-decode the preceding assistant message now.
+						if prevRaw := contentRawFromLine(prevAssistantRaw); prevRaw != nil {
+							prevContent := extractContentTextRaw(prevRaw)
+							if prevContent != "" {
+								win.WriteString("assistant: ")
+								win.WriteString(trimTo(prevContent, extractorTailLen))
+								win.WriteString("\n\n")
+							}
+						}
+					}
+					win.WriteString("user: ")
+					win.WriteString(trimTo(content, extractorTailLen))
+					s := win.String()
+					if !seen[s] {
+						seen[s] = true
+						windows = append(windows, s)
+					}
+					break
+				}
+			}
+			prevRole = "user"
+			prevAssistantRaw = nil
+		} else {
+			prevRole = role
+			prevAssistantRaw = nil
 		}
 	}
 
 	if len(windows) == 0 {
-		var tail []string
-		for i := len(msgs) - 1; i >= 0 && len(tail) < extractorTailCount; i-- {
-			if msgs[i].role == "assistant" {
-				tail = append([]string{trimTo(msgs[i].content, extractorTailLen)}, tail...)
+		// Decode tail assistant messages for fallback summary.
+		decoded := make([]string, 0, len(tailRaw))
+		for _, raw := range tailRaw {
+			if cr := contentRawFromLine(raw); cr != nil {
+				if c := extractContentTextRaw(cr); c != "" {
+					decoded = append(decoded, trimTo(c, extractorTailLen))
+				}
 			}
 		}
-		windows = tail
+		windows = decoded
 	}
 
 	summary := strings.Join(windows, "\n\n---\n\n")
@@ -306,32 +367,38 @@ func extractTranscriptSummary(data []byte) (string, []CandidateEvent) {
 	return summary, candidates
 }
 
-// extractContentText handles both Claude Code transcript content shapes:
-// a bare string, or an array of content blocks with {"type":"text","text":"..."}.
-// Returns the concatenated text portion; tool_use blocks are ignored here
-// (counted separately by countHeimdallWrites).
-func extractContentText(raw any) string {
-	switch v := raw.(type) {
-	case string:
-		return v
-	case []any:
-		var parts []string
-		for _, block := range v {
-			m, ok := block.(map[string]any)
-			if !ok {
-				continue
-			}
-			if t, _ := m["type"].(string); t == "text" {
-				if text, _ := m["text"].(string); text != "" {
-					parts = append(parts, text)
-				}
-			}
-		}
-		return strings.Join(parts, "\n")
-	default:
+// extractContentTextRaw is like extractContentText but operates on
+// json.RawMessage to avoid double-parsing the content field.
+func extractContentTextRaw(raw json.RawMessage) string {
+	if len(raw) == 0 {
 		return ""
 	}
+	// Quick heuristic: if it starts with '"' it's a string.
+	if raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return s
+		}
+		return ""
+	}
+	// Otherwise treat as array of content blocks.
+	var blocks []json.RawMessage
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+	var parts []string
+	for _, b := range blocks {
+		var m struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(b, &m) == nil && m.Type == "text" && m.Text != "" {
+			parts = append(parts, m.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
+
 
 func trimTo(s string, n int) string {
 	if len(s) <= n {
