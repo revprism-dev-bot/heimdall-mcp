@@ -669,6 +669,38 @@ func TestHookSessionStart_RaceFree(t *testing.T) {
 var _ HookSessionStartDeps = HookSessionStartDeps{}
 
 // ---------------------------------------------------------------------------
+// emitTierBNote unit tests
+// ---------------------------------------------------------------------------
+
+func TestEmitTierBNote_NewTwoLineForm(t *testing.T) {
+	var buf bytes.Buffer
+	// Always-emit suppress stub so the note actually fires.
+	alwaysEmit := func(_, _ string, _ time.Duration) bool { return true }
+	emitTierBNote(&buf, alwaysEmit, "/some/project", "index_model_mismatch", "index model mismatch")
+
+	out := buf.String()
+	if !strings.Contains(out, "> heimdall_search: unavailable (index model mismatch)") {
+		t.Errorf("missing scoped search-unavailable line; got:\n%s", out)
+	}
+	if !strings.Contains(out, "heimdall_remember and heimdall_index_text still work") {
+		t.Errorf("missing writes-still-work reassurance line; got:\n%s", out)
+	}
+	// Old single-line form must be gone.
+	if strings.Contains(out, "> heimdall: unavailable") {
+		t.Errorf("old unscoped banner leaked; got:\n%s", out)
+	}
+}
+
+func TestEmitTierBNote_SuppressedWhenOutsideWindow(t *testing.T) {
+	var buf bytes.Buffer
+	neverEmit := func(_, _ string, _ time.Duration) bool { return false }
+	emitTierBNote(&buf, neverEmit, "/p", "index_model_mismatch", "index model mismatch")
+	if buf.Len() != 0 {
+		t.Errorf("expected empty output when suppressed, got %q", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Scope tests (Feature 1: hook scope filtering by CWD subpath)
 //
 // SessionStart uses RunRecall, which takes MemoryFilter.ContextPath.

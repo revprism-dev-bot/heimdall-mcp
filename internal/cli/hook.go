@@ -383,15 +383,23 @@ func classifyVerifyErr(err error) string {
 	}
 }
 
-// emitTierBNote writes a one-line degraded-state note to stdout if and only
-// if the suppression store says this failure code is out of its cooldown
-// window. Otherwise writes nothing.
+// emitTierBNote writes a two-line degraded-state note to stdout iff the
+// suppression store says this failure code is out of its cooldown window.
+// Scopes the "unavailable" claim to the read path (heimdall_search) and
+// reassures the model that write-path tools (heimdall_remember,
+// heimdall_index_text) are still usable in this branch — which is true
+// whenever we reach here: Ollama is up (checked earlier), and the memory
+// store is independent of the code-index model-verify gate.
 func emitTierBNote(w io.Writer, suppress func(string, string, time.Duration) bool, project, failureCode, humanReason string) {
 	if !suppress(project, failureCode, sessionStartSuppressionWindow) {
 		return
 	}
-	// Single-line degraded banner — matches plan §3.1 wording.
-	fmt.Fprintf(w, "## Heimdall context\n\n> heimdall: unavailable (%s)\n", humanReason)
+	fmt.Fprintf(w,
+		"## Heimdall context\n\n"+
+			"> heimdall_search: unavailable (%s)\n"+
+			"> heimdall_remember and heimdall_index_text still work — use them for this session's decisions.\n",
+		humanReason,
+	)
 }
 
 // emitEmpty writes the "no index yet" one-liner.
