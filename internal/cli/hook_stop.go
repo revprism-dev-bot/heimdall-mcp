@@ -144,7 +144,7 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 						defer memStore.Close()
 						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 						defer cancel()
-						client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+						client := newOllamaClient(cfg)
 						embedder := heimdall.NewOllamaEmbedder(client, cfg.Model)
 						result, err := heimdall.IngestSessionSummary(ctx, summary, "", embedder, memStore)
 						if err == nil {

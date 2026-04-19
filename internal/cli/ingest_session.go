@@ -103,7 +103,7 @@ func CLIIngestSession(stdin io.Reader, stdout, stderr io.Writer, env map[string]
 	newEmbedder := deps.NewEmbedder
 	if newEmbedder == nil {
 		newEmbedder = func(ctx context.Context, endpoint, model string) (heimdall.Embedder, error) {
-			client := heimdall.NewOllamaClient(endpoint)
+			client := newOllamaClientForEndpoint(endpoint)
 			if err := client.Ping(ctx); err != nil {
 				return nil, fmt.Errorf("ollama not reachable at %s: %w", endpoint, err)
 			}

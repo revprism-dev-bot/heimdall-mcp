@@ -197,7 +197,7 @@ func fillSkillsDeps(deps SkillsDeps) SkillsDeps {
 	}
 	if deps.NewEmbedder == nil {
 		deps.NewEmbedder = func(ctx context.Context, endpoint, model string) (func(string) ([]float32, error), error) {
-			client := heimdall.NewOllamaClient(endpoint)
+			client := newOllamaClientForEndpoint(endpoint)
 			if err := client.Ping(ctx); err != nil {
 				return nil, fmt.Errorf("ollama not reachable at %s: %w", endpoint, err)
 			}

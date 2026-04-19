@@ -147,7 +147,7 @@ var prewarmFn prewarmFunc = runPrewarmOllama
 func runPrewarmOllama(ctx context.Context, endpoint, model string) prewarmResult {
 	res := prewarmResult{model: model}
 	start := time.Now()
-	client := heimdall.NewOllamaClient(endpoint)
+	client := newOllamaClientForEndpoint(endpoint)
 	_, err := client.EmbedForHook(ctx, model, prewarmInput)
 	res.duration = time.Since(start)
 	res.err = err
@@ -206,7 +206,7 @@ func runSkillsImport(ctx context.Context, cfg config.Config, env map[string]stri
 	}
 	defer store.Close()
 
-	client := heimdall.NewOllamaClient(cfg.OllamaEndpoint)
+	client := newOllamaClient(cfg)
 	if err := client.Ping(ctx); err != nil {
 		res.err = fmt.Errorf("ollama not reachable at %s: %w", cfg.OllamaEndpoint, err)
 		return
