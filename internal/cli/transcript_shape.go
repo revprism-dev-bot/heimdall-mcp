@@ -32,6 +32,17 @@ func extractRoleAndContent(entry map[string]any) (role string, content any, ok b
 		return "", nil, false
 	}
 
+	// Skip meta entries. Claude Code sets isMeta=true (and often a
+	// sourceToolUseID) on system-injected content that arrives in the
+	// user-role channel — skill loader payloads, tool-invocation echoes,
+	// and internal prompts. These aren't real human input and must not
+	// trigger marker-based rules (correction, teaching, workaround,
+	// frustration) — the skill bodies routinely contain words like
+	// "stop", "instead", "turns out" in their documentation.
+	if isMeta, _ := entry["isMeta"].(bool); isMeta {
+		return "", nil, false
+	}
+
 	msg, _ := entry["message"].(map[string]any)
 	if msg == nil {
 		return "", nil, false

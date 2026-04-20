@@ -120,6 +120,23 @@ func TestExtractRoleAndContent_BothShapes(t *testing.T) {
 			wantContent: "system prompt",
 			wantOK:      true,
 		},
+		{
+			// isMeta=true entries are Claude Code's skill-loader / tool-invocation
+			// echoes that arrive in the user-role channel. They must be skipped —
+			// skill bodies routinely contain marker words that would fire the
+			// correction/teaching/workaround rules as false positives.
+			name: "meta_user_skipped",
+			entry: map[string]any{
+				"type":   "user",
+				"uuid":   "u2",
+				"isMeta": true,
+				"message": map[string]any{
+					"role":    "user",
+					"content": "Base directory for this skill: ... stop instead turns out",
+				},
+			},
+			wantOK: false,
+		},
 	}
 
 	for _, tc := range cases {
