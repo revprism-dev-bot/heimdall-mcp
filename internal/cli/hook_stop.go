@@ -246,15 +246,31 @@ func roleFromLine(line []byte) string {
 }
 
 // contentRawFromLine extracts the raw JSON value of the "content" key from
-// a JSONL line via lightweight struct decode (avoids map[string]any allocs).
+// a JSONL line, handling both transcript shapes:
+//
+//  1. Legacy shape: top-level "content" field.
+//  2. Real Claude Code shape: "content" nested under "message".
+//
+// Returns nil if content is not found or cannot be decoded.
 func contentRawFromLine(line []byte) json.RawMessage {
-	var e struct {
+	// Try top-level content first (legacy / synthetic shape).
+	var topLevel struct {
 		Content json.RawMessage `json:"content"`
+		Message *struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
 	}
-	if json.Unmarshal(line, &e) != nil {
+	if json.Unmarshal(line, &topLevel) != nil {
 		return nil
 	}
-	return e.Content
+	if len(topLevel.Content) > 0 {
+		return topLevel.Content
+	}
+	// Fall back to message.content (real Claude Code shape).
+	if topLevel.Message != nil && len(topLevel.Message.Content) > 0 {
+		return topLevel.Message.Content
+	}
+	return nil
 }
 
 func extractTranscriptSummary(data []byte) (string, []CandidateEvent) {
@@ -411,6 +427,9 @@ func trimTo(s string, n int) string {
 
 // countHeimdallWrites returns the number of tool_use blocks in the
 // transcript whose name is heimdall_remember or heimdall_index_text.
+// Handles both the legacy top-level shape and the real Claude Code shape
+// where content is nested under "message". Tool names are normalised via
+// normalizeToolName so mcp__heimdall__heimdall_remember is counted too.
 func countHeimdallWrites(data []byte) int {
 	n := 0
 	sc := bufio.NewScanner(bytes.NewReader(data))
@@ -424,11 +443,15 @@ func countHeimdallWrites(data []byte) int {
 		if json.Unmarshal(line, &entry) != nil {
 			continue
 		}
-		raw, ok := entry["content"].([]any)
+		_, rawContent, ok := extractRoleAndContent(entry)
 		if !ok {
 			continue
 		}
-		for _, block := range raw {
+		blocks, ok := rawContent.([]any)
+		if !ok {
+			continue
+		}
+		for _, block := range blocks {
 			m, ok := block.(map[string]any)
 			if !ok {
 				continue
@@ -437,7 +460,7 @@ func countHeimdallWrites(data []byte) int {
 				continue
 			}
 			name, _ := m["name"].(string)
-			if name == "heimdall_remember" || name == "heimdall_index_text" {
+			if bare := normalizeToolName(name); bare == "heimdall_remember" || bare == "heimdall_index_text" {
 				n++
 			}
 		}

@@ -18,6 +18,22 @@ import (
 	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
 
+// mcpServerKey is a stable per-process identifier that lets operators bucket
+// mcp.tool_call log lines by MCP-server-lifetime. Claude Code does not thread
+// its session_id into MCP subprocess calls, so this is the best proxy
+// available. Computed once at package init: "mcp-<hostname>-<pid>".
+var mcpServerKey = func() string {
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "unknown"
+	}
+	// Trim to first label to keep the key short.
+	if dot := strings.IndexByte(host, '.'); dot > 0 {
+		host = host[:dot]
+	}
+	return fmt.Sprintf("mcp-%s-%d", host, os.Getpid())
+}()
+
 // Server holds runtime state for the MCP server.
 //
 // ollama / ollamaMu implement a server-scoped OllamaClient singleton so
@@ -649,8 +665,9 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 		result = s.toolManagePaths(params.Arguments)
 	default:
 		heimdall.LogHookEvent("WARN", "mcp.tool_call", map[string]any{
-			"tool": params.Name,
-			"err":  "unknown_tool",
+			"tool":       params.Name,
+			"err":        "unknown_tool",
+			"mcp_server": mcpServerKey,
 		})
 		return &JSONRPCResponse{
 			JSONRPC: "2.0",
@@ -665,12 +682,14 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 	//   input_bytes — size of the arguments JSON (not the content — privacy/size)
 	//   is_error    — whether result.IsError is true
 	//   result_size — approximate byte size of the rendered result
+	//   mcp_server  — stable per-process key for bucketing by MCP-server-lifetime
 	heimdall.LogHookEvent("INFO", "mcp.tool_call", map[string]any{
 		"tool":        params.Name,
 		"duration_ms": time.Since(start).Milliseconds(),
 		"input_bytes": len(params.Arguments),
 		"is_error":    result.IsError,
 		"result_size": resultSize(result),
+		"mcp_server":  mcpServerKey,
 	})
 
 	return &JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}

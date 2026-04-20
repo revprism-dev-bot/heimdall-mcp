@@ -373,6 +373,8 @@ func evaluateTaskStartRecall(msgs []parsedMsg) (int, int, []MissedCall) {
 // parseTranscriptMessages walks the JSONL transcript and returns a slice of
 // parsedMsg with role, flattened text content, and raw content blocks.
 // The Index field reflects the line's 0-based position in the file.
+// Handles both the legacy top-level shape and the real Claude Code shape
+// via extractRoleAndContent.
 func parseTranscriptMessages(data []byte) []parsedMsg {
 	var msgs []parsedMsg
 	i := 0
@@ -386,13 +388,13 @@ func parseTranscriptMessages(data []byte) []parsedMsg {
 			i++
 			continue
 		}
-		role, _ := entry["role"].(string)
-		if role == "" {
+		role, rawContent, ok := extractRoleAndContent(entry)
+		if !ok {
 			i++
 			continue
 		}
 		p := parsedMsg{Role: role, Index: i}
-		switch v := entry["content"].(type) {
+		switch v := rawContent.(type) {
 		case string:
 			p.Content = v
 		case []any:
@@ -418,11 +420,13 @@ func parseTranscriptMessages(data []byte) []parsedMsg {
 }
 
 // assistantHasTool returns true if the message has a tool_use block with the
-// given tool name.
+// given tool name. The comparison is performed after normalising the stored
+// name via normalizeToolName so that both bare ("heimdall_remember") and
+// MCP-prefixed ("mcp__heimdall__heimdall_remember") names match.
 func assistantHasTool(msg parsedMsg, toolName string) bool {
 	for _, block := range msg.ContentBlocks {
 		if btype, _ := block["type"].(string); btype == "tool_use" {
-			if name, _ := block["name"].(string); name == toolName {
+			if name, _ := block["name"].(string); normalizeToolName(name) == toolName {
 				return true
 			}
 		}

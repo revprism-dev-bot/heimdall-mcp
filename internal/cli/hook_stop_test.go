@@ -427,6 +427,53 @@ func TestHookSessionEnd_SuppressesWhenClean(t *testing.T) {
 	}
 }
 
+// TestExtractTranscriptSummary_RealShape verifies that extractTranscriptSummary
+// correctly processes the real Claude Code transcript shape (nested under
+// "message"), finding correction markers and returning candidates.
+func TestExtractTranscriptSummary_RealShape(t *testing.T) {
+	data, err := os.ReadFile("testdata/transcript_real_shape.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	summary, candidates := extractTranscriptSummary(data)
+
+	if summary == "" {
+		t.Fatal("expected non-empty summary for real-shape transcript")
+	}
+
+	// The first entry says "actually no, do X instead" — should yield a correction.
+	hasCorrectionCandidate := false
+	for _, c := range candidates {
+		if c.Marker == "correction" {
+			hasCorrectionCandidate = true
+			break
+		}
+	}
+	if !hasCorrectionCandidate {
+		t.Errorf("expected at least one correction candidate; got candidates=%+v", candidates)
+	}
+	// All excerpts must be within the 200-char cap.
+	for _, c := range candidates {
+		if len(c.Excerpt) > 200 {
+			t.Errorf("excerpt exceeds 200 chars (%d): %q", len(c.Excerpt), c.Excerpt)
+		}
+	}
+}
+
+// TestCountHeimdallWrites_RealShape verifies that countHeimdallWrites correctly
+// counts mcp__heimdall__* tool-use blocks in the real Claude Code transcript shape.
+func TestCountHeimdallWrites_RealShape(t *testing.T) {
+	data, err := os.ReadFile("testdata/transcript_real_shape.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	n := countHeimdallWrites(data)
+	// Fixture has one mcp__heimdall__heimdall_remember block.
+	if n != 1 {
+		t.Errorf("expected 1 heimdall write (mcp__heimdall__heimdall_remember), got %d", n)
+	}
+}
+
 func TestHookSessionEnd_SuppressesOnEmptyTranscript(t *testing.T) {
 	dir := t.TempDir()
 	tPath := filepath.Join(dir, "transcript.jsonl")

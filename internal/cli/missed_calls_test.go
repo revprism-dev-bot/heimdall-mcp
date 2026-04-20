@@ -210,3 +210,49 @@ func TestEvaluateReadLargeFile_MissWhenNoSearch(t *testing.T) {
 		t.Errorf("expected >=1 miss, got 0")
 	}
 }
+
+// TestAnalyzeTranscript_RealShape verifies that AnalyzeTranscript correctly
+// handles the real Claude Code transcript shape (type discriminator + nested
+// message) and recognises mcp__heimdall__* tool names via normalizeToolName.
+//
+// Fixture transcript_real_shape.jsonl contains:
+//   - 1 user correction ("actually no, do X instead") → triggers user_correction
+//   - 1 mcp__heimdall__heimdall_remember in the NEXT assistant turn → Followed=1
+//   - 1 large Read result (>200 lines) without heimdall_search follow-up → miss
+func TestAnalyzeTranscript_RealShape(t *testing.T) {
+	data, err := os.ReadFile("testdata/transcript_real_shape.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	res := AnalyzeTranscript(data)
+
+	// user_correction should fire exactly once.
+	// Count triggers/followed attributed to user_correction.
+	corrTriggers, corrFollowed := 0, 0
+	for _, m := range res.Misses {
+		if m.Rule == "user_correction" {
+			corrTriggers++
+		}
+	}
+	// Triggers - misses = followed (for this rule specifically).
+	// We'll verify by running the evaluator directly.
+	msgs := parseTranscriptMessages(data)
+	triggers, followed, misses := evaluateUserCorrection(msgs)
+
+	if triggers != 1 {
+		t.Errorf("user_correction: expected 1 trigger, got %d", triggers)
+	}
+	if followed != 1 {
+		t.Errorf("user_correction: expected 1 followed (mcp__heimdall__heimdall_remember should be recognised), got %d", followed)
+	}
+	if len(misses) != 0 {
+		t.Errorf("user_correction: expected 0 misses (correction WAS followed), got %+v", misses)
+	}
+	_ = corrTriggers
+	_ = corrFollowed
+
+	// Overall: at least 1 trigger must be detected.
+	if res.Triggers == 0 {
+		t.Error("expected at least 1 trigger in real-shape transcript, got 0")
+	}
+}

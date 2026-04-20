@@ -399,6 +399,36 @@ func TestHandleToolsCall_LogsEveryInvocation(t *testing.T) {
 	}
 }
 
+// TestHandleToolsCall_LogsMCPServerKey verifies that every mcp.tool_call log
+// line includes the mcp_server= field so operators can bucket calls by
+// MCP-server-lifetime (B3 fix).
+func TestHandleToolsCall_LogsMCPServerKey(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	s := &Server{Cfg: config.DefaultConfig()}
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"heimdall_configure","arguments":{"action":"get","key":"model"}}`),
+	}
+	_ = s.handleToolsCall(req)
+
+	body, err := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if err != nil {
+		t.Fatalf("hooks.log not written: %v", err)
+	}
+	logStr := string(body)
+	if !strings.Contains(logStr, "mcp_server=") {
+		t.Errorf("expected mcp_server= field in mcp.tool_call log line; got:\n%s", logStr)
+	}
+	// Key must be non-empty and follow the "mcp-<host>-<pid>" pattern.
+	if !strings.Contains(logStr, "mcp_server=mcp-") {
+		t.Errorf("expected mcp_server=mcp-<host>-<pid> format; got:\n%s", logStr)
+	}
+}
+
 // strconvItoa is a tiny local helper to keep the test independent of
 // strconv import bloat at the top of the file.
 func strconvItoa(n int) string {
