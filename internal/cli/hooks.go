@@ -45,6 +45,8 @@ func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer,
 		return HooksAuditGuardrails(stdin, stdout, stderr, env, rest)
 	case "smoke":
 		return HooksSmoke(cfg, stdin, stdout, stderr, env, rest)
+	case "analyze-session":
+		return HooksAnalyzeSession(cfg, stdin, stdout, stderr, env, rest)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "heimdall-mcp hooks — operate on the Claude Code hooks subsystem")
 		fmt.Fprintln(stdout)
@@ -56,6 +58,8 @@ func DispatchHooks(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer,
 		fmt.Fprintln(stdout, "  hooks audit-guardrails [--since=<dur>] [--format text|json]")
 		fmt.Fprintln(stdout, "                                         Audit PreToolUse shadow-mode verdicts")
 		fmt.Fprintln(stdout, "  hooks smoke [--fake-ollama] [--format=text|json]  Fire each hook once, report pass/fail")
+		fmt.Fprintln(stdout, "  hooks analyze-session --transcript <path> [--format text|json]")
+		fmt.Fprintln(stdout, "                                         Analyze a transcript for missed heimdall calls")
 		return 0
 	default:
 		fmt.Fprintf(stderr, "Unknown hooks subcommand: %s\n", sub)

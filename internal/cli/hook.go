@@ -383,15 +383,23 @@ func classifyVerifyErr(err error) string {
 	}
 }
 
-// emitTierBNote writes a one-line degraded-state note to stdout if and only
-// if the suppression store says this failure code is out of its cooldown
-// window. Otherwise writes nothing.
+// emitTierBNote writes a two-line degraded-state note to stdout iff the
+// suppression store says this failure code is out of its cooldown window.
+// Scopes the "unavailable" claim to the read path (heimdall_search) and
+// reassures the model that write-path tools (heimdall_remember,
+// heimdall_index_text) are still usable in this branch — which is true
+// whenever we reach here: Ollama is up (checked earlier), and the memory
+// store is independent of the code-index model-verify gate.
 func emitTierBNote(w io.Writer, suppress func(string, string, time.Duration) bool, project, failureCode, humanReason string) {
 	if !suppress(project, failureCode, sessionStartSuppressionWindow) {
 		return
 	}
-	// Single-line degraded banner — matches plan §3.1 wording.
-	fmt.Fprintf(w, "## Heimdall context\n\n> heimdall: unavailable (%s)\n", humanReason)
+	fmt.Fprintf(w,
+		"## Heimdall context\n\n"+
+			"> heimdall_search: unavailable (%s)\n"+
+			"> heimdall_remember and heimdall_index_text still work — use them for this session's decisions.\n",
+		humanReason,
+	)
 }
 
 // emitEmpty writes the "no index yet" one-liner.
@@ -428,9 +436,136 @@ func formatSessionStartBlock(status heimdall.StatusInfo, model, projectRoot stri
 		}
 	}
 
+	// NEW: render the last-session review if present. Silent no-op when
+	// missing/stale/malformed — so this line is safe to land before the
+	// writer in hook_stop.go is live.
+	b.WriteString(renderLastSessionReview(projectRoot, now))
+
 	appendSkillsSection(&b, skillBullets)
 
 	b.WriteString("\n_retrieved via heimdall-mcp_\n")
+	return b.String()
+}
+
+// lastSessionReview is the on-disk shape of .heimdall_db/hooks/last-session-review.json.
+// Written by HookSessionEnd (see internal/cli/hook_stop.go) and read once by
+// renderLastSessionReview at the next SessionStart. Keeping the type local to
+// hook.go avoids a package cycle with hook_stop.go — the writer side defines
+// its own equivalent; both serialize/deserialize through JSON so structural
+// compatibility is what matters, not type identity.
+type lastSessionReview struct {
+	SessionID  string       `json:"session_id"`
+	EndedAt    int64        `json:"ended_at"`
+	Candidates int          `json:"candidates"`
+	Writes     int          `json:"writes"`
+	TopMarkers []string     `json:"top_markers"`
+	Excerpts   []string     `json:"excerpts"`
+	Misses     []reviewMiss `json:"misses,omitempty"`
+	Triggers   int          `json:"triggers,omitempty"`
+	Followed   int          `json:"followed,omitempty"`
+}
+
+// reviewMiss mirrors a MissedCall for on-disk storage. The field names use
+// JSON keys that match the writer in hook_stop.go's missRecord struct.
+type reviewMiss struct {
+	Rule           string `json:"rule"`
+	ExpectedTool   string `json:"expected_tool"`
+	TriggerExcerpt string `json:"trigger"`
+	Turn           int    `json:"turn"`
+}
+
+const lastSessionReviewMaxAge = 7 * 24 * time.Hour
+
+// renderLastSessionReview returns the "### Last session review" markdown
+// section for inclusion in the SessionStart block, or empty string if:
+//   - the review file is missing
+//   - the file is malformed
+//   - the review is older than 7 days
+//
+// The review file is unlinked in all cases where it exists and is readable
+// (including stale and malformed), so a bad file doesn't keep nagging.
+// Only the successful-render path writes output; the unlink is side-effect.
+func renderLastSessionReview(projectDir string, now time.Time) string {
+	path := filepath.Join(projectDir, ".heimdall_db", "hooks", "last-session-review.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// Missing or unreadable — quietly skip. No unlink (nothing to unlink on ENOENT).
+		return ""
+	}
+	// Unlink before rendering: consume-once semantics survive even a render panic.
+	_ = os.Remove(path)
+
+	var rev lastSessionReview
+	if err := json.Unmarshal(data, &rev); err != nil {
+		heimdall.LogHookEvent("WARN", "session-start", map[string]any{"err": "review_json_parse_failed"})
+		return ""
+	}
+	endedAt := time.Unix(rev.EndedAt, 0)
+	if now.Sub(endedAt) > lastSessionReviewMaxAge {
+		return ""
+	}
+
+	// Counts by marker, preserving priority order.
+	markerCounts := map[string]int{}
+	for _, m := range rev.TopMarkers {
+		markerCounts[m]++
+	}
+	var markerParts []string
+	for _, m := range []string{"correction", "workaround", "teaching", "frustration"} {
+		if c := markerCounts[m]; c > 0 {
+			markerParts = append(markerParts, fmt.Sprintf("%d %s", c, m))
+		}
+	}
+	markerSummary := strings.Join(markerParts, ", ")
+
+	var b strings.Builder
+	b.WriteString("\n### Last session review\n")
+	fmt.Fprintf(&b, "%d candidate remember-moments", rev.Candidates)
+	if markerSummary != "" {
+		fmt.Fprintf(&b, " (%s)", markerSummary)
+	}
+	fmt.Fprintf(&b, " but only %d heimdall_remember / heimdall_index_text calls this session.\n\n", rev.Writes)
+
+	if len(rev.Excerpts) > 0 {
+		b.WriteString("Examples:\n")
+		for i, ex := range rev.Excerpts {
+			if i >= 3 {
+				break
+			}
+			marker := ""
+			if i < len(rev.TopMarkers) {
+				marker = rev.TopMarkers[i]
+			}
+			if marker != "" {
+				fmt.Fprintf(&b, "- %s: %q\n", marker, ex)
+			} else {
+				fmt.Fprintf(&b, "- %q\n", ex)
+			}
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("If any of these still matter, heimdall_remember them now.\n")
+
+	// Misses section: surface specific rule violations.
+	if len(rev.Misses) > 0 {
+		b.WriteString("\n")
+		if rev.Followed == 0 && rev.Triggers > 0 {
+			fmt.Fprintf(&b, "No heimdall calls matched any of the %d triggered rules this session.\n", rev.Triggers)
+		} else if rev.Triggers > 0 {
+			fmt.Fprintf(&b, "Missed heimdall calls (%d/%d compliant):\n", rev.Followed, rev.Triggers)
+		} else {
+			b.WriteString("Missed heimdall calls:\n")
+		}
+		limit := 5
+		if len(rev.Misses) < limit {
+			limit = len(rev.Misses)
+		}
+		for _, m := range rev.Misses[:limit] {
+			fmt.Fprintf(&b, "- %s -> expected %s: %q\n", m.Rule, m.ExpectedTool, m.TriggerExcerpt)
+		}
+		b.WriteString("\nheimdall_remember any items above that still matter.\n")
+	}
+
 	return b.String()
 }
 

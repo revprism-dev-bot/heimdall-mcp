@@ -353,17 +353,46 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	}
 	promptEmbedB64 := base64.StdEncoding.EncodeToString(heimdall.EncodeFloat32Vec(queryVec))
 
+	// Compute sha256 of the injected body for correlation without leaking content.
+	// Use the first 6 bytes (12 hex chars) as a compact fingerprint.
+	bodyHash := sha256.Sum256([]byte(body))
+	autoInjectHash := hex.EncodeToString(bodyHash[:6])
+	topHitFiles := extractTopHitFiles(results, 3)
+
 	logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
-		"stage":            "ok",
-		"hits":             len(results),
-		"skills":           len(skillBullets),
-		"bytes":            len(body),
-		"model":            resolvedModel,
-		"scope":            scope,
-		"hit_ids":          strings.Join(hitIDs, ","),
-		"prompt_embed_b64": promptEmbedB64,
+		"stage":             "ok",
+		"hits":              len(results),
+		"skills":            len(skillBullets),
+		"bytes":             len(body),
+		"model":             resolvedModel,
+		"scope":             scope,
+		"hit_ids":           strings.Join(hitIDs, ","),
+		"prompt_embed_b64":  promptEmbedB64,
+		"auto_inject_bytes": len(body),
+		"auto_inject_hash":  autoInjectHash,
+		"top_hit_files":     strings.Join(topHitFiles, ","),
 	})
 	return 0
+}
+
+// extractTopHitFiles returns the first n distinct FilePath values from the
+// search results, in order. Used to log which files contributed to the
+// injected context without logging the full content.
+func extractTopHitFiles(results []heimdall.SearchResult, n int) []string {
+	seen := make(map[string]bool, n)
+	out := make([]string, 0, n)
+	for _, r := range results {
+		if len(out) >= n {
+			break
+		}
+		fp := r.Record.FilePath
+		if fp == "" || seen[fp] {
+			continue
+		}
+		seen[fp] = true
+		out = append(out, fp)
+	}
+	return out
 }
 
 // readUserPromptStdin extracts (prompt, absProjectFromCWD, sessionID) from a

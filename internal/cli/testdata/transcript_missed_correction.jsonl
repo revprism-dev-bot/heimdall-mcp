@@ -1,0 +1,3 @@
+{"role":"assistant","content":"I will use the global variable approach to track the state."}
+{"role":"user","content":"Actually no, do not use global variables — use dependency injection instead."}
+{"role":"assistant","content":"Understood, I will refactor to use dependency injection."}

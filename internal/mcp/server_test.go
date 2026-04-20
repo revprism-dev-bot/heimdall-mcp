@@ -2,8 +2,12 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -344,6 +348,85 @@ func TestServer_ConfigureSetRaceFreeUnderRace(t *testing.T) {
 	time.Sleep(75 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+func TestHeimdallInstructionsTriggerPairs(t *testing.T) {
+	markers := []string{
+		"WHEN you're about to Read a file > 200 lines",
+		"WHEN the user corrects you",
+		"WHEN a WebFetch, Read, or external-MCP call",
+		"WHEN starting a task that references past decisions",
+		"WHEN search feels wrong",
+		"Last session review",
+	}
+	for _, m := range markers {
+		if !strings.Contains(heimdallInstructions, m) {
+			t.Errorf("heimdallInstructions missing marker: %q", m)
+		}
+	}
+}
+
+func TestHandleToolsCall_LogsEveryInvocation(t *testing.T) {
+	// Capture log lines via a temporary HEIMDALL_HOOK_LOG path.
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	// Build a minimal server. Use heimdall_configure (get action) because it
+	// needs no live index or registry — the dispatcher just reads s.Cfg and
+	// returns. We only need the dispatcher to execute and emit the log line.
+	s := &Server{Cfg: config.DefaultConfig()}
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"heimdall_configure","arguments":{"action":"get","key":"model"}}`),
+	}
+	_ = s.handleToolsCall(req)
+
+	body, err := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if err != nil {
+		t.Fatalf("hooks.log not written: %v", err)
+	}
+	s2 := string(body)
+	if !strings.Contains(s2, "event=mcp.tool_call") {
+		t.Errorf("expected event=mcp.tool_call in log; got %s", s2)
+	}
+	if !strings.Contains(s2, `tool=heimdall_configure`) {
+		t.Errorf("expected tool=heimdall_configure in log; got %s", s2)
+	}
+	if !strings.Contains(s2, "duration_ms=") {
+		t.Errorf("expected duration_ms field in log; got %s", s2)
+	}
+}
+
+// TestHandleToolsCall_LogsMCPServerKey verifies that every mcp.tool_call log
+// line includes the mcp_server= field so operators can bucket calls by
+// MCP-server-lifetime (B3 fix).
+func TestHandleToolsCall_LogsMCPServerKey(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	s := &Server{Cfg: config.DefaultConfig()}
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"heimdall_configure","arguments":{"action":"get","key":"model"}}`),
+	}
+	_ = s.handleToolsCall(req)
+
+	body, err := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if err != nil {
+		t.Fatalf("hooks.log not written: %v", err)
+	}
+	logStr := string(body)
+	if !strings.Contains(logStr, "mcp_server=") {
+		t.Errorf("expected mcp_server= field in mcp.tool_call log line; got:\n%s", logStr)
+	}
+	// Key must be non-empty and follow the "mcp-<host>-<pid>" pattern.
+	if !strings.Contains(logStr, "mcp_server=mcp-") {
+		t.Errorf("expected mcp_server=mcp-<host>-<pid> format; got:\n%s", logStr)
+	}
 }
 
 // strconvItoa is a tiny local helper to keep the test independent of

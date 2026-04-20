@@ -669,6 +669,38 @@ func TestHookSessionStart_RaceFree(t *testing.T) {
 var _ HookSessionStartDeps = HookSessionStartDeps{}
 
 // ---------------------------------------------------------------------------
+// emitTierBNote unit tests
+// ---------------------------------------------------------------------------
+
+func TestEmitTierBNote_NewTwoLineForm(t *testing.T) {
+	var buf bytes.Buffer
+	// Always-emit suppress stub so the note actually fires.
+	alwaysEmit := func(_, _ string, _ time.Duration) bool { return true }
+	emitTierBNote(&buf, alwaysEmit, "/some/project", "index_model_mismatch", "index model mismatch")
+
+	out := buf.String()
+	if !strings.Contains(out, "> heimdall_search: unavailable (index model mismatch)") {
+		t.Errorf("missing scoped search-unavailable line; got:\n%s", out)
+	}
+	if !strings.Contains(out, "heimdall_remember and heimdall_index_text still work") {
+		t.Errorf("missing writes-still-work reassurance line; got:\n%s", out)
+	}
+	// Old single-line form must be gone.
+	if strings.Contains(out, "> heimdall: unavailable") {
+		t.Errorf("old unscoped banner leaked; got:\n%s", out)
+	}
+}
+
+func TestEmitTierBNote_SuppressedWhenOutsideWindow(t *testing.T) {
+	var buf bytes.Buffer
+	neverEmit := func(_, _ string, _ time.Duration) bool { return false }
+	emitTierBNote(&buf, neverEmit, "/p", "index_model_mismatch", "index model mismatch")
+	if buf.Len() != 0 {
+		t.Errorf("expected empty output when suppressed, got %q", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Scope tests (Feature 1: hook scope filtering by CWD subpath)
 //
 // SessionStart uses RunRecall, which takes MemoryFilter.ContextPath.
@@ -862,5 +894,163 @@ func TestHookSessionStart_LogsSessionID(t *testing.T) {
 	logData, _ := os.ReadFile(filepath.Join(tmp, "hooks.log"))
 	if !strings.Contains(string(logData), "session=abc-xyz") {
 		t.Fatalf("expected session=abc-xyz in hooks.log:\n%s", string(logData))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// renderLastSessionReview tests (Task 3: SessionStart nag renderer)
+// ---------------------------------------------------------------------------
+
+// writeReviewFile is a local helper for tests; in-repo callers use
+// internal/cli/hook_stop.go's writer (landing in Task 4). Defining it here
+// keeps this task's tests runnable before Task 4 merges.
+func writeReviewFile(t *testing.T, projectDir string, body string) string {
+	t.Helper()
+	dir := filepath.Join(projectDir, ".heimdall_db", "hooks")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	p := filepath.Join(dir, "last-session-review.json")
+	if err := os.WriteFile(p, []byte(body), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return p
+}
+
+func TestSessionStartBlock_IncludesLastSessionReview(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+		"session_id": "s-1",
+		"ended_at": ` + fmt.Sprintf("%d", time.Now().Unix()-60) + `,
+		"candidates": 7,
+		"writes": 0,
+		"top_markers": ["correction","correction","workaround"],
+		"excerpts": [
+			"no, the other file — move the check before the loop not after",
+			"actually heimdall_remember still works when search is down",
+			"binding to 127.0.0.1 instead of localhost fixed macOS ::1"
+		]
+	}`
+	reviewPath := writeReviewFile(t, dir, body)
+
+	out := renderLastSessionReview(dir, time.Now())
+	if !strings.Contains(out, "### Last session review") {
+		t.Errorf("expected header; got %q", out)
+	}
+	if !strings.Contains(out, "7 candidate remember-moments") {
+		t.Errorf("expected count line; got %q", out)
+	}
+	if !strings.Contains(out, "move the check before the loop") {
+		t.Errorf("expected first excerpt; got %q", out)
+	}
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Errorf("expected review file unlinked after render; err=%v", err)
+	}
+}
+
+func TestSessionStartBlock_SkipsMissingReviewFile(t *testing.T) {
+	dir := t.TempDir()
+	out := renderLastSessionReview(dir, time.Now())
+	if out != "" {
+		t.Errorf("expected empty output when file missing, got %q", out)
+	}
+}
+
+func TestSessionStartBlock_SkipsStaleReviewFile(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+		"session_id": "s-old",
+		"ended_at": ` + fmt.Sprintf("%d", time.Now().Add(-8*24*time.Hour).Unix()) + `,
+		"candidates": 5,
+		"writes": 0,
+		"top_markers": ["correction"],
+		"excerpts": ["stale"]
+	}`
+	reviewPath := writeReviewFile(t, dir, body)
+
+	out := renderLastSessionReview(dir, time.Now())
+	if out != "" {
+		t.Errorf("expected empty output for stale file, got %q", out)
+	}
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Errorf("expected stale review file unlinked without render; err=%v", err)
+	}
+}
+
+func TestSessionStartBlock_SkipsMalformedReviewFile(t *testing.T) {
+	dir := t.TempDir()
+	_ = writeReviewFile(t, dir, "{ not json")
+	out := renderLastSessionReview(dir, time.Now())
+	if out != "" {
+		t.Errorf("expected empty output on malformed file, got %q", out)
+	}
+}
+
+// TestRenderLastSessionReview_SurfacesMisses verifies that when the review
+// file contains a misses array, the renderer includes the miss details in its
+// output.
+func TestRenderLastSessionReview_SurfacesMisses(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+		"session_id": "s-misses",
+		"ended_at": ` + fmt.Sprintf("%d", time.Now().Unix()-60) + `,
+		"candidates": 5,
+		"writes": 0,
+		"top_markers": ["correction"],
+		"excerpts": ["actually do it the other way"],
+		"misses": [
+			{"rule":"user_correction","expected_tool":"heimdall_remember","trigger":"actually do it the other way","turn":2},
+			{"rule":"external_content","expected_tool":"heimdall_index_text","trigger":"WebFetch result content","turn":5}
+		],
+		"triggers": 3,
+		"followed": 1
+	}`
+	writeReviewFile(t, dir, body)
+
+	out := renderLastSessionReview(dir, time.Now())
+	if !strings.Contains(out, "### Last session review") {
+		t.Errorf("expected header; got %q", out)
+	}
+	// Misses section should be present.
+	if !strings.Contains(out, "user_correction") {
+		t.Errorf("expected user_correction miss in output; got %q", out)
+	}
+	if !strings.Contains(out, "heimdall_remember") {
+		t.Errorf("expected heimdall_remember in output; got %q", out)
+	}
+	if !strings.Contains(out, "external_content") {
+		t.Errorf("expected external_content miss in output; got %q", out)
+	}
+	if !strings.Contains(out, "heimdall_index_text") {
+		t.Errorf("expected heimdall_index_text in output; got %q", out)
+	}
+	// Should mention compliance ratio.
+	if !strings.Contains(out, "compliant") && !strings.Contains(out, "Missed") {
+		t.Errorf("expected compliance ratio or 'Missed' mention; got %q", out)
+	}
+}
+
+// TestRenderLastSessionReview_AllMissed verifies the stronger "No heimdall
+// calls matched" opener when Followed == 0 and Triggers > 0.
+func TestRenderLastSessionReview_AllMissed(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+		"session_id": "s-all-missed",
+		"ended_at": ` + fmt.Sprintf("%d", time.Now().Unix()-60) + `,
+		"candidates": 3,
+		"writes": 0,
+		"top_markers": ["correction"],
+		"excerpts": ["no, wrong"],
+		"misses": [
+			{"rule":"user_correction","expected_tool":"heimdall_remember","trigger":"no, wrong","turn":1}
+		],
+		"triggers": 2,
+		"followed": 0
+	}`
+	writeReviewFile(t, dir, body)
+
+	out := renderLastSessionReview(dir, time.Now())
+	if !strings.Contains(out, "No heimdall calls matched") {
+		t.Errorf("expected stronger opener for all-missed case; got %q", out)
 	}
 }

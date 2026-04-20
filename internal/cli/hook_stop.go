@@ -1,11 +1,16 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
@@ -136,7 +141,10 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 		if _, err := os.Stat(payload.TranscriptPath); err == nil {
 			transcript, err := os.ReadFile(payload.TranscriptPath)
 			if err == nil && len(transcript) > 0 {
-				summary := extractTranscriptSummary(transcript)
+				summary, candidates := extractTranscriptSummary(transcript)
+				writes := countHeimdallWrites(transcript)
+				analysis := AnalyzeTranscript(transcript)
+
 				if summary != "" {
 					memDBPath := config.ResolveMemoryDBPath()
 					memStore, err := heimdall.OpenMemoryStore(memDBPath)
@@ -157,6 +165,13 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 						}
 					}
 				}
+
+				if err := writeLastSessionReview(projectDir, payload.SessionID, time.Now(), candidates, writes, analysis.Misses, analysis); err != nil {
+					heimdall.LogHookEvent("WARN", "session-end", map[string]any{
+						"err": "review_write_failed",
+						"msg": err.Error(),
+					})
+				}
 			}
 		}
 	}
@@ -176,56 +191,350 @@ func resolveBufferDir(projectDir string) string {
 	return filepath.Join(projectDir, ".heimdall_db", "hooks", "sessions")
 }
 
-func extractTranscriptSummary(data []byte) string {
-	var messages []string
-	start := 0
-	for i := 0; i < len(data); i++ {
-		if data[i] == '\n' {
-			line := data[start:i]
-			start = i + 1
-			if len(line) == 0 {
-				continue
-			}
-			var entry map[string]any
-			if json.Unmarshal(line, &entry) != nil {
-				continue
-			}
-			if role, _ := entry["role"].(string); role == "assistant" {
-				if content, _ := entry["content"].(string); content != "" {
-					messages = append(messages, content)
-				}
-			}
-		}
+// CandidateEvent is one remember-worthy moment detected in a transcript scan.
+// Excerpt is capped at 200 chars; Marker is one of: correction, frustration,
+// teaching, workaround.
+type CandidateEvent struct {
+	Marker  string
+	Excerpt string
+}
+
+// Marker priority (highest first) for review-record ranking.
+var candidateMarkerPriority = []string{"correction", "workaround", "teaching", "frustration"}
+
+// markerPatterns maps marker class → compiled regex. Regexes scan user
+// messages only. Precompiled at package init.
+var markerPatterns = map[string]*regexp.Regexp{
+	"correction":  regexp.MustCompile(`(?i)\bactually\b|\bno,?\s|\bdon['']?t\b|\bstop\b|\binstead\b|\bwrong\b`),
+	"frustration": regexp.MustCompile(`(?i)\bfuck\b|\bwhy\b|\bbroken\b`),
+	"teaching":    regexp.MustCompile(`(?i)\bturns out\b|\bfyi\b|\bheads up\b|\bfor reference\b`),
+	"workaround":  regexp.MustCompile(`(?i)\bworkaround\b|\bhack\b|\btrick\b|\bgotcha\b`),
+}
+
+const (
+	extractorMaxOutput  = 20 * 1024
+	extractorExcerptMax = 200
+	extractorTailCount  = 3
+	extractorTailLen    = 800
+)
+
+// extractTranscriptSummary scans the full JSONL transcript for user-side
+// marker hits and returns:
+//   - summary: concatenated context windows around each hit. Each window
+//     contains the user message plus the preceding assistant message, is
+//     deduplicated, joined with "\n\n---\n\n", and capped at 20 KB. On
+//     zero hits, falls back to the last 3 assistant messages trimmed to
+//     800 chars each.
+//   - candidates: one entry per hit with marker class plus a ≤200-char
+//     excerpt of the user message.
+//
+// Single byte-scan pass; O(len(data)) + O(hits × regex_cost).
+// roleFromLine extracts the "role" field value from a JSONL line without
+// full JSON decoding. Returns "" if the pattern is not found.
+func roleFromLine(line []byte) string {
+	const prefix = `"role":"`
+	idx := bytes.Index(line, []byte(prefix))
+	if idx < 0 {
+		return ""
 	}
-	if start < len(data) {
-		line := data[start:]
-		if len(line) > 0 {
-			var entry map[string]any
-			if json.Unmarshal(line, &entry) == nil {
-				if role, _ := entry["role"].(string); role == "assistant" {
-					if content, _ := entry["content"].(string); content != "" {
-						messages = append(messages, content)
+	rest := line[idx+len(prefix):]
+	end := bytes.IndexByte(rest, '"')
+	if end < 0 {
+		return ""
+	}
+	return string(rest[:end])
+}
+
+// contentRawFromLine extracts the raw JSON value of the "content" key from
+// a JSONL line, handling both transcript shapes:
+//
+//  1. Legacy shape: top-level "content" field.
+//  2. Real Claude Code shape: "content" nested under "message".
+//
+// Returns nil if content is not found or cannot be decoded.
+func contentRawFromLine(line []byte) json.RawMessage {
+	// Try top-level content first (legacy / synthetic shape).
+	var topLevel struct {
+		Content json.RawMessage `json:"content"`
+		Message *struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &topLevel) != nil {
+		return nil
+	}
+	if len(topLevel.Content) > 0 {
+		return topLevel.Content
+	}
+	// Fall back to message.content (real Claude Code shape).
+	if topLevel.Message != nil && len(topLevel.Message.Content) > 0 {
+		return topLevel.Message.Content
+	}
+	return nil
+}
+
+func extractTranscriptSummary(data []byte) (string, []CandidateEvent) {
+	// prevAssistantRaw stores the raw JSONL line of the most recent assistant
+	// message, for lazy content decoding when a user marker hit is found.
+	// prevAssistantTail stores the trimmed content for tail-fallback tracking.
+	// We decode full content only for user messages (always small) and for
+	// the single preceding assistant message when a marker hits.
+
+	var candidates []CandidateEvent
+	var windows []string
+	seen := map[string]bool{}
+
+	// Rolling tail: last extractorTailCount assistant message raw lines.
+	type rawLine []byte
+	tailRaw := make([]rawLine, 0, extractorTailCount)
+	var prevRole string
+	var prevAssistantRaw []byte
+
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	sc.Buffer(make([]byte, 2*1024*1024), 2*1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		role := roleFromLine(line)
+		if role == "" {
+			continue
+		}
+
+		if role == "assistant" {
+			// Store raw line for lazy decode; update tail ring.
+			lineCopy := append([]byte(nil), line...)
+			prevAssistantRaw = lineCopy
+			if len(tailRaw) < extractorTailCount {
+				tailRaw = append(tailRaw, lineCopy)
+			} else {
+				copy(tailRaw, tailRaw[1:])
+				tailRaw[extractorTailCount-1] = lineCopy
+			}
+			prevRole = "assistant"
+		} else if role == "user" {
+			// Decode user content (user messages are always small).
+			raw := contentRawFromLine(line)
+			if raw == nil {
+				prevRole = "user"
+				prevAssistantRaw = nil
+				continue
+			}
+			content := extractContentTextRaw(raw)
+			if content == "" {
+				prevRole = "user"
+				prevAssistantRaw = nil
+				continue
+			}
+
+			for _, marker := range candidateMarkerPriority {
+				if markerPatterns[marker].MatchString(content) {
+					excerpt := content
+					if len(excerpt) > extractorExcerptMax {
+						excerpt = excerpt[:extractorExcerptMax]
 					}
+					candidates = append(candidates, CandidateEvent{Marker: marker, Excerpt: excerpt})
+
+					var win strings.Builder
+					if prevRole == "assistant" && prevAssistantRaw != nil {
+						// Lazy-decode the preceding assistant message now.
+						if prevRaw := contentRawFromLine(prevAssistantRaw); prevRaw != nil {
+							prevContent := extractContentTextRaw(prevRaw)
+							if prevContent != "" {
+								win.WriteString("assistant: ")
+								win.WriteString(trimTo(prevContent, extractorTailLen))
+								win.WriteString("\n\n")
+							}
+						}
+					}
+					win.WriteString("user: ")
+					win.WriteString(trimTo(content, extractorTailLen))
+					s := win.String()
+					if !seen[s] {
+						seen[s] = true
+						windows = append(windows, s)
+					}
+					break
 				}
 			}
+			prevRole = "user"
+			prevAssistantRaw = nil
+		} else {
+			prevRole = role
+			prevAssistantRaw = nil
 		}
 	}
 
-	if len(messages) > 5 {
-		messages = messages[len(messages)-5:]
+	if len(windows) == 0 {
+		// Decode tail assistant messages for fallback summary.
+		decoded := make([]string, 0, len(tailRaw))
+		for _, raw := range tailRaw {
+			if cr := contentRawFromLine(raw); cr != nil {
+				if c := extractContentTextRaw(cr); c != "" {
+					decoded = append(decoded, trimTo(c, extractorTailLen))
+				}
+			}
+		}
+		windows = decoded
 	}
-	if len(messages) == 0 {
+
+	summary := strings.Join(windows, "\n\n---\n\n")
+	if len(summary) > extractorMaxOutput {
+		summary = summary[:extractorMaxOutput]
+	}
+	return summary, candidates
+}
+
+// extractContentTextRaw is like extractContentText but operates on
+// json.RawMessage to avoid double-parsing the content field.
+func extractContentTextRaw(raw json.RawMessage) string {
+	if len(raw) == 0 {
 		return ""
 	}
-	result := ""
-	for _, m := range messages {
-		if len(m) > 500 {
-			m = m[:500]
+	// Quick heuristic: if it starts with '"' it's a string.
+	if raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return s
 		}
-		result += m + "\n\n"
+		return ""
 	}
-	if len(result) > 5000 {
-		result = result[:5000]
+	// Otherwise treat as array of content blocks.
+	var blocks []json.RawMessage
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
 	}
-	return result
+	var parts []string
+	for _, b := range blocks {
+		var m struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(b, &m) == nil && m.Type == "text" && m.Text != "" {
+			parts = append(parts, m.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func trimTo(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// countHeimdallWrites returns the number of tool_use blocks in the
+// transcript whose name is heimdall_remember or heimdall_index_text.
+// Handles both the legacy top-level shape and the real Claude Code shape
+// where content is nested under "message". Tool names are normalised via
+// normalizeToolName so mcp__heimdall__heimdall_remember is counted too.
+func countHeimdallWrites(data []byte) int {
+	n := 0
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	sc.Buffer(make([]byte, 2*1024*1024), 2*1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if json.Unmarshal(line, &entry) != nil {
+			continue
+		}
+		_, rawContent, ok := extractRoleAndContent(entry)
+		if !ok {
+			continue
+		}
+		blocks, ok := rawContent.([]any)
+		if !ok {
+			continue
+		}
+		for _, block := range blocks {
+			m, ok := block.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := m["type"].(string); t != "tool_use" {
+				continue
+			}
+			name, _ := m["name"].(string)
+			if bare := normalizeToolName(name); bare == "heimdall_remember" || bare == "heimdall_index_text" {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// writeLastSessionReview persists a review record when the session warrants
+// nagging the next SessionStart. Suppression: skip when candidates <= 2 AND
+// writes >= 1 AND len(misses) == 0 (well-behaved session). Only 3 highest-
+// priority excerpts; up to 5 missed-call entries.
+func writeLastSessionReview(projectDir, sessionID string, endedAt time.Time, candidates []CandidateEvent, writes int, misses []MissedCall, analysis AnalysisResult) error {
+	if len(candidates) <= 2 && writes >= 1 && len(misses) == 0 {
+		return nil
+	}
+
+	priorityIdx := map[string]int{}
+	for i, m := range candidateMarkerPriority {
+		priorityIdx[m] = i
+	}
+	ranked := make([]CandidateEvent, len(candidates))
+	copy(ranked, candidates)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return priorityIdx[ranked[i].Marker] < priorityIdx[ranked[j].Marker]
+	})
+
+	topMarkers := make([]string, 0, 3)
+	excerpts := make([]string, 0, 3)
+	for i, c := range ranked {
+		if i >= 3 {
+			break
+		}
+		topMarkers = append(topMarkers, c.Marker)
+		excerpts = append(excerpts, c.Excerpt)
+	}
+
+	// Serialize up to 5 miss entries for the review record.
+	type missRecord struct {
+		Rule    string `json:"rule"`
+		ExpTool string `json:"expected_tool"`
+		Trigger string `json:"trigger"`
+		Turn    int    `json:"turn"`
+	}
+	missRecords := make([]missRecord, 0, len(misses))
+	for i, mc := range misses {
+		if i >= 5 {
+			break
+		}
+		missRecords = append(missRecords, missRecord{
+			Rule:    mc.Rule,
+			ExpTool: mc.ExpectedTool,
+			Trigger: mc.TriggerExcerpt,
+			Turn:    mc.TurnIndex,
+		})
+	}
+
+	record := map[string]any{
+		"session_id":  sessionID,
+		"ended_at":    endedAt.Unix(),
+		"candidates":  len(candidates),
+		"writes":      writes,
+		"top_markers": topMarkers,
+		"excerpts":    excerpts,
+		"misses":      missRecords,
+		"triggers":    analysis.Triggers,
+		"followed":    analysis.Followed,
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(projectDir, ".heimdall_db", "hooks")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "last-session-review.json"), data, 0600)
 }

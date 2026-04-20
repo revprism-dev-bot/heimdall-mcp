@@ -697,3 +697,72 @@ func TestUserPromptBudgetDefault_PinnedTo450(t *testing.T) {
 		t.Fatalf("default budget %d exceeds hard cap %d", userPromptBudgetDefault, userPromptHardTimeout)
 	}
 }
+
+// TestHookUserPrompt_LogsAutoInjectFields verifies that the stage=ok log line
+// emitted by HookUserPrompt includes the three new observability fields:
+//   - auto_inject_bytes — byte count of the injected body (> 0 on a hit)
+//   - auto_inject_hash  — 12-char hex prefix of sha256(body)
+//   - top_hit_files     — list of file paths from the top hits
+func TestHookUserPrompt_LogsAutoInjectFields(t *testing.T) {
+	const model = "test-model"
+	const dim = 3
+	project := t.TempDir()
+	baseDir := seedVectorStore(t, project, model, dim, time.Now().Unix())
+	dbDir := heimdall.ModelDBDir(baseDir, model)
+	recs := []heimdall.VectorRecord{
+		{ID: "1", FilePath: "a.go", StartLine: 1, EndLine: 10, Content: "package a\nfunc A() {}", Embedding: []float32{1, 0, 0}},
+		{ID: "2", FilePath: "b.go", StartLine: 5, EndLine: 15, Content: "package b\nfunc B() {}", Embedding: []float32{0.5, 0.5, 0}},
+	}
+	seedStoreWithRecords(t, dbDir, recs)
+
+	fake := newFakeOllama(t, model, dim)
+
+	// Redirect hooks.log to a temp file so we can inspect it.
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+
+	out, _, code := runHookUserPrompt(t, runUPOpts{
+		stdin: `{"prompt":"explain the post-edit flow","cwd":"` + project + `"}`,
+		env:   map[string]string{},
+		cfg:   baseCfg(fake.server.URL, model),
+	})
+	if code != 0 {
+		t.Fatalf("hook returned code %d, want 0", code)
+	}
+	if !strings.Contains(out, "## Heimdall context") {
+		t.Fatalf("expected Heimdall context block in stdout, got: %q", out)
+	}
+
+	logData, err := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if err != nil {
+		t.Fatalf("hooks.log not written: %v", err)
+	}
+	logStr := string(logData)
+
+	// Find the stage=ok line specifically.
+	var okLine string
+	for _, line := range strings.Split(logStr, "\n") {
+		if strings.Contains(line, "stage=ok") {
+			okLine = line
+			break
+		}
+	}
+	if okLine == "" {
+		t.Fatalf("no stage=ok line in hooks.log:\n%s", logStr)
+	}
+
+	// auto_inject_bytes must be present and > 0.
+	if !strings.Contains(okLine, "auto_inject_bytes=") {
+		t.Errorf("missing auto_inject_bytes in stage=ok line; got:\n%s", okLine)
+	}
+
+	// auto_inject_hash must be present (12-char hex prefix of sha256).
+	if !strings.Contains(okLine, "auto_inject_hash=") {
+		t.Errorf("missing auto_inject_hash in stage=ok line; got:\n%s", okLine)
+	}
+
+	// top_hit_files must be present when hits > 0.
+	if !strings.Contains(okLine, "top_hit_files=") {
+		t.Errorf("missing top_hit_files in stage=ok line; got:\n%s", okLine)
+	}
+}

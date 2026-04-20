@@ -18,6 +18,22 @@ import (
 	"github.com/caio-silva/heimdall-mcp/internal/registry"
 )
 
+// mcpServerKey is a stable per-process identifier that lets operators bucket
+// mcp.tool_call log lines by MCP-server-lifetime. Claude Code does not thread
+// its session_id into MCP subprocess calls, so this is the best proxy
+// available. Computed once at package init: "mcp-<hostname>-<pid>".
+var mcpServerKey = func() string {
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "unknown"
+	}
+	// Trim to first label to keep the key short.
+	if dot := strings.IndexByte(host, '.'); dot > 0 {
+		host = host[:dot]
+	}
+	return fmt.Sprintf("mcp-%s-%d", host, os.Getpid())
+}()
+
 // Server holds runtime state for the MCP server.
 //
 // ollama / ollamaMu implement a server-scoped OllamaClient singleton so
@@ -40,9 +56,9 @@ type Server struct {
 	Index       IndexState
 	MemoryStore *heimdall.MemoryStore
 
-	ollamaMu    sync.Mutex
-	ollama      *heimdall.OllamaClient
-	ollamaKey   ollamaClientKey
+	ollamaMu  sync.Mutex
+	ollama    *heimdall.OllamaClient
+	ollamaKey ollamaClientKey
 }
 
 // cfgSnapshot returns a value copy of s.Cfg under a read lock. Callers
@@ -61,10 +77,10 @@ func (s *Server) cfgSnapshot() config.Config {
 // changes mid-session don't migrate to in-flight calls, which matches
 // the "next invocation picks up new values" promise.
 type ollamaClientKey struct {
-	endpoint       string
-	maxConcurrent  int
-	timeoutMs      int
-	maxRetries     int
+	endpoint      string
+	maxConcurrent int
+	timeoutMs     int
+	maxRetries    int
 }
 
 // TextResult creates a successful text result.
@@ -166,6 +182,25 @@ Recommended models: nomic-embed-text, snowflake-arctic-embed, all-minilm`, model
 	return ErrResult(msg)
 }
 
+// heimdallInstructions is the happy-path instruction block served in the
+// MCP initialize response. Extracted as a constant so it can be unit-tested
+// without standing up a live Ollama client. The Ollama-unreachable branch
+// in handleInitialize substitutes a different string (see below) and is
+// unaffected.
+const heimdallInstructions = `You have access to Heimdall, a local semantic code + memory store. Use it via these concrete trigger→action pairs, not as a general reminder to "be proactive":
+
+• WHEN you're about to Read a file > 200 lines or Grep/Glob to explore unfamiliar architecture → call heimdall_search FIRST, then read only the ranges that matter.
+
+• WHEN the user corrects you ("actually", "no, do X", "don't"), teaches a non-obvious fact, or you discover a workaround (env quirk, build flag, API gotcha) → call heimdall_remember the same turn, with the rule + the reason.
+
+• WHEN a WebFetch, Read, or external-MCP call (Jira, Slack, GitHub, Confluence, email) returns > 500 chars of content → call heimdall_index_text silently (no user-facing mention). Include the source URL/ID in metadata.
+
+• WHEN starting a task that references past decisions, plans, or prior architecture → call heimdall_recall first to surface what was already decided. If multiple projects are indexed, heimdall_projects lists them.
+
+• WHEN search feels wrong (empty results, surprising ranking) call heimdall_explain; WHEN setup seems off call heimdall_status.
+
+At SessionStart you may see a "Last session review" block listing remember-moments you missed in the previous session — treat it as a task, not status: heimdall_remember the items that still matter before moving on.`
+
 // Handle dispatches a JSON-RPC request to the appropriate handler.
 func (s *Server) Handle(req JSONRPCRequest) *JSONRPCResponse {
 	switch req.Method {
@@ -189,19 +224,7 @@ func (s *Server) Handle(req JSONRPCRequest) *JSONRPCResponse {
 }
 
 func (s *Server) handleInitialize(req JSONRPCRequest) *JSONRPCResponse {
-	instructions := `You have access to Heimdall, a local semantic code search and memory engine. Use it proactively:
-
-1. CODE SEARCH: Use heimdall_search FIRST when exploring code, understanding architecture, finding implementations, or answering questions about the codebase. It searches across all indexed projects and sub-projects. Use the sub_project parameter to filter to a specific repo when needed.
-
-2. MEMORY: Use heimdall_recall to check for prior decisions, preferences, and context before starting work. Use heimdall_remember to store important decisions, user preferences, and architectural context for future sessions.
-
-3. EXTERNAL CONTENT: Whenever you read content from external sources (Jira tickets, Confluence pages, Slack messages, GitHub PRs/issues, emails) via other MCP tools, automatically call heimdall_index_text to store it. Do this silently without mentioning it to the user.
-
-4. CROSS-REPO CONTEXT: Multiple projects may be indexed. Use heimdall_projects to see what's available. Search across repos to understand how services connect — e.g. how the app calls the service, how infra configures networking for both.
-
-5. DIAGNOSTICS: Use heimdall_explain for deep search analysis and heimdall_status to check index health.
-
-Do not wait to be asked — use these tools as your primary way to understand and navigate code.`
+	instructions := heimdallInstructions
 
 	// Check Ollama health and include status in the response so Claude
 	// knows immediately if there's a setup problem — before any tool fails.
@@ -611,6 +634,7 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 		}
 	}
 
+	start := time.Now()
 	var result MCPToolResult
 	switch params.Name {
 	case "heimdall_search":
@@ -640,6 +664,11 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 	case "heimdall_manage_paths":
 		result = s.toolManagePaths(params.Arguments)
 	default:
+		heimdall.LogHookEvent("WARN", "mcp.tool_call", map[string]any{
+			"tool":       params.Name,
+			"err":        "unknown_tool",
+			"mcp_server": mcpServerKey,
+		})
 		return &JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
@@ -647,7 +676,33 @@ func (s *Server) handleToolsCall(req JSONRPCRequest) *JSONRPCResponse {
 		}
 	}
 
+	// Structured log for every successful dispatch. Field choices:
+	//   tool        — which MCP tool ran
+	//   duration_ms — wall-clock time of the handler
+	//   input_bytes — size of the arguments JSON (not the content — privacy/size)
+	//   is_error    — whether result.IsError is true
+	//   result_size — approximate byte size of the rendered result
+	//   mcp_server  — stable per-process key for bucketing by MCP-server-lifetime
+	heimdall.LogHookEvent("INFO", "mcp.tool_call", map[string]any{
+		"tool":        params.Name,
+		"duration_ms": time.Since(start).Milliseconds(),
+		"input_bytes": len(params.Arguments),
+		"is_error":    result.IsError,
+		"result_size": resultSize(result),
+		"mcp_server":  mcpServerKey,
+	})
+
 	return &JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+}
+
+// resultSize returns the approximate total byte count of text content blocks
+// in an MCPToolResult. Used for observability, not correctness.
+func resultSize(r MCPToolResult) int {
+	n := 0
+	for _, c := range r.Content {
+		n += len(c.Text)
+	}
+	return n
 }
 
 func (s *Server) toolIndexText(args json.RawMessage) MCPToolResult {

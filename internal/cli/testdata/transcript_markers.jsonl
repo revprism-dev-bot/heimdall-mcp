@@ -1,0 +1,7 @@
+{"role":"assistant","content":"Here is the fix — I'll change the loop condition to <=."}
+{"role":"user","content":"no, actually the loop should use <, not <=. Don't change that."}
+{"role":"assistant","content":"Got it, reverting to <."}
+{"role":"user","content":"FYI: the build flag `-tags integration` is required for these tests. Heads up, it was missing from the docs."}
+{"role":"assistant","content":"Thanks — running with -tags integration now."}
+{"role":"user","content":"the workaround for the macOS ::1 binding is to use 127.0.0.1 explicitly"}
+{"role":"assistant","content":"Understood, applying that."}

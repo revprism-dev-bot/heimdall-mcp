@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/config"
 )
@@ -238,7 +239,7 @@ func TestHookSessionEnd_LogsSingleEventStamp(t *testing.T) {
 }
 
 func TestExtractTranscriptSummary_Empty(t *testing.T) {
-	got := extractTranscriptSummary(nil)
+	got, _ := extractTranscriptSummary(nil)
 	if got != "" {
 		t.Fatalf("expected empty, got %q", got)
 	}
@@ -252,7 +253,7 @@ func TestExtractTranscriptSummary_AssistantMessages(t *testing.T) {
 		`{"role":"assistant","content":"I don't have access to a clock."}`,
 	}
 	data := []byte(strings.Join(lines, "\n"))
-	got := extractTranscriptSummary(data)
+	got, _ := extractTranscriptSummary(data)
 	if !strings.Contains(got, "Hi there!") {
 		t.Fatalf("expected assistant message, got %q", got)
 	}
@@ -267,9 +268,311 @@ func TestExtractTranscriptSummary_TakesLast5(t *testing.T) {
 		lines = append(lines, `{"role":"assistant","content":"msg`+string(rune('A'+i))+`"}`)
 	}
 	data := []byte(strings.Join(lines, "\n"))
-	got := extractTranscriptSummary(data)
+	got, _ := extractTranscriptSummary(data)
 	// Should only contain the last 5 (F through J)
 	if strings.Contains(got, "msgA") {
 		t.Fatal("should not contain first messages")
+	}
+}
+
+func TestExtractTranscriptSummary_MarkerWindows(t *testing.T) {
+	data, err := os.ReadFile("testdata/transcript_markers.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	summary, candidates := extractTranscriptSummary(data)
+
+	if summary == "" {
+		t.Fatalf("expected non-empty summary")
+	}
+	seen := map[string]bool{}
+	for _, c := range candidates {
+		seen[c.Marker] = true
+	}
+	for _, want := range []string{"correction", "teaching", "workaround"} {
+		if !seen[want] {
+			t.Errorf("missing candidate marker %q; got %+v", want, candidates)
+		}
+	}
+	for _, c := range candidates {
+		if len(c.Excerpt) > 200 {
+			t.Errorf("excerpt exceeds 200 chars: %d", len(c.Excerpt))
+		}
+	}
+}
+
+func TestExtractTranscriptSummary_NoMarkers_TailFallback(t *testing.T) {
+	data := []byte(`{"role":"assistant","content":"first msg"}
+{"role":"assistant","content":"second msg"}
+{"role":"assistant","content":"third msg"}
+`)
+	summary, candidates := extractTranscriptSummary(data)
+	if summary == "" {
+		t.Errorf("expected non-empty tail-fallback summary; got empty")
+	}
+	if !strings.Contains(summary, "third msg") {
+		t.Errorf("expected tail to include most recent assistant message; got %q", summary)
+	}
+	if len(candidates) != 0 {
+		t.Errorf("expected 0 candidates with no markers, got %d", len(candidates))
+	}
+}
+
+func TestExtractTranscriptSummary_BoundedOutput(t *testing.T) {
+	var big bytes.Buffer
+	big.WriteString(`{"role":"user","content":"actually stop doing X"}` + "\n")
+	msg := `{"role":"assistant","content":"` + strings.Repeat("x", 1000) + `"}` + "\n"
+	for big.Len() < 10*1024*1024 {
+		big.WriteString(msg)
+	}
+	start := time.Now()
+	summary, _ := extractTranscriptSummary(big.Bytes())
+	elapsed := time.Since(start)
+
+	if len(summary) > 20*1024 {
+		t.Errorf("summary exceeds 20KB cap: %d bytes", len(summary))
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("extractor took too long on 10MB input: %v", elapsed)
+	}
+}
+
+func TestCountHeimdallWrites_CountsToolUseBlocks(t *testing.T) {
+	data, err := os.ReadFile("testdata/transcript_tool_use.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	n := countHeimdallWrites(data)
+	if n != 2 {
+		t.Errorf("expected 2 write tool_uses (remember + index_text), got %d", n)
+	}
+}
+
+func TestHookSessionEnd_WritesReviewRecord(t *testing.T) {
+	dir := t.TempDir()
+
+	tPath := filepath.Join(dir, "transcript.jsonl")
+	lines := []string{
+		`{"role":"user","content":"no, actually do it the other way"}`,
+		`{"role":"user","content":"don't use that flag"}`,
+		`{"role":"user","content":"stop — that's wrong"}`,
+		`{"role":"user","content":"instead of X use Y"}`,
+		`{"role":"user","content":"actually move the check before the loop"}`,
+	}
+	if err := os.WriteFile(tPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	payload := sessionEndPayload{
+		SessionID:      "s-review-1",
+		TranscriptPath: tPath,
+		CWD:            dir,
+		HookEventName:  "SessionEnd",
+		Reason:         "user_exit",
+	}
+	data, _ := json.Marshal(payload)
+
+	cfg := config.DefaultConfig()
+	code := HookSessionEnd(cfg, bytes.NewReader(data), &bytes.Buffer{}, &bytes.Buffer{}, map[string]string{}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+
+	reviewPath := filepath.Join(dir, ".heimdall_db", "hooks", "last-session-review.json")
+	body, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatalf("review file not written: %v", err)
+	}
+	var rev map[string]any
+	if err := json.Unmarshal(body, &rev); err != nil {
+		t.Fatalf("review file malformed: %v", err)
+	}
+	if int(rev["candidates"].(float64)) != 5 {
+		t.Errorf("expected 5 candidates, got %v", rev["candidates"])
+	}
+	if int(rev["writes"].(float64)) != 0 {
+		t.Errorf("expected 0 writes, got %v", rev["writes"])
+	}
+}
+
+func TestHookSessionEnd_SuppressesWhenClean(t *testing.T) {
+	dir := t.TempDir()
+
+	tPath := filepath.Join(dir, "transcript.jsonl")
+	lines := []string{
+		`{"role":"user","content":"actually change the default to 42"}`,
+		`{"role":"assistant","content":[{"type":"tool_use","name":"heimdall_remember","input":{}}]}`,
+		`{"role":"assistant","content":[{"type":"tool_use","name":"heimdall_remember","input":{}}]}`,
+	}
+	if err := os.WriteFile(tPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	payload := sessionEndPayload{
+		SessionID:      "s-clean",
+		TranscriptPath: tPath,
+		CWD:            dir,
+		HookEventName:  "SessionEnd",
+	}
+	data, _ := json.Marshal(payload)
+
+	code := HookSessionEnd(config.DefaultConfig(), bytes.NewReader(data), &bytes.Buffer{}, &bytes.Buffer{}, map[string]string{}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+
+	reviewPath := filepath.Join(dir, ".heimdall_db", "hooks", "last-session-review.json")
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Errorf("expected no review file for clean session; err=%v", err)
+	}
+}
+
+// TestExtractTranscriptSummary_RealShape verifies that extractTranscriptSummary
+// correctly processes the real Claude Code transcript shape (nested under
+// "message"), finding correction markers and returning candidates.
+func TestExtractTranscriptSummary_RealShape(t *testing.T) {
+	data, err := os.ReadFile("testdata/transcript_real_shape.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	summary, candidates := extractTranscriptSummary(data)
+
+	if summary == "" {
+		t.Fatal("expected non-empty summary for real-shape transcript")
+	}
+
+	// The first entry says "actually no, do X instead" — should yield a correction.
+	hasCorrectionCandidate := false
+	for _, c := range candidates {
+		if c.Marker == "correction" {
+			hasCorrectionCandidate = true
+			break
+		}
+	}
+	if !hasCorrectionCandidate {
+		t.Errorf("expected at least one correction candidate; got candidates=%+v", candidates)
+	}
+	// All excerpts must be within the 200-char cap.
+	for _, c := range candidates {
+		if len(c.Excerpt) > 200 {
+			t.Errorf("excerpt exceeds 200 chars (%d): %q", len(c.Excerpt), c.Excerpt)
+		}
+	}
+}
+
+// TestCountHeimdallWrites_RealShape verifies that countHeimdallWrites correctly
+// counts mcp__heimdall__* tool-use blocks in the real Claude Code transcript shape.
+func TestCountHeimdallWrites_RealShape(t *testing.T) {
+	data, err := os.ReadFile("testdata/transcript_real_shape.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	n := countHeimdallWrites(data)
+	// Fixture has one mcp__heimdall__heimdall_remember block.
+	if n != 1 {
+		t.Errorf("expected 1 heimdall write (mcp__heimdall__heimdall_remember), got %d", n)
+	}
+}
+
+func TestHookSessionEnd_SuppressesOnEmptyTranscript(t *testing.T) {
+	dir := t.TempDir()
+	tPath := filepath.Join(dir, "transcript.jsonl")
+	if err := os.WriteFile(tPath, []byte{}, 0644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	payload := sessionEndPayload{
+		SessionID:      "s-empty",
+		TranscriptPath: tPath,
+		CWD:            dir,
+		HookEventName:  "SessionEnd",
+	}
+	data, _ := json.Marshal(payload)
+
+	code := HookSessionEnd(config.DefaultConfig(), bytes.NewReader(data), &bytes.Buffer{}, &bytes.Buffer{}, map[string]string{}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+
+	reviewPath := filepath.Join(dir, ".heimdall_db", "hooks", "last-session-review.json")
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Errorf("expected no review file for empty transcript")
+	}
+}
+
+// TestHookSessionEnd_RecordsMissesInReview verifies that when the transcript
+// contains a user correction not followed by heimdall_remember, the review
+// record includes a misses entry with the correct rule and expected tool.
+func TestHookSessionEnd_RecordsMissesInReview(t *testing.T) {
+	dir := t.TempDir()
+
+	// Transcript: correction without a following heimdall_remember.
+	// 5 corrections to exceed the suppression threshold (candidates > 2).
+	tPath := filepath.Join(dir, "transcript.jsonl")
+	lines := []string{
+		`{"role":"assistant","content":"I will use global state."}`,
+		`{"role":"user","content":"Actually no, do not use global variables."}`,
+		`{"role":"assistant","content":"Understood."}`,
+		`{"role":"user","content":"no, that approach is wrong too"}`,
+		`{"role":"assistant","content":"Let me try again."}`,
+		`{"role":"user","content":"stop — this is still broken"}`,
+		`{"role":"assistant","content":"OK."}`,
+	}
+	if err := os.WriteFile(tPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	payload := sessionEndPayload{
+		SessionID:      "s-misses-1",
+		TranscriptPath: tPath,
+		CWD:            dir,
+		HookEventName:  "SessionEnd",
+		Reason:         "user_exit",
+	}
+	data, _ := json.Marshal(payload)
+
+	code := HookSessionEnd(config.DefaultConfig(), bytes.NewReader(data), &bytes.Buffer{}, &bytes.Buffer{}, map[string]string{}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+
+	reviewPath := filepath.Join(dir, ".heimdall_db", "hooks", "last-session-review.json")
+	body, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatalf("review file not written: %v", err)
+	}
+	var rev map[string]any
+	if err := json.Unmarshal(body, &rev); err != nil {
+		t.Fatalf("review file malformed: %v", err)
+	}
+
+	// Verify misses field is present and non-empty.
+	missesRaw, ok := rev["misses"]
+	if !ok {
+		t.Fatalf("review file missing 'misses' field; keys: %v", rev)
+	}
+	misses, ok := missesRaw.([]any)
+	if !ok || len(misses) == 0 {
+		t.Fatalf("expected non-empty misses array, got %T: %v", missesRaw, missesRaw)
+	}
+
+	// Verify the first miss has the right rule and expected_tool.
+	firstMiss, ok := misses[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected miss to be a map, got %T", misses[0])
+	}
+	if rule, _ := firstMiss["rule"].(string); rule != "user_correction" {
+		t.Errorf("expected rule=user_correction, got %q", rule)
+	}
+	if et, _ := firstMiss["expected_tool"].(string); et != "heimdall_remember" {
+		t.Errorf("expected expected_tool=heimdall_remember, got %q", et)
+	}
+
+	// Verify triggers and followed fields are present.
+	if _, ok := rev["triggers"]; !ok {
+		t.Errorf("review file missing 'triggers' field")
+	}
+	if _, ok := rev["followed"]; !ok {
+		t.Errorf("review file missing 'followed' field")
 	}
 }
