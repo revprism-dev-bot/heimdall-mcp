@@ -35,19 +35,29 @@ const heimdallHookVersion = 1
 
 // heimdallBinaryVersion is the string recorded in the `x-heimdall` metadata
 // bag on installed hook entries. Distinct from heimdallHookVersion because the
-// binary can churn without changing the hook shape. Bumped to "wave2-phase3"
-// when Phase 3 added the PreToolUse guardrail entry — the auto-upgrade path
-// uses this string to decide whether an existing 5-hook install should be
-// expanded to the current 6-hook template on SessionStart.
-const heimdallBinaryVersion = "wave2-phase3"
+// binary can churn without changing the hook shape. Bumped to "wave2-phase4"
+// when the SessionEnd entry gained an explicit `timeout` field — Claude Code's
+// default 1.5 s SessionEnd budget was killing the P0 ingest path mid-embed
+// (see docs/plans/claude-heimdall-self-use/04-session-end-regression-handoff.md).
+// autoUpgradeHooks uses this string on SessionStart to refresh stale heimdall
+// entries in-place so shape drift heals without a manual reinstall.
+const heimdallBinaryVersion = "wave2-phase4"
+
+// sessionEndTimeoutSeconds overrides Claude Code's per-hook 1500 ms SessionEnd
+// budget. Real sessions with ≥10 memories to ingest blow past 1.5 s on the
+// embedder round-trips; the harness SIGTERMs the subprocess before any log
+// line lands, leaving no evidence the hook fired. 30 s is a generous ceiling
+// that still lets the outer `/exit` path return quickly on well-behaved runs.
+const sessionEndTimeoutSeconds = 30
 
 // phase1aHook describes one Claude Code hook entry heimdall owns. The list
 // below is the canonical Phase 1a install set; `--only` filters over it by
 // event name.
 type phase1aHook struct {
-	event   string // Claude Code hook event (e.g. "SessionStart")
-	matcher string // empty if the event has no matcher
-	command string // full command string including --source=heimdall
+	event          string // Claude Code hook event (e.g. "SessionStart")
+	matcher        string // empty if the event has no matcher
+	command        string // full command string including --source=heimdall
+	timeoutSeconds int    // per-command timeout in seconds; 0 = harness default
 }
 
 // phase1aHooks is the canonical install set. The variable name is preserved
@@ -83,9 +93,10 @@ var phase1aHooks = []phase1aHook{
 		command: "heimdall-mcp hook stop --source=heimdall --version=1",
 	},
 	{
-		event:   "SessionEnd",
-		matcher: "",
-		command: "heimdall-mcp hook session-end --source=heimdall --version=1",
+		event:          "SessionEnd",
+		matcher:        "",
+		command:        "heimdall-mcp hook session-end --source=heimdall --version=1",
+		timeoutSeconds: sessionEndTimeoutSeconds,
 	},
 	{
 		// Phase 3 — destructive-op guardrails. Ships in shadow mode by
@@ -999,16 +1010,21 @@ func buildHookEntry(h phase1aHook) map[string]any {
 		"installed_at":     time.Now().UTC().Format(time.RFC3339),
 		"heimdall_version": heimdallBinaryVersion,
 	}
+	inner := map[string]any{
+		"type":    "command",
+		"command": h.command,
+	}
+	// Claude Code reads `hooks[N].timeout` (seconds) as a per-command cap and
+	// feeds it through getSessionEndHookTimeoutMs → AbortSignal.timeout(…).
+	// Omit when zero so unrelated events stay bit-identical to the old shape.
+	if h.timeoutSeconds > 0 {
+		inner["timeout"] = h.timeoutSeconds
+	}
 	entry := map[string]any{
 		"source":     "heimdall",
 		"version":    heimdallHookVersion,
 		"x-heimdall": meta,
-		"hooks": []any{
-			map[string]any{
-				"type":    "command",
-				"command": h.command,
-			},
-		},
+		"hooks":      []any{inner},
 	}
 	if h.matcher != "" {
 		entry["matcher"] = h.matcher
@@ -1038,6 +1054,20 @@ func isHeimdallEntry(obj map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// entryMatchesCurrentVersion returns true if the entry's
+// `x-heimdall.heimdall_version` equals the running binary's
+// heimdallBinaryVersion. An entry missing the metadata bag is treated as stale
+// — installs predating the bag need a refresh to gain timeout / matcher
+// fields added in later waves.
+func entryMatchesCurrentVersion(obj map[string]any) bool {
+	meta, ok := obj["x-heimdall"].(map[string]any)
+	if !ok {
+		return false
+	}
+	v, _ := meta["heimdall_version"].(string)
+	return v == heimdallBinaryVersion
 }
 
 // sameMatcher compares an existing entry's "matcher" field to the desired
@@ -1251,27 +1281,38 @@ func autoUpgradeHooks(env map[string]string) {
 			continue
 		}
 
-		// Find which hooks from the template are missing.
+		// Find which hooks from the template are missing, and which existing
+		// heimdall entries are stale (heimdall_version != current).
 		var missing []phase1aHook
+		var refreshed []string // "event:matcher" tokens replaced in place
 		for _, h := range phase1aHooks {
 			list, _ := hooksMap[h.event].([]any)
 			found := false
-			for _, raw := range list {
+			for i, raw := range list {
 				obj, ok := raw.(map[string]any)
 				if !ok {
 					continue
 				}
-				if isHeimdallEntry(obj) && sameMatcher(obj, h.matcher) {
-					found = true
-					break
+				if !isHeimdallEntry(obj) || !sameMatcher(obj, h.matcher) {
+					continue
 				}
+				found = true
+				if !entryMatchesCurrentVersion(obj) {
+					list[i] = buildHookEntry(h)
+					refreshed = append(refreshed, fmt.Sprintf("%s:%s", h.event, h.matcher))
+				}
+				break
 			}
 			if !found {
 				missing = append(missing, h)
+			} else {
+				// Write the (possibly refreshed) list back so the slice
+				// assignment above is picked up.
+				hooksMap[h.event] = list
 			}
 		}
 
-		if len(missing) == 0 {
+		if len(missing) == 0 && len(refreshed) == 0 {
 			continue
 		}
 
@@ -1298,11 +1339,12 @@ func autoUpgradeHooks(env map[string]string) {
 			names[i] = h.event
 		}
 		heimdall.LogHookEvent("INFO", "auto-upgrade", map[string]any{
-			"msg":   "hooks_upgraded",
-			"scope": scope,
-			"added": names,
-			"total": len(phase1aHooks),
-			"path":  path,
+			"msg":       "hooks_upgraded",
+			"scope":     scope,
+			"added":     names,
+			"refreshed": refreshed,
+			"total":     len(phase1aHooks),
+			"path":      path,
 		})
 
 		// Prewarm note: install-hooks fires a 5s EmbedForHook to remove the

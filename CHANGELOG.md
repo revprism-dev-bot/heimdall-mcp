@@ -43,6 +43,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) in
 
 ### Fixed
 
+- **`event=session-end` hook now survives Claude Code's 1.5 s SIGTERM budget.**
+  Claude Code 2.1.114 hardcodes a 1500 ms per-subprocess cap on SessionEnd
+  hooks (harness constant `E$8`). The P0 `HookSessionEnd` path does
+  transcript summarization + ollama embeddings + memory-store ingest +
+  review-record persistence, which on real sessions with ≥10 memories to
+  ingest measures ~1.7 s — past the budget, so the subprocess got SIGTERM'd
+  before any log line landed. Observed effect: zero `event=session-end`
+  entries since 2026-04-19T18:46Z, breaking the nag loop that depends on
+  the review record. Fix is threefold: (1) the installer now emits
+  `hooks[0].timeout = 30` (seconds) on the SessionEnd entry, which Claude
+  Code reads through `getSessionEndHookTimeoutMs → AbortSignal.timeout`;
+  (2) `HookSessionEnd` logs the `msg=session_ended` "ran" marker BEFORE the
+  slow ingest block so evidence survives any future tighter budget; and
+  (3) a new `sweepOrphanBuffers` pass on `HookSessionStart` moves rolling
+  buffers idle past 48 h into `.heimdall_db/hooks/sessions/_orphaned/`, so
+  reboot-killed session buffers stop accumulating. `heimdallBinaryVersion`
+  bumped to `"wave2-phase4"` and `autoUpgradeHooks` now refreshes stale
+  heimdall-sourced entries in place so existing installs pick up the new
+  shape without a manual `install-hooks` run. Full investigation in
+  `docs/plans/claude-heimdall-self-use/04-session-end-regression-handoff.md`.
 - **Sub-repos with a broken `.heimdall_db` are now registered anyway.**
   `IndexSubRepos` used to fire `OnSubRepoDiscovered` only AFTER
   `OpenStore` succeeded — so a sub-repo whose SQLite file was truncated,

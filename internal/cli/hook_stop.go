@@ -137,6 +137,17 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 	bufferDir := resolveBufferDir(projectDir)
 	bufferPath := filepath.Join(bufferDir, payload.SessionID+".jsonl")
 
+	// Log the "ran" marker FIRST so we always have evidence the hook fired,
+	// even if Claude Code's SessionEnd budget (default 1500 ms) SIGTERMs the
+	// subprocess mid-ingest. The ingest_ok line below is the richer signal,
+	// but its absence no longer means "hook never ran" — only "ingest didn't
+	// finish in time." See docs/plans/claude-heimdall-self-use/04.
+	heimdall.LogHookEvent("INFO", "session-end", map[string]any{
+		"session": payload.SessionID,
+		"reason":  payload.Reason,
+		"msg":     "session_ended",
+	})
+
 	if payload.TranscriptPath != "" {
 		if _, err := os.Stat(payload.TranscriptPath); err == nil {
 			transcript, err := os.ReadFile(payload.TranscriptPath)
@@ -178,17 +189,70 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 
 	os.Remove(bufferPath)
 
-	heimdall.LogHookEvent("INFO", "session-end", map[string]any{
-		"session": payload.SessionID,
-		"reason":  payload.Reason,
-		"msg":     "session_ended",
-	})
-
 	return 0
 }
 
 func resolveBufferDir(projectDir string) string {
 	return filepath.Join(projectDir, ".heimdall_db", "hooks", "sessions")
+}
+
+// orphanBufferGracePeriod is the minimum age a rolling buffer must reach
+// before sweepOrphanBuffers will treat it as abandoned. 48 hours is well
+// past any realistic idle-session interval while still catching buffers left
+// behind by a reboot-kill the next time the user opens Claude Code.
+const orphanBufferGracePeriod = 48 * time.Hour
+
+// orphanSubdir is the directory name under the buffer dir where orphans get
+// moved. Kept here (rather than inlined) so tests can assert against it.
+const orphanSubdir = "_orphaned"
+
+// sweepOrphanBuffers moves rolling buffers that have been idle past
+// orphanBufferGracePeriod into `<bufferDir>/_orphaned/`. Reboot-killed
+// sessions never hit SessionEnd and so leak their buffer; this is the
+// self-heal path that keeps the buffer dir from growing unbounded.
+//
+// Never returns — logging failures is best-effort (§5.9 golden rule).
+// `now` is injected so tests don't have to wait 48 hours.
+func sweepOrphanBuffers(projectDir string, now time.Time) {
+	defer func() { _ = recover() }()
+
+	bufferDir := resolveBufferDir(projectDir)
+	entries, err := os.ReadDir(bufferDir)
+	if err != nil {
+		return
+	}
+	cutoff := now.Add(-orphanBufferGracePeriod)
+
+	var moved []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue // skip _orphaned/ itself and any nested dirs
+		}
+		if !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		orphanDir := filepath.Join(bufferDir, orphanSubdir)
+		if err := os.MkdirAll(orphanDir, 0o700); err != nil {
+			continue
+		}
+		src := filepath.Join(bufferDir, e.Name())
+		dst := filepath.Join(orphanDir, e.Name())
+		if err := os.Rename(src, dst); err != nil {
+			continue
+		}
+		moved = append(moved, e.Name())
+	}
+	if len(moved) > 0 {
+		heimdall.LogHookEvent("INFO", "session-gc", map[string]any{
+			"msg":     "orphan_buffers_moved",
+			"count":   len(moved),
+			"project": projectDir,
+		})
+	}
 }
 
 // CandidateEvent is one remember-worthy moment detected in a transcript scan.

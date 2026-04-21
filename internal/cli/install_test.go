@@ -379,6 +379,121 @@ func TestInstallHooks_WriteDeniedDirectory(t *testing.T) {
 	}
 }
 
+// TestInstallHooks_SessionEndHasTimeout pins the regression fix for the
+// 1500 ms SessionEnd SIGTERM: the SessionEnd hook entry must carry an explicit
+// `timeout` on its inner command, overriding Claude Code's default budget.
+// Any refactor that drops this field will re-break the nag loop silently.
+// See docs/plans/claude-heimdall-self-use/04-session-end-regression-handoff.md.
+func TestInstallHooks_SessionEndHasTimeout(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	var stdout, stderr bytes.Buffer
+
+	if code := CLIInstallHooks(config.Config{}, nil, &stdout, &stderr, env, []string{"--scope=user"}); code != 0 {
+		t.Fatalf("install exit=%d stderr=%s", code, stderr.String())
+	}
+
+	m := readJSON(t, filepath.Join(home, ".claude", "settings.json"))
+	hooks := m["hooks"].(map[string]any)
+	seList := hooks["SessionEnd"].([]any)
+	if len(seList) == 0 {
+		t.Fatal("SessionEnd list is empty")
+	}
+	entry := seList[0].(map[string]any)
+	inner := entry["hooks"].([]any)
+	if len(inner) == 0 {
+		t.Fatal("SessionEnd inner hooks empty")
+	}
+	cmd := inner[0].(map[string]any)
+
+	// The timeout lands on the inner command object. JSON round-trips numeric
+	// fields through float64, hence the cast.
+	raw, ok := cmd["timeout"]
+	if !ok {
+		t.Fatalf("SessionEnd inner command missing timeout field: %v", cmd)
+	}
+	got, ok := raw.(float64)
+	if !ok {
+		t.Fatalf("timeout must be numeric, got %T: %v", raw, raw)
+	}
+	if int(got) != sessionEndTimeoutSeconds {
+		t.Errorf("want timeout=%d seconds, got %v", sessionEndTimeoutSeconds, got)
+	}
+
+	// Sanity: other events shouldn't have grown a spurious timeout field.
+	for event, rawList := range hooks {
+		if event == "SessionEnd" {
+			continue
+		}
+		for _, raw := range rawList.([]any) {
+			obj := raw.(map[string]any)
+			for _, h := range obj["hooks"].([]any) {
+				inner := h.(map[string]any)
+				if _, has := inner["timeout"]; has {
+					t.Errorf("%s entry unexpectedly carries timeout: %v", event, inner)
+				}
+			}
+		}
+	}
+}
+
+// TestAutoUpgradeHooks_RefreshesStaleVersion covers the drift-heal path:
+// an install from a previous binary version (e.g. wave2-phase3) gets
+// rewritten to the current template when HookSessionStart fires. Without
+// this, bumping heimdallBinaryVersion would only affect fresh installs and
+// existing users would stay on the buggy shape forever.
+func TestAutoUpgradeHooks_RefreshesStaleVersion(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(t, home)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed a complete install under an older heimdall_version, WITHOUT the
+	// timeout field on SessionEnd — the exact shape that shipped before
+	// wave2-phase4.
+	stale := map[string]any{
+		"hooks": map[string]any{},
+	}
+	staleHooks := stale["hooks"].(map[string]any)
+	for _, h := range phase1aHooks {
+		entry := map[string]any{
+			"source":  "heimdall",
+			"version": float64(heimdallHookVersion),
+			"x-heimdall": map[string]any{
+				"installed_at":     "2026-04-16T20:43:00Z",
+				"heimdall_version": "wave2-phase3", // stale
+			},
+			"hooks": []any{
+				map[string]any{"type": "command", "command": h.command},
+			},
+		}
+		if h.matcher != "" {
+			entry["matcher"] = h.matcher
+		}
+		staleHooks[h.event] = []any{entry}
+	}
+	b, _ := json.MarshalIndent(stale, "", "  ")
+	if err := os.WriteFile(settingsPath, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	autoUpgradeHooks(env)
+
+	m := readJSON(t, settingsPath)
+	hooks := m["hooks"].(map[string]any)
+	seEntry := hooks["SessionEnd"].([]any)[0].(map[string]any)
+	meta := seEntry["x-heimdall"].(map[string]any)
+	if got, _ := meta["heimdall_version"].(string); got != heimdallBinaryVersion {
+		t.Errorf("want heimdall_version=%q, got %q", heimdallBinaryVersion, got)
+	}
+	inner := seEntry["hooks"].([]any)[0].(map[string]any)
+	if _, has := inner["timeout"]; !has {
+		t.Errorf("refreshed SessionEnd inner hook must carry timeout, got: %v", inner)
+	}
+}
+
 // ----- T15: uninstall-hooks -----
 
 func TestUninstallHooks_RemovesHeimdallEntries(t *testing.T) {
