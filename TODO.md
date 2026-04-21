@@ -101,7 +101,7 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] New `heimdall_ls(path)` MCP tool — lists child paths with chunk counts for filesystem-style navigation
 - [x] `WithScope()` and `WithDetail()` functional options on `SearchFiltered`
 - [x] Auto-detect path for memories (follow-up) — shipped in `ab7c629` via `deriveMemoryContextPath` in `internal/mcp/memory_tools.go`: explicit `context_path` wins; otherwise `os.Getwd()` + `FindRepoRoot` + `ComputeScope` derive the subpath; auto-detect never overwrites an existing non-empty `ContextPath` on update.
-- [ ] Update hook injection to respect scope when CWD is a subpath (follow-up)
+- [x] Update hook injection to respect scope when CWD is a subpath (follow-up) — shipped in `ab7c629` via `findRepoRoot` + `computeScope` in `internal/cli/hook_user_prompt.go` + `internal/cli/scope.go`: subpath CWD narrows search via `heimdall.WithScope(scope)`; scope folded into `hook_cache` key so subpath queries don't collide with repo-root queries.
 
 ## 4. Skills as indexable content — **SHIPPED**
 
@@ -121,3 +121,23 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] DES-006 config-driven EmbedBatchSize — `EmbedBatchSize` field added to Config with default 32
 - [x] DES-010 ETA unit test — extracted `computeETA()` pure function + 6 tests in `eta_test.go`
 - [x] TEST-013 mock rename — `MockEmbedder` → `StubEmbedder` across all source files (12+ files)
+
+## 7. Claude self-use of heimdall (2026-04-19)
+
+**Doc:** `docs/plans/claude-heimdall-self-use/00-problem-and-fixes.md`
+Observed: two independent Claude sessions admitted under-using heimdall (no direct search/recall/remember/index_text from coordinator tier; only reliance on auto-injected hook context and agent-delegation). Doc analyses root causes and proposes P0/P1/P2 fixes. Kickoff prompt for next session is in the doc itself.
+
+- [ ] Next session: run kickoff prompt → plan for P0 items (SessionEnd review hook, rewrite MCP instructions as trigger→action pairs, scope "unavailable" error)
+- [ ] After approved plan: implement P0 items (3 PRs, normal quality gate)
+- [ ] P1 items — follow-up after P0 ships
+- [ ] P2 items — backlog
+
+## 8. Future roadmap — centralized DB (2026-04-21)
+
+**Memory:** `project_centralized_db_roadmap.md` (in `~/.claude/projects/-home-noname-Code-heimdall-mcp/memory/`)
+
+Stated direction: eventually support a centralized heimdall DB co-located with the Ollama host, so team members don't each maintain a per-project local `.heimdall_db/`. Not blocking current work — current decisions just need to avoid foreclosing it.
+
+- [ ] Design doc: multi-writer semantics, schema_version compatibility check on client connect, project-ID addressing vs filesystem paths, team-level auth model
+- [ ] Scope + plan spike (no implementation until scoped) — estimate LOC / PR count / migration cost for existing local-DB callers
+- [ ] Decide client/server boundary: MCP-over-network? Custom RPC? Shared filesystem with lock?
