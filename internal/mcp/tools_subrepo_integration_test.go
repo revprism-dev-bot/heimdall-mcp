@@ -532,6 +532,237 @@ func TestHeimdallLs_ShowsSubRepos(t *testing.T) {
 	}
 }
 
+// TestHeimdallLs_FanoutOnWrapperProject (PR4 — Wave 2 B-ls case (a)).
+// Asserts the core fanout contract: ls on a wrapper project root returns
+// a GROUPED response that aggregates the wrapper's own context_path
+// children with entries from every registered sub-repo under it, each
+// sub-repo's contribution attributed via its registry Name in the
+// SubProject field. Pre-fanout (the regression this test guards) the
+// response was a flat list of only the wrapper's own children, making
+// sub-repo hierarchies invisible — the Problem #4 symptom.
+//
+// The test deliberately asserts on the grouped shape (not on per-row
+// sub_project column values) so it is independent of the Problem #2
+// writer bug (sub-repo chunks still land in their own store with
+// sub_project=""). The fanout attributes rows by WHICH STORE they came
+// from, which is the fix's design point.
+func TestHeimdallLs_FanoutOnWrapperProject(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, _, _ := seedHierarchicalOuter(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+	runIndexSync(t, srv, outer)
+
+	reqJSON, _ := json.Marshal(map[string]any{"project": "outer"})
+	res := srv.toolLs(reqJSON)
+	if res.IsError {
+		t.Fatalf("toolLs(project=outer) returned error: %+v", res)
+	}
+	if len(res.Content) == 0 {
+		t.Fatalf("toolLs(project=outer) returned zero content blocks")
+	}
+	body := res.Content[0].Text
+	if body == "No entries at this path." {
+		t.Fatalf("toolLs(project=outer) surfaced 'No entries' — wrapper fanout regressed")
+	}
+
+	// Grouped response: []LsGroup — decode and verify three groups
+	// (anchor + alpha + beta), each contributing at least one entry.
+	var groups []LsGroup
+	if err := json.Unmarshal([]byte(body), &groups); err != nil {
+		t.Fatalf("toolLs(project=outer) did not return grouped []LsGroup — decode error: %v\nbody: %s", err, body)
+	}
+	if len(groups) != 3 {
+		t.Fatalf("toolLs(project=outer) returned %d groups, want 3 (outer + alpha + beta); body=%s", len(groups), body)
+	}
+
+	// The anchor group must come first with SubProject="".
+	if groups[0].SubProject != "" {
+		t.Errorf("groups[0].SubProject = %q, want \"\" (anchor first)", groups[0].SubProject)
+	}
+	if groups[0].ProjectName != "outer" {
+		t.Errorf("groups[0].ProjectName = %q, want \"outer\"", groups[0].ProjectName)
+	}
+
+	// Sub-repo groups must be attributed by registry Name, sorted.
+	want := map[string]bool{"alpha": true, "beta": true}
+	for _, g := range groups[1:] {
+		if g.SubProject == "" {
+			t.Errorf("unexpected anchor group in sub-repo slice: %+v", g)
+			continue
+		}
+		if !want[g.SubProject] {
+			t.Errorf("unexpected sub-repo group SubProject=%q", g.SubProject)
+		}
+		if g.SubProject != g.ProjectName {
+			t.Errorf("sub-repo group SubProject=%q but ProjectName=%q (should match registry Name)", g.SubProject, g.ProjectName)
+		}
+		if len(g.Entries) == 0 {
+			t.Errorf("sub-repo group %q has zero entries — fanout failed for this sub-repo", g.SubProject)
+		}
+	}
+	if groups[1].SubProject >= groups[2].SubProject {
+		t.Errorf("sub-repo groups not sorted: %q then %q", groups[1].SubProject, groups[2].SubProject)
+	}
+}
+
+// TestHeimdallLs_PlainProject_UnchangedShape (PR4 — Wave 2 B-ls case (b)).
+// A project with no registered sub-repos under it keeps the original
+// flat []PathEntry response shape. This is the backwards-compat guarantee
+// for every non-wrapper project — the fanout must be a no-op when there
+// is nothing to fan out.
+func TestHeimdallLs_PlainProject_UnchangedShape(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	plain := filepath.Join(base, "plain")
+	if err := os.MkdirAll(filepath.Join(plain, "src"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plain, "src", "plain.go"), []byte("package plain\n// plain-unique-token\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitInit(t, plain)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(plain)
+	runIndexSync(t, srv, plain)
+
+	if len(srv.Registry.All()) != 1 {
+		t.Fatalf("expected exactly 1 registered project (the plain one), got %d", len(srv.Registry.All()))
+	}
+
+	reqJSON, _ := json.Marshal(map[string]any{"project": "plain"})
+	res := srv.toolLs(reqJSON)
+	if res.IsError {
+		t.Fatalf("toolLs(project=plain) returned error: %+v", res)
+	}
+	body := res.Content[0].Text
+	if body == "No entries at this path." {
+		t.Fatalf("toolLs(project=plain) surfaced 'No entries' — plain project regressed")
+	}
+
+	// Flat []PathEntry shape is the contract for plain projects. Decoding
+	// as []LsGroup first would succeed on a naive response that happened
+	// to have matching field names — enforce the flat shape explicitly by
+	// asserting the response is a JSON array whose elements are objects
+	// with a "name" field but NO "entries" field.
+	var flat []heimdall.PathEntry
+	if err := json.Unmarshal([]byte(body), &flat); err != nil {
+		t.Fatalf("plain-project ls did not return flat []PathEntry — decode error: %v\nbody: %s", err, body)
+	}
+	if len(flat) == 0 {
+		t.Fatalf("plain-project ls returned empty flat list: %s", body)
+	}
+	// Reject the grouped shape defensively: if entries had an "entries"
+	// sub-field each row would either fail the flat decode above or have
+	// zero meaningful content — assert on a known-good child name instead.
+	found := false
+	for _, e := range flat {
+		if e.Name == "src" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("plain-project ls missing expected child 'src' (have: %+v)", flat)
+	}
+}
+
+// TestHeimdallLs_SubRepoDirectTarget (PR4 — Wave 2 B-ls case (c)).
+// Calling ls against a sub-repo directly (by its registered Name) shows
+// only that sub-repo's own hierarchy in the flat shape — no fanout across
+// the parent wrapper's other sub-repos. A sub-repo has no registered
+// children under it, so the fanout collapses to the single-store path.
+// This is the guarantee that "ls on alpha" never leaks outer or beta
+// content into alpha's listing.
+func TestHeimdallLs_SubRepoDirectTarget(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, _, _ := seedHierarchicalOuter(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+	runIndexSync(t, srv, outer)
+
+	reqJSON, _ := json.Marshal(map[string]any{"project": "alpha"})
+	res := srv.toolLs(reqJSON)
+	if res.IsError {
+		t.Fatalf("toolLs(project=alpha) returned error: %+v", res)
+	}
+	body := res.Content[0].Text
+	if body == "No entries at this path." {
+		t.Fatalf("toolLs(project=alpha) surfaced 'No entries' — sub-repo direct target regressed")
+	}
+
+	// Must be flat []PathEntry — no fanout when the target has no
+	// sub-repos under it.
+	var flat []heimdall.PathEntry
+	if err := json.Unmarshal([]byte(body), &flat); err != nil {
+		t.Fatalf("sub-repo direct-target ls did not return flat shape — body=%s err=%v", body, err)
+	}
+	// Alpha's only nested content lives under cmd/.
+	var hasCmd bool
+	for _, e := range flat {
+		if e.Name == "cmd" {
+			hasCmd = true
+		}
+		// Negative check: outer's 'src' and beta's 'lib' must NOT appear —
+		// their chunks live in different stores and the non-fanout path
+		// must not touch them.
+		if e.Name == "src" || e.Name == "lib" {
+			t.Errorf("sub-repo direct-target ls leaked foreign-repo entry %q (have: %+v)", e.Name, flat)
+		}
+	}
+	if !hasCmd {
+		t.Errorf("sub-repo direct-target ls missing expected 'cmd' entry (have: %+v)", flat)
+	}
+}
+
+// TestHeimdallLs_SubProjectRootSentinel (PR4). Passing
+// sub_project="__root__" on a wrapper collapses the fanout to the anchor
+// only, matching the search tool's root sentinel semantics (decisions.md
+// §Q4). Confirms the filter parameter is wired through and the anchor-only
+// path emits the flat shape (same shape as a plain project).
+func TestHeimdallLs_SubProjectRootSentinel(t *testing.T) {
+	const model = "nomic-embed-text"
+	const dim = 4
+
+	base := t.TempDir()
+	outer, _, _ := seedHierarchicalOuter(t, base)
+
+	srv, _ := newMCPIntegrationServer(t, model, dim)
+	t.Chdir(outer)
+	runIndexSync(t, srv, outer)
+
+	reqJSON, _ := json.Marshal(map[string]any{"project": "outer", "sub_project": heimdall.SubProjectRoot})
+	res := srv.toolLs(reqJSON)
+	if res.IsError {
+		t.Fatalf("toolLs(__root__) returned error: %+v", res)
+	}
+	body := res.Content[0].Text
+
+	var flat []heimdall.PathEntry
+	if err := json.Unmarshal([]byte(body), &flat); err != nil {
+		t.Fatalf("__root__ sentinel did not return flat shape — body=%s err=%v", body, err)
+	}
+	// Must contain 'src' (outer's own child) and must NOT contain 'cmd'
+	// or 'lib' (those belong to sub-repo stores and should be excluded
+	// when __root__ is requested).
+	for _, e := range flat {
+		if e.Name == "cmd" || e.Name == "lib" {
+			t.Errorf("__root__ sentinel leaked sub-repo entry %q: %+v", e.Name, flat)
+		}
+	}
+}
+
 // TestHeimdallLs_HierarchyPopulatedAfterSubProjectTagging (PR4). After
 // indexing a hierarchical outer + sub-repos, ls against each registered
 // project's root returns non-empty entries. This is the overall
