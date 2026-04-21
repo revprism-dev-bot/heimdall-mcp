@@ -98,9 +98,9 @@ type lsInput struct {
 // responses; callers that already parse flat ls output only need to learn
 // one extra wrapper to parse the grouped form.
 type LsGroup struct {
-	SubProject  string                `json:"subProject"`  // "" for anchor/wrapper; sub-repo name otherwise
-	ProjectName string                `json:"projectName"` // registry Name of the contributing project
-	Entries     []heimdall.PathEntry  `json:"entries"`
+	SubProject  string               `json:"subProject"`  // "" for anchor/wrapper; sub-repo name otherwise
+	ProjectName string               `json:"projectName"` // registry Name of the contributing project
+	Entries     []heimdall.PathEntry `json:"entries"`
 }
 
 type indexInput struct {

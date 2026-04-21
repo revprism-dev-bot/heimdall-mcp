@@ -313,7 +313,7 @@ func TestIndexSubRepos_RegistersUnconditionally(t *testing.T) {
 // TestMCPSearch_SubProjectFilter_Hits (PR2 / Problem #2). After indexing a
 // wrapper + sub-repo, a search against the sub-repo's store with
 // sub_project=<sub-repo-name> returns matching rows. Prior to PR2 sub-repo
-// stores had sub_project='' universally, so the filter returned zero.
+// stores had sub_project set to the empty string universally, so the filter returned zero.
 func TestMCPSearch_SubProjectFilter_Hits(t *testing.T) {
 	const model = "nomic-embed-text"
 	const dim = 4
@@ -349,7 +349,7 @@ func TestMCPSearch_SubProjectFilter_Hits(t *testing.T) {
 
 // TestMCPSearch_RootSentinel_FiltersToEmptySubProject (OQ-c). On the OUTER
 // store, sub_project="__root__" returns rows only (outer chunks have
-// sub_project='' — sub-repo chunks are stored in sub-repo-local stores).
+// sub_project set to the empty string — sub-repo chunks are stored in sub-repo-local stores).
 // The test asserts the sentinel syntactically works against a store that
 // might one day gain cross-tagged rows; on the outer-only store every
 // row qualifies.
