@@ -576,3 +576,118 @@ func TestHookSessionEnd_RecordsMissesInReview(t *testing.T) {
 		t.Errorf("review file missing 'followed' field")
 	}
 }
+
+// TestHookSessionEnd_LogsSessionEndedBeforeIngest pins the post-regression
+// contract: the `msg=session_ended` line MUST appear before any `msg=ingest_ok`
+// line in the hook log. Claude Code's 1500 ms SessionEnd budget would SIGTERM
+// the hook mid-embed on any real session with ≥10 memories to ingest. Logging
+// the "ran" marker first means the `event=session-end` signal survives even
+// when the ingest subprocess is killed.
+//
+// See docs/plans/claude-heimdall-self-use/04-session-end-regression-handoff.md.
+func TestHookSessionEnd_LogsSessionEndedBeforeIngest(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HEIMDALL_HOOK_LOG", filepath.Join(tmp, "hooks.log"))
+	t.Setenv("HEIMDALL_HOOKS", "1")
+
+	projectDir := t.TempDir()
+
+	// Synthetic transcript with one user-correction marker — enough to make
+	// extractTranscriptSummary return non-empty, which historically gated the
+	// slow ingest path. Even without Ollama reachable, the reorder means
+	// session_ended should be flushed first.
+	transcriptDir := filepath.Join(projectDir, "transcripts")
+	if err := os.MkdirAll(transcriptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcriptPath := filepath.Join(transcriptDir, "session.jsonl")
+	transcript := `{"role":"user","content":"actually no, do X instead"}` + "\n" +
+		`{"role":"assistant","content":"Got it — switching to X."}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(transcript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := sessionEndPayload{
+		SessionID:      "ordering-probe",
+		CWD:            projectDir,
+		HookEventName:  "SessionEnd",
+		Reason:         "prompt_input_exit",
+		TranscriptPath: transcriptPath,
+	}
+	data, _ := json.Marshal(payload)
+	code := HookSessionEnd(config.DefaultConfig(), bytes.NewReader(data), &bytes.Buffer{}, &bytes.Buffer{}, map[string]string{}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+
+	logBytes, err := os.ReadFile(filepath.Join(tmp, "hooks.log"))
+	if err != nil {
+		t.Fatalf("hook log not written: %v", err)
+	}
+	logStr := string(logBytes)
+
+	endedIdx := strings.Index(logStr, "msg=session_ended")
+	if endedIdx < 0 {
+		t.Fatalf("no session_ended line in hook log:\n%s", logStr)
+	}
+	ingestIdx := strings.Index(logStr, "msg=ingest_ok")
+	if ingestIdx >= 0 && ingestIdx < endedIdx {
+		t.Fatalf("session_ended must be logged before ingest_ok:\n%s", logStr)
+	}
+}
+
+// TestSweepOrphanBuffers_MovesAgedBuffersOnly verifies the self-heal path:
+// buffers older than orphanBufferGracePeriod move to `_orphaned/`, fresher
+// ones stay put. Without this sweep, reboot-killed session buffers would
+// accumulate forever — see handoff §1.3 for the 3-orphan state that
+// motivated this.
+func TestSweepOrphanBuffers_MovesAgedBuffersOnly(t *testing.T) {
+	projectDir := t.TempDir()
+	bufferDir := resolveBufferDir(projectDir)
+	if err := os.MkdirAll(bufferDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	staleName := "old-session.jsonl"
+	freshName := "live-session.jsonl"
+	stalePath := filepath.Join(bufferDir, staleName)
+	freshPath := filepath.Join(bufferDir, freshName)
+	if err := os.WriteFile(stalePath, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(freshPath, []byte("fresh"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Age the stale buffer by backdating its mtime.
+	old := time.Now().Add(-72 * time.Hour)
+	if err := os.Chtimes(stalePath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepOrphanBuffers(projectDir, time.Now())
+
+	// Stale should have moved to _orphaned/.
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Errorf("stale buffer should be gone from sessions/, err=%v", err)
+	}
+	movedPath := filepath.Join(bufferDir, orphanSubdir, staleName)
+	if _, err := os.Stat(movedPath); err != nil {
+		t.Errorf("stale buffer should exist under _orphaned/, err=%v", err)
+	}
+	// Fresh should still be in place.
+	if _, err := os.Stat(freshPath); err != nil {
+		t.Errorf("fresh buffer should not be moved, err=%v", err)
+	}
+}
+
+// TestSweepOrphanBuffers_MissingDirIsNoop guards the cold-start case: a
+// brand-new project has no .heimdall_db/hooks/sessions/ yet, and the sweep
+// must not panic or create spurious directories when there's nothing to do.
+func TestSweepOrphanBuffers_MissingDirIsNoop(t *testing.T) {
+	projectDir := t.TempDir()
+	// No buffer dir created. Sweep must not panic and must not create one.
+	sweepOrphanBuffers(projectDir, time.Now())
+	if _, err := os.Stat(resolveBufferDir(projectDir)); !os.IsNotExist(err) {
+		t.Errorf("sweep must not create buffer dir when missing; got err=%v", err)
+	}
+}

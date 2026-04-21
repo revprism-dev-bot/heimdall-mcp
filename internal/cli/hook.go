@@ -229,6 +229,15 @@ func HookSessionStart(cfg config.Config, stdin io.Reader, stdout, stderr io.Writ
 
 	baseDir := filepath.Join(projectRoot, ".heimdall_db")
 
+	// --- orphan-buffer sweep (self-heal from reboot-kill) --------------------
+	//
+	// SessionEnd removes the rolling buffer for its own session, so the only
+	// buffers that accumulate are from sessions that never SessionEnd'd —
+	// reboot-kill being the common case. Move anything older than
+	// orphanBufferGracePeriod to `_orphaned/` so the dir doesn't grow forever
+	// and retrospective analyze-session still has the data.
+	sweepOrphanBuffers(projectRoot, time.Now())
+
 	// --- Ollama ping ---------------------------------------------------------
 
 	client := newClient(cfg.OllamaEndpoint)
