@@ -23,8 +23,16 @@ import (
 // seedModelDBWithRow opens a vector store at baseDir/<modelDirName>, writes
 // one entry with the given mod_time, then closes the store so files are
 // flushed. Returns the directory path so callers can os.Chtimes it.
+//
+// The legacy-_latest auto-migration is disabled for the duration of the
+// helper so that seeding a `<model>_latest/` followed by a `<model>/` (or
+// vice versa) does NOT collapse via migration-001 into a single dir. The
+// reader-tiebreak tests in this file deliberately construct mixed states
+// to exercise ModelDBDir's mixed-state logic; the schema framework's
+// migration-001 would otherwise pre-empt that setup at the second OpenStore.
 func seedModelDBWithRow(t *testing.T, baseDir, modelDirName string, rowModTime int64) string {
 	t.Helper()
+	t.Setenv(DisableLegacyMigrationEnv, "1")
 	dir := filepath.Join(baseDir, modelDirName)
 	store, err := OpenStore(dir)
 	if err != nil {
@@ -48,9 +56,11 @@ func seedModelDBWithRow(t *testing.T, baseDir, modelDirName string, rowModTime i
 
 // makeEmptyModelDir creates the directory with a vectors.db file but no rows.
 // Used to simulate the observed bug where an empty bare directory
-// shadowed a populated _latest dir.
+// shadowed a populated _latest dir. Like seedModelDBWithRow, disables the
+// auto-migration so a sibling `_latest/` is preserved for the test.
 func makeEmptyModelDir(t *testing.T, baseDir, modelDirName string) string {
 	t.Helper()
+	t.Setenv(DisableLegacyMigrationEnv, "1")
 	dir := filepath.Join(baseDir, modelDirName)
 	store, err := OpenStore(dir)
 	if err != nil {

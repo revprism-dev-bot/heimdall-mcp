@@ -12,12 +12,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/caio-silva/heimdall-mcp/internal/heimdall/schema"
+
 	_ "modernc.org/sqlite"
 )
 
 // SubProjectRoot is the reserved sentinel that callers pass as sub_project
 // to restrict a search to outer/wrapper chunks only (rows whose sub_project
-// is NULL or ''). Empty string continues to mean "no filter". Per locked
+// is NULL or ”). Empty string continues to mean "no filter". Per locked
 // OQ-c / R-v2-1 the registry rejects sub-repo names matching ^__[a-z]+__$
 // to prevent collision with this sentinel.
 const SubProjectRoot = "__root__"
@@ -90,7 +92,37 @@ type VectorStore struct {
 
 // OpenStore loads or creates a vector store at the given directory.
 // The store file is dbDir/vectors.db.
+//
+// As part of opening, the per-project versioned migration framework runs:
+//   - PreOpen migrations (e.g. the legacy `<model>_latest/` rename) fire
+//     BEFORE MkdirAll so a freshly-created bare dir does not block a
+//     pending rename.
+//   - Post-open SQL migrations and the recording of completed PreOpen
+//     versions happen after the DB is opened and the bootstrap tables are
+//     present.
+//
+// If any migration fails, OpenStore closes the partially-opened store and
+// returns the error — callers MUST NOT receive a half-migrated handle.
 func OpenStore(dbDir string) (*VectorStore, error) {
+	// Run PreOpen migrations BEFORE creating the dir. Migration-001 wants
+	// to rename `<model>_latest/` → `<model>/` which is impossible if we
+	// MkdirAll the canonical dir first.
+	//
+	// We derive (BaseDir, Model) from dbDir using the convention
+	// dbDir = <baseDir>/<sanitizedModel>. Callers that pass a non-conventional
+	// dbDir (e.g. raw t.TempDir() in unit tests) just see migration-001
+	// no-op — the rename precondition is "<baseDir>/<model>_latest exists",
+	// which fails and the migration returns nil cleanly.
+	sctx := &schema.Context{
+		BaseDir: filepath.Dir(dbDir),
+		Model:   filepath.Base(dbDir),
+	}
+	migrations := Migrations()
+	preOpenCompleted, err := schema.ApplyPreOpen(sctx, migrations)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return nil, err
 	}
@@ -160,6 +192,16 @@ func OpenStore(dbDir string) (*VectorStore, error) {
 		);
 		CREATE INDEX IF NOT EXISTS idx_hook_cache_created ON hook_cache(created_at);
 	`); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	// Run versioned schema migrations (records any PreOpen versions that
+	// just completed; runs pending KindSQL migrations in order). On
+	// failure we close the DB and propagate the error so callers never
+	// receive a partially-migrated store.
+	sctx.DB = db
+	if err := schema.Apply(sctx, migrations, preOpenCompleted); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -712,13 +754,13 @@ func (s *VectorStore) Mu() *sync.RWMutex {
 }
 
 // BackfillSubProject sets the sub_project column to name for every row in
-// the store whose sub_project is currently NULL or '' (the default for
+// the store whose sub_project is currently NULL or ” (the default for
 // stores indexed before Problem #2 was fixed). It is safe to call on a
 // store that already has fully-populated sub_project values — it is a
 // no-op (idempotent).
 //
 // The helper exists specifically for legacy sub-repo stores written by
-// pre-fix binaries: those rows carry '' (or NULL) and the post-fix search
+// pre-fix binaries: those rows carry ” (or NULL) and the post-fix search
 // filter (`sub_project = ?`) returns zero hits. Running this helper once
 // at the top of a sub-repo indexing pass promotes the existing rows into
 // the post-fix tagging regime without a full reindex.
