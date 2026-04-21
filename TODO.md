@@ -100,7 +100,7 @@ not via hopeful tool exposure. Highest-leverage item by a wide margin.
 - [x] `heimdall_search` gains `scope` path param — prefix filter on `context_path`
 - [x] New `heimdall_ls(path)` MCP tool — lists child paths with chunk counts for filesystem-style navigation
 - [x] `WithScope()` and `WithDetail()` functional options on `SearchFiltered`
-- [ ] Auto-detect path for memories (follow-up)
+- [x] Auto-detect path for memories (follow-up) — shipped in `ab7c629` via `deriveMemoryContextPath` in `internal/mcp/memory_tools.go`: explicit `context_path` wins; otherwise `os.Getwd()` + `FindRepoRoot` + `ComputeScope` derive the subpath; auto-detect never overwrites an existing non-empty `ContextPath` on update.
 - [ ] Update hook injection to respect scope when CWD is a subpath (follow-up)
 
 ## 4. Skills as indexable content — **SHIPPED**
