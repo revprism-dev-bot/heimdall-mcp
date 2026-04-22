@@ -112,9 +112,16 @@ func TestMigrateLegacyLatestDir_NoLegacyDir_NoOp(t *testing.T) {
 // TestMigrateLegacyLatestDir_BothExist_LogsAndLeaves — both dirs populated.
 // Returns (false, nil); neither is deleted/moved. Reader preference from
 // ModelDBDir handles the mixed state separately.
+//
+// Disables auto-migration during the seed phase so that opening the
+// canonical store while legacy is present does NOT eagerly fire
+// migration-001 from inside OpenStore. The test then calls
+// MigrateLegacyLatestDir directly to assert the both-exist branch's
+// log-and-leave behaviour.
 func TestMigrateLegacyLatestDir_BothExist_LogsAndLeaves(t *testing.T) {
 	baseDir := t.TempDir()
 	const model = "nomic-embed-text"
+	t.Setenv(DisableLegacyMigrationEnv, "1")
 	legacy := seedLegacyDir(t, baseDir, model, 100)
 	// Populate canonical separately.
 	canonical := filepath.Join(baseDir, model)
@@ -133,6 +140,8 @@ func TestMigrateLegacyLatestDir_BothExist_LogsAndLeaves(t *testing.T) {
 		t.Fatalf("upsert canonical: %v", err)
 	}
 	store.Close()
+	// Re-enable migration for the actual subject-under-test call.
+	t.Setenv(DisableLegacyMigrationEnv, "")
 
 	migrated, err := MigrateLegacyLatestDir(baseDir, model)
 	if err != nil {
