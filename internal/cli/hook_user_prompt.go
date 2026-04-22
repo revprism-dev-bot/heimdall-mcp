@@ -71,6 +71,10 @@ type HookUserPromptDeps struct {
 	OpenMemoryStore func() (*heimdall.MemoryStore, error)
 	Suppress        func(project, failureCode string, window time.Duration) bool
 	Now             func() time.Time
+	// ReadHookLog is injected by tests so the nag-after-N-turns direct-call
+	// scan doesn't have to read the user's real ~/.local/state/heimdall log.
+	// Nil → real heimdall.ReadHookLog.
+	ReadHookLog hookLogReaderFunc
 }
 
 // HookUserPrompt is the Claude Code `UserPromptSubmit` hook entry point.
@@ -250,10 +254,14 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 	}
 	cacheKey := userPromptCacheKey(trimmed, store.GetIndexVersion(), cacheScope)
 	if cached, cerr := store.HookCacheGet(cacheKey, userPromptCacheTTL); cerr == nil {
-		_, _ = stdout.Write(cached)
+		// Splice the nag (if any) AFTER reading from cache so the cached
+		// payload itself never carries it. Counter is per-session, computed
+		// fresh on every prompt regardless of cache hit/miss.
+		final := evaluateAndSpliceNag(string(cached), projectRoot, sessionID, env, deps.ReadHookLog, deps.Now, "cache_hit")
+		_, _ = io.WriteString(stdout, final)
 		logHookEventWithSession("INFO", "user-prompt", sessionID, map[string]any{
 			"stage": "cache_hit",
-			"bytes": len(cached),
+			"bytes": len(final),
 			"model": resolvedModel,
 		})
 		return 0
@@ -327,6 +335,12 @@ func HookUserPrompt(cfg config.Config, stdin io.Reader, stdout, stderr io.Writer
 			"err":   perr.Error(),
 		})
 	}
+
+	// Splice the nag suffix AFTER the cache put: cache only stores the
+	// prompt-stable payload; the nag is recomputed every turn from per-session
+	// state. See evaluateAndSpliceNag for the safety/scope rules.
+	body = evaluateAndSpliceNag(body, projectRoot, sessionID, env, deps.ReadHookLog, deps.Now, "ok")
+
 	_, _ = io.WriteString(stdout, body)
 
 	// Stage-1 semantic-drift logging (plan 12 §3.2 / §10 Stage 1). Additive

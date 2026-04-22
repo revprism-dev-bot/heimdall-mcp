@@ -188,6 +188,10 @@ func HookSessionEnd(cfg config.Config, stdin io.Reader, stdout, _ io.Writer, env
 	}
 
 	os.Remove(bufferPath)
+	// Per-session nag state is co-located with the buffer dir; remove it on
+	// SessionEnd so it doesn't leak into the next session (which would carry
+	// over a stale turn counter).
+	purgeNagStateIfPresent(projectDir, payload.SessionID)
 
 	return 0
 }

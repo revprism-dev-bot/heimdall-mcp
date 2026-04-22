@@ -375,6 +375,149 @@ func TestHookUserPrompt_BudgetTimeout(t *testing.T) {
 	}
 }
 
+// nagInjectingDeps wraps runHookUserPrompt with a synthetic ReadHookLog so
+// the nag direct-call detector returns a controlled answer. Uses the same
+// surface as runHookUserPrompt; duplicated rather than threaded through to
+// keep the existing 16+ tests' behavior unchanged.
+func runHookUserPromptWithReader(t *testing.T, opts runUPOpts, reader hookLogReaderFunc) (stdout, stderr string, code int) {
+	t.Helper()
+	var out, errBuf strings.Builder
+	mem := opts.memoryStore
+	if mem == nil {
+		var err error
+		mem, err = heimdall.OpenMemoryStore(filepath.Join(t.TempDir(), "memories.db"))
+		if err != nil {
+			t.Fatalf("open empty memory store: %v", err)
+		}
+		t.Cleanup(func() { mem.Close() })
+	}
+	deps := HookUserPromptDeps{
+		Suppress: opts.suppress,
+		OpenMemoryStore: func() (*heimdall.MemoryStore, error) {
+			return mem, nil
+		},
+		ReadHookLog: reader,
+	}
+	if deps.Suppress == nil {
+		deps.Suppress = func(string, string, time.Duration) bool { return true }
+	}
+	rc := HookUserPrompt(opts.cfg, strings.NewReader(opts.stdin), &out, &errBuf, opts.env, opts.args, deps)
+	return out.String(), errBuf.String(), rc
+}
+
+// Nag integration: with state pre-seeded at turn=4 and threshold=5 (env), the
+// next call should fire the "### Heimdall nudge" block on the happy path.
+// Uses HEIMDALL_NAG_TURNS=5 explicitly + a no-call reader so direct-call
+// detection returns false.
+func TestHookUserPrompt_NagFiresAtThresholdOnHappyPath(t *testing.T) {
+	const model = "test-model"
+	const dim = 3
+	const sessionID = "nag-session-1"
+	project := t.TempDir()
+	baseDir := seedVectorStore(t, project, model, dim, time.Now().Unix())
+	dbDir := heimdall.ModelDBDir(baseDir, model)
+	seedStoreWithRecords(t, dbDir, []heimdall.VectorRecord{
+		{ID: "1", FilePath: "a.go", StartLine: 1, EndLine: 10, Content: "package a", Embedding: []float32{1, 0, 0}},
+	})
+
+	// Pre-seed nag state at Turn=4. Next prompt is turn 5 → should fire.
+	saveNagState(project, sessionID, nagState{Turn: 4, LastNagTurn: 0, LastResetUnix: time.Now().Unix() - 600})
+
+	fake := newFakeOllama(t, model, dim)
+	noCallReader := func(opts heimdall.ReadHookLogOpts) ([]heimdall.HookLogEntry, error) {
+		return nil, nil // no direct calls in the (synthetic) log
+	}
+
+	out, _, code := runHookUserPromptWithReader(t, runUPOpts{
+		stdin: `{"prompt":"explain the post-edit flow","cwd":"` + project + `","session_id":"` + sessionID + `"}`,
+		env:   map[string]string{"HEIMDALL_NAG_TURNS": "5"},
+		cfg:   baseCfg(fake.server.URL, model),
+	}, noCallReader)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if !strings.Contains(out, "### Heimdall nudge") {
+		t.Errorf("expected nag block in output, got:\n%s", out)
+	}
+	// Nag must appear before the footer to ensure it's part of the auto-injected block.
+	idxNag := strings.Index(out, "### Heimdall nudge")
+	idxFooter := strings.Index(out, "_retrieved via heimdall-mcp_")
+	if idxNag < 0 || idxFooter < 0 || idxNag >= idxFooter {
+		t.Errorf("nag block not before footer; nag@%d footer@%d", idxNag, idxFooter)
+	}
+	// Persisted state should now show LastNagTurn=5 (so we don't immediately re-fire).
+	got := loadNagState(project, sessionID)
+	if got.LastNagTurn != 5 {
+		t.Errorf("LastNagTurn after fire = %d, want 5; state=%+v", got.LastNagTurn, got)
+	}
+}
+
+// Nag integration: a recent direct heimdall_search call resets the counter
+// even if we were over threshold. The output should NOT contain the nag.
+func TestHookUserPrompt_NagSuppressedByDirectCall(t *testing.T) {
+	const model = "test-model"
+	const dim = 3
+	const sessionID = "nag-session-2"
+	project := t.TempDir()
+	baseDir := seedVectorStore(t, project, model, dim, time.Now().Unix())
+	dbDir := heimdall.ModelDBDir(baseDir, model)
+	seedStoreWithRecords(t, dbDir, []heimdall.VectorRecord{
+		{ID: "1", FilePath: "a.go", StartLine: 1, EndLine: 10, Content: "package a", Embedding: []float32{1, 0, 0}},
+	})
+
+	saveNagState(project, sessionID, nagState{Turn: 9, LastNagTurn: 0, LastResetUnix: time.Now().Unix() - 600})
+
+	fake := newFakeOllama(t, model, dim)
+	withCallReader := func(opts heimdall.ReadHookLogOpts) ([]heimdall.HookLogEntry, error) {
+		return []heimdall.HookLogEntry{
+			{Timestamp: time.Now(), Event: "mcp.tool_call", Fields: map[string]string{"tool": "heimdall_search"}},
+		}, nil
+	}
+
+	out, _, code := runHookUserPromptWithReader(t, runUPOpts{
+		stdin: `{"prompt":"explain the post-edit flow","cwd":"` + project + `","session_id":"` + sessionID + `"}`,
+		env:   map[string]string{"HEIMDALL_NAG_TURNS": "5"},
+		cfg:   baseCfg(fake.server.URL, model),
+	}, withCallReader)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if strings.Contains(out, "### Heimdall nudge") {
+		t.Errorf("nag block should be suppressed by direct call, got:\n%s", out)
+	}
+	// Counter should have reset to 0.
+	got := loadNagState(project, sessionID)
+	if got.Turn != 0 {
+		t.Errorf("Turn after direct call = %d, want 0", got.Turn)
+	}
+}
+
+// Nag suppression on Tier-B paths: with Ollama down, no nag is emitted (we
+// never reach the cache or stage=ok path).
+func TestHookUserPrompt_NagNotEmittedOnTierB(t *testing.T) {
+	const model = "test-model"
+	const sessionID = "nag-session-3"
+	project := t.TempDir()
+	_ = seedVectorStore(t, project, model, 3, time.Now().Unix())
+	fake := newFakeOllama(t, model, 3)
+	fake.pingFail.Store(true)
+
+	saveNagState(project, sessionID, nagState{Turn: 99, LastNagTurn: 0, LastResetUnix: time.Now().Unix() - 600})
+
+	out, _, code := runHookUserPromptWithReader(t, runUPOpts{
+		stdin:    `{"prompt":"explain the post-edit flow","cwd":"` + project + `","session_id":"` + sessionID + `"}`,
+		env:      map[string]string{"HEIMDALL_NAG_TURNS": "5"},
+		cfg:      baseCfg(fake.server.URL, model),
+		suppress: func(string, string, time.Duration) bool { return true },
+	}, nil)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if strings.Contains(out, "### Heimdall nudge") {
+		t.Errorf("nag must not appear on Tier B (Ollama down); got:\n%s", out)
+	}
+}
+
 // 11. Cache key normalization — cosmetic prompt differences collapse.
 func TestUserPromptCacheKey_Normalization(t *testing.T) {
 	scope := "/tmp/p"
