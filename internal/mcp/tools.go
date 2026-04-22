@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/caio-silva/heimdall-mcp/internal/heimdall"
@@ -808,28 +809,230 @@ func (s *Server) toolExpand(args json.RawMessage) MCPToolResult {
 	return TextResult(string(out))
 }
 
+// toolLs lists the context_path hierarchy of a project. When called on a
+// wrapper project that has registered sub-repos, it fans out across the
+// registry: the wrapper's own store is queried, plus the store of every
+// registered project whose Path is strictly under the wrapper's Path.
+// Each group in the output is attributed to the contributing registered
+// project so callers can see which sub-repo each entry belongs to — the
+// symptom addressed in docs/plans/2026-04-21-migration-framework/
+// 00-problems-catalog.md Problem #4 (pre-PR4 ls against a wrapper only
+// surfaced wrapper-local chunks, making sub-repo hierarchies invisible).
+//
+// Behavioral contract:
+//
+//   - Wrapper project with sub-repos → grouped response ([]LsGroup), one
+//     group per contributing project, sorted: anchor first, sub-repos
+//     alphabetically by Name.
+//   - Plain project with no registered sub-repos under it → flat response
+//     ([]heimdall.PathEntry), byte-identical shape to the pre-fanout
+//     behavior (backwards compatible).
+//   - Sub-repo targeted directly → flat response (sub-repos have no
+//     further sub-repos under them in the registry, so fanout collapses
+//     to the single-store path).
+//
+// sub_project parameter mapping (matches the search tool's sentinel
+// vocabulary — see types.go lsInput and heimdall.SubProjectRoot):
+//
+//   - "" or omitted   → include anchor + every registered sub-repo
+//   - "__root__"      → anchor only (skip the fanout)
+//   - "<name>"        → restrict to the named registered sub-repo
+//
+// The registry iteration is deliberately abstracted behind lsMembers so
+// a future centralized-DB backend (per project_centralized_db_roadmap.md)
+// can swap the local-registry walk for a server-side project list without
+// touching the fanout/aggregation logic here.
 func (s *Server) toolLs(args json.RawMessage) MCPToolResult {
 	var input lsInput
 	if err := json.Unmarshal(args, &input); err != nil {
 		return ErrResult("invalid arguments: " + err.Error())
 	}
 
-	dbDir, _ := s.resolveAnyModelDB(input.Project)
+	anchor := s.resolveLsAnchor(input.Project)
+	members := s.lsMembers(anchor, input.SubProject)
+	if len(members) == 0 {
+		// No anchor project could be resolved at all — fall back to the
+		// pre-fanout single-store path so callers without a registered
+		// project still see a useful response. This preserves the
+		// behavior of `heimdall_ls` on a brand-new, not-yet-indexed
+		// cwd where resolveDBDir synthesises a path under cwd.
+		return s.lsSingleStore(input.Project, input.Path)
+	}
+
+	// Collect each member's PathEntry list in parallel order with members.
+	groups := make([]LsGroup, 0, len(members))
+	anchorPath := ""
+	if anchor != nil {
+		anchorPath = anchor.Path
+	}
+	for _, m := range members {
+		entries := s.lsEntriesForMember(m, input.Path)
+		if len(entries) == 0 {
+			continue
+		}
+		groups = append(groups, LsGroup{
+			SubProject:  subProjectLabel(m, anchorPath),
+			ProjectName: m.Name,
+			Entries:     entries,
+		})
+	}
+
+	if len(groups) == 0 {
+		return TextResult("No entries at this path.")
+	}
+
+	// Single-member response keeps the flat shape — this is the "plain
+	// project" (b) and "sub-repo targeted directly" (c) backwards-compat
+	// path. The anchor-only group flattens to its Entries slice so
+	// existing callers that parse []PathEntry don't have to learn the
+	// grouped shape for plain projects.
+	if len(groups) == 1 && groups[0].SubProject == "" {
+		out, _ := json.MarshalIndent(groups[0].Entries, "", "  ")
+		return TextResult(string(out))
+	}
+
+	out, _ := json.MarshalIndent(groups, "", "  ")
+	return TextResult(string(out))
+}
+
+// lsSingleStore is the pre-fanout ls path, kept as a fallback for the
+// "no registered project resolvable" case. Identical behavior to the
+// original toolLs: open the resolved store, list by context path, emit a
+// flat []PathEntry. Factoring this out keeps the fanout path readable.
+func (s *Server) lsSingleStore(project, contextPath string) MCPToolResult {
+	dbDir, _ := s.resolveAnyModelDB(project)
 	if dbDir == "" {
 		return ErrResult("no index found")
 	}
-
 	store, err := heimdall.OpenStore(dbDir)
 	if err != nil {
 		return ErrResult("store error")
 	}
 	defer store.Close()
 
-	entries := store.ListByContextPath(input.Path)
+	entries := store.ListByContextPath(contextPath)
 	if len(entries) == 0 {
 		return TextResult("No entries at this path.")
 	}
-
 	out, _ := json.MarshalIndent(entries, "", "  ")
 	return TextResult(string(out))
+}
+
+// resolveLsAnchor picks the registered project that ls should treat as
+// the "anchor" — the wrapper root for a fanout, or the leaf for a direct
+// target. Resolution order mirrors resolveDBDir but returns the registry
+// entry itself so the caller can inspect Path for fanout discovery:
+//
+//  1. project argument exact/substring match via Registry.Find
+//  2. cwd-based lookup via Registry.FindByCWD
+//  3. nil (caller falls through to the non-fanout path)
+func (s *Server) resolveLsAnchor(project string) *registry.ProjectEntry {
+	if s.Registry == nil {
+		return nil
+	}
+	if project != "" {
+		if p := s.Registry.Find(project); p != nil {
+			return p
+		}
+	}
+	cwd, _ := os.Getwd()
+	if p := s.Registry.FindByCWD(cwd); p != nil {
+		return p
+	}
+	return nil
+}
+
+// lsMembers returns the registry entries whose stores should be queried
+// for the ls response, honoring the sub_project filter:
+//
+//   - subProjectFilter == "" → anchor + every registered project whose
+//     Path is strictly under the anchor's Path.
+//   - subProjectFilter == SubProjectRoot → anchor only.
+//   - subProjectFilter == "<name>" → only the registry entry with that
+//     Name, and only if it is the anchor itself or registered under it
+//     (prevents fanout from bleeding across unrelated projects that
+//     happen to share a sub-repo basename).
+//
+// Registry iteration is the explicit abstraction boundary for the
+// centralized-DB roadmap: a future backend swaps Registry.All() for a
+// server-side project list while keeping the filter semantics identical.
+func (s *Server) lsMembers(anchor *registry.ProjectEntry, subProjectFilter string) []registry.ProjectEntry {
+	if anchor == nil || s.Registry == nil {
+		return nil
+	}
+	anchorClean := filepath.Clean(anchor.Path)
+
+	if subProjectFilter == heimdall.SubProjectRoot {
+		return []registry.ProjectEntry{*anchor}
+	}
+
+	all := s.Registry.All()
+	// Candidates: anchor + every registered project strictly under it.
+	candidates := make([]registry.ProjectEntry, 0, 4)
+	candidates = append(candidates, *anchor)
+	for _, p := range all {
+		pClean := filepath.Clean(p.Path)
+		if pClean == anchorClean {
+			continue
+		}
+		if registry.IsSubpath(pClean, anchorClean) {
+			candidates = append(candidates, p)
+		}
+	}
+
+	// Deterministic order: anchor first, then sub-repos sorted by Name.
+	sort.Slice(candidates[1:], func(i, j int) bool {
+		return candidates[i+1].Name < candidates[j+1].Name
+	})
+
+	if subProjectFilter == "" {
+		return candidates
+	}
+	// Named filter: pick the single candidate whose Name matches. Does
+	// NOT fall back to the anchor — if the filter doesn't match a
+	// registered member under the anchor, the caller gets an empty
+	// response (same semantics as the search tool's Named mode).
+	for _, c := range candidates {
+		if c.Name == subProjectFilter {
+			return []registry.ProjectEntry{c}
+		}
+	}
+	return nil
+}
+
+// lsEntriesForMember opens a registered project's store and lists its
+// context_path hierarchy at the given prefix. Store-open failures are
+// logged and treated as "no entries" — a single broken sub-repo store
+// must not fail the whole fanout (users would lose visibility into
+// every sibling sub-repo for an unrelated reason).
+func (s *Server) lsEntriesForMember(m registry.ProjectEntry, contextPath string) []heimdall.PathEntry {
+	dbDir, _ := s.resolveAnyModelDB(m.Name)
+	if dbDir == "" {
+		// Fall back to the registry's DBPath + server's configured model.
+		// resolveAnyModelDB may return "" when the model isn't pulled
+		// in Ollama, but we still want to surface whatever is on disk
+		// for ls (which never needs an embedder).
+		dbDir = heimdall.ModelDBDir(m.DBPath, s.Cfg.Model)
+	}
+	if dbDir == "" {
+		return nil
+	}
+	store, err := heimdall.OpenStore(dbDir)
+	if err != nil {
+		log.Printf("heimdall: ls: skipping %s (store open failed): %v", m.Name, err)
+		return nil
+	}
+	defer store.Close()
+	return store.ListByContextPath(contextPath)
+}
+
+// subProjectLabel returns the SubProject label for a member's group:
+// empty string when the member IS the anchor (so callers see the same
+// "__root__-ish" convention used by the search filter), otherwise the
+// member's registry Name. Pure string helper so the caller stays linear.
+func subProjectLabel(m registry.ProjectEntry, anchorPath string) string {
+	if filepath.Clean(m.Path) == filepath.Clean(anchorPath) {
+		return ""
+	}
+	return m.Name
 }

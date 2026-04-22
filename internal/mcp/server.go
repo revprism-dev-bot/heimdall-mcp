@@ -556,7 +556,7 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 		},
 		{
 			Name:        "heimdall_ls",
-			Description: "List the context path hierarchy — filesystem-style navigation of indexed content. Shows directories and chunk counts at each level. Use to explore what's indexed before searching.",
+			Description: "List the context path hierarchy — filesystem-style navigation of indexed content. Shows directories and chunk counts at each level. On a wrapper project with sub-repos, fans out across the registry so sub-repo content is visible (grouped by contributing project). Use to explore what's indexed before searching.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -567,6 +567,10 @@ func (s *Server) handleToolsList(req JSONRPCRequest) *JSONRPCResponse {
 					"project": map[string]any{
 						"type":        "string",
 						"description": "Project name or path (optional)",
+					},
+					"sub_project": map[string]any{
+						"type":        "string",
+						"description": "Narrow a wrapper-project ls. Omit for the full fanout (anchor + all registered sub-repos); pass \"__root__\" for the wrapper only; pass a sub-repo name to restrict to that sub-repo.",
 					},
 				},
 			},

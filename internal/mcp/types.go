@@ -73,6 +73,34 @@ type expandInput struct {
 type lsInput struct {
 	Path    string `json:"path"`    // context path to list (empty = root)
 	Project string `json:"project"` // optional
+	// SubProject narrows the fanout on a wrapper project:
+	//   "" (omitted)  → fan out across the anchor + every registered sub-repo
+	//                   whose Path is under the anchor's Path.
+	//   "__root__"    → anchor/wrapper only (same sentinel as the search
+	//                   filter — see heimdall.SubProjectRoot).
+	//   "<name>"      → restrict to the named registered sub-repo.
+	// The wire contract matches the search tool's sub_project parameter so
+	// callers use one mental model. When B-migration's SubProjectFilter
+	// typed variant lands (docs/plans/2026-04-21-dispatch-plan/decisions.md
+	// §Q4) this string field maps to that type at the MCP boundary without
+	// breaking callers.
+	SubProject string `json:"sub_project"`
+}
+
+// LsGroup aggregates one ls "section" contributed by a single registered
+// project (the anchor wrapper, or one of its sub-repos). Emitted only when
+// toolLs fans out across multiple registered projects — the single-project
+// path keeps the pre-fanout flat `[]PathEntry` shape for backwards
+// compatibility (see PR4 / Problem #4).
+//
+// Entries reuses heimdall.PathEntry directly so the per-row wire shape
+// (name/path/chunkCount) is identical between the flat and grouped
+// responses; callers that already parse flat ls output only need to learn
+// one extra wrapper to parse the grouped form.
+type LsGroup struct {
+	SubProject  string               `json:"subProject"`  // "" for anchor/wrapper; sub-repo name otherwise
+	ProjectName string               `json:"projectName"` // registry Name of the contributing project
+	Entries     []heimdall.PathEntry `json:"entries"`
 }
 
 type indexInput struct {
